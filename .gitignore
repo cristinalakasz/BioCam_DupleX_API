@@ -7,12 +7,15 @@
 # Not redistributed here. Copy the DLLs from the 3Brain SDK install into
 # BioCam_DupleX_API/API/ and BioCam_DupleX_API/SampleApp_BioCamCL/Dependencies/
 *.dll
-*.chm
 
 # --- Recorded data -----------------------------------------------------
-# Raw recordings are multi-GB and exceed GitHub's 100 MB file limit.
+# Raw recordings are multi-GB and exceed GitHub's 100 MB file limit, but the
+# per-session *_meta.json sidecars are small and worth versioning.
+# NB: must be "recordings/*" not "recordings/" -- git does not descend into an
+# excluded directory, so the negation below would never be reached.
 *.raw
-recordings/
+recordings/*
+!recordings/*_meta.json
 
 # --- Build output ------------------------------------------------------
 bin/
