@@ -1,0 +1,33 @@
+# --- Secrets -----------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Vendor SDK binaries (3Brain BioCam Driver API) ---------------------
+# Not redistributed here. Copy the DLLs from the 3Brain SDK install into
+# BioCam_DupleX_API/API/ and BioCam_DupleX_API/SampleApp_BioCamCL/Dependencies/
+*.dll
+*.chm
+
+# --- Recorded data -----------------------------------------------------
+# Raw recordings are multi-GB and exceed GitHub's 100 MB file limit.
+*.raw
+recordings/
+
+# --- Build output ------------------------------------------------------
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- OS / editor -------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
