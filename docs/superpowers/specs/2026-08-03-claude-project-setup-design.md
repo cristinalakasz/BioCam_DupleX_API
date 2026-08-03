@@ -157,18 +157,22 @@ works against the only safety net it has.
 
 ## 4. Deliverables
 
-Eight deliverables (nine files, counting the fixture's metadata sidecar).
-Nothing installs or executes as part of this setup.
+Nothing installs or executes as part of this setup. (No file count is given here
+deliberately — per the staleness policy in §5, counts drift.)
 
 | File | Audience | Purpose |
 |---|---|---|
 | `README.md` | humans | Complete lab manual. §5. |
-| `requirements.txt` | humans | Exact pinned dependencies. |
+| `requirements.txt` | humans | Pinned runtime dependencies (`numpy`, `pythonnet`). |
+| `requirements-dev.txt` | humans | Pinned test dependencies (`pytest`). Separate — see below. |
 | `CLAUDE.md` | Claude | Project briefing loaded every session. §6. |
 | `.claude/agents/biocam-api-verifier.md` | Claude | Read-only .NET interop checker. §7. |
 | `.claude/agents/realtime-safety-reviewer.md` | Claude | Read-only callback-latency checker. §7. |
 | `.claude/agents/dsp-implementer.md` | Claude | Test-first implementer, Layers 2–3 only. §7. |
 | `.claude/settings.json` | Claude | Permissions for routine commands. |
+| `pytest.ini` | tests | Test configuration. |
+| `tests/test_fixture_integrity.py` | tests | Proves the fixture is internally consistent. |
+| `tests/test_no_hardware_imports.py` | tests | Guard: enforces that the suite needs no hardware. |
 | `tests/fixtures/sample_5s.raw` + `_meta.json` | tests | Real recorded signal, small enough to commit. |
 
 ### Test fixture
@@ -177,6 +181,52 @@ A few seconds cut from the existing 1.5 GB recording, with a matching metadata
 sidecar. Real signal rather than synthetic: recordings contain noise, drift, and
 artifacts nobody thinks to simulate, and detectors tuned on clean synthetic data
 degrade on real input. Cost is a few hundred KB committed permanently.
+
+### Test scaffolding
+
+The suite written here is small. Its purpose is to make "run the tests" a real
+command from the first day, and to make the no-hardware constraint structural
+rather than a thing everyone remembers.
+
+**The governing rule: the entire test suite must pass on a machine with no
+BioCAM and no 3Brain DLLs installed.**
+
+That is stronger than "no instrument attached." It means no test may import
+`pythonnet`, `clr`, or any module that does, because importing the interop layer
+requires the assemblies to be present on disk. Consequences:
+
+- **Layer 1 has no automated tests, by construction.** Not an oversight — it is
+  unreachable from a test process here.
+- Layer 2 and Layer 3 code must be importable **without** the interop layer being
+  importable. This forces the layer separation to be real in the module structure
+  rather than merely described in this document. If someone puts decoding logic
+  in the same module as `clr.AddReference`, the tests stop running and they find
+  out immediately.
+- Runtime and test dependencies are split into two requirements files, so the
+  suite is runnable without `pythonnet` installed at all.
+
+**`tests/test_no_hardware_imports.py`** enforces this: it walks every module
+under `tests/` and the Layer 2/3 source packages and asserts that none of them,
+transitively, imports `clr` or `pythonnet`. This is the mechanism that keeps the
+architecture honest; without it the boundary erodes quietly and nobody notices
+until the suite can only run on a machine with the SDK.
+
+**`tests/test_fixture_integrity.py`** asserts the fixture's `.raw` and
+`_meta.json` agree: file size is an exact multiple of
+`total_channels × ch_sample_byte_size`, the frame count matches, and values fall
+within `min_digital_value`–`max_digital_value`. If the pair disagree, every
+future test built on the fixture is quietly measuring the wrong thing. Cheap to
+check once, expensive to discover later.
+
+### What a green suite does and does not mean
+
+Stated here because it is the most likely way this setup misleads someone.
+
+A passing suite means Layer 2 and Layer 3 behave as specified. It says **nothing
+whatsoever** about whether the instrument code works, because that code is not
+executed. Correspondingly, `pytest` output must never be reported as evidence
+that a change is lab-ready, and Gate 2 (§8) treats the suite as one item among
+five rather than as the decision.
 
 ---
 
@@ -200,7 +250,9 @@ asserting them. Detail where stable, generated output where not.
    why they are not in the repo, and a command to verify all seven are present.
    Its own section because it is the first thing that will block a fresh clone.
 4. **Environment setup** — exact Python version, both conda and venv paths (the
-   development machine has conda; the lab machine may not).
+   development machine has conda; the lab machine may not). Distinguishes the
+   two dependency files: the lab machine needs `requirements.txt`, a development
+   machine with no instrument needs only `requirements-dev.txt` to run the suite.
 5. **Preflight check** — one command, run before any experiment. Verifies DLLs
    load, .NET version, device detected, plate connected; prints actual
    acquisition parameters read from the instrument. Sample pass and fail output.
@@ -219,7 +271,8 @@ asserting them. Detail where stable, generated output where not.
    stimulation output because `Start()` was not called, data-loss warnings).
 10. **Project layout** — one line per file.
 11. **Development** — the three-layer model and which layer new code belongs in,
-    running tests without hardware, the replay fixture, the callback latency rule.
+    running tests without hardware, the replay fixture, the callback latency rule,
+    and what a green suite does and does not prove (§4).
 12. **Before handing code to the lab** — the Gate 2 checklist (§8) reproduced in
     full, so it survives independently of `CLAUDE.md` and of any tooling. Written
     for a human to work through, including the "what is untested" note that
@@ -253,7 +306,9 @@ briefing dilutes the important parts.
    `API/3Brain.BioCamDriver.xml` and `SampleApp_BioCamCL/MainForm.cs`. Includes
    the stimulator lifecycle `Initialize → Start → Stop → Close`.
 5. **The mandatory checkpoints** (§8), stated as rules rather than suggestions.
-6. **Commands.** How to run tests and preflight.
+6. **Commands.** How to run tests and preflight — plus the rule that a green
+   suite covers Layers 2–3 only and must never be reported as evidence that
+   instrument code works (§4).
 7. **Conventions.** English throughout. Never commit DLLs or `.raw` files.
    Fixture location.
 
@@ -313,14 +368,17 @@ demand. Before code is handed over for a run:
 
 1. `biocam-api-verifier` clean across all interop code, not just what changed.
 2. `realtime-safety-reviewer` clean across the whole data path.
-3. Full test suite passing against the replay fixture.
+3. Full test suite passing — noting that this covers Layers 2 and 3 only, and
+   proves nothing about Layer 1 (§4).
 4. Preflight script runs and reports correctly.
 5. Every known-untested assumption written down explicitly, so the colleague
    knows what is being tried for the first time and what to report.
 
 Item 5 exists because the highest-value output of a lab session is not "it
 worked" but a precise answer about the specific things that could not be checked
-beforehand.
+beforehand. Since Layer 1 has no automated coverage by construction, **every
+Layer 1 change since the last session belongs on that list** — that is the rule
+that turns "untested" from a vague worry into a finite, reviewable set.
 
 ### Enforcement
 
