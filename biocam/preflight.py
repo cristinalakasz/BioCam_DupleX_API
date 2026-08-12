@@ -71,7 +71,10 @@ def _check_dll(dll_dir, name):
     path = dll_dir / name
     if not path.is_file():
         return CheckResult(name, False, f"not found in {dll_dir}")
-    return CheckResult(name, True, f"{path.stat().st_size} bytes")
+    size = path.stat().st_size
+    if size == 0:
+        return CheckResult(name, False, f"0 bytes (empty file) in {dll_dir}")
+    return CheckResult(name, True, f"{size} bytes")
 
 
 def format_report(results):

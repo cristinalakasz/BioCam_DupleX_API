@@ -4,6 +4,14 @@ Run once, by hand. The source recording is ~1.4 GB and is NOT in the repository,
 so this script cannot be re-run from a fresh clone. It is committed to document
 exactly how the fixtures were produced.
 
+Provenance caveat: the source recording's completeness was never verifiable —
+no subscription to DataLoss existed and its packet log used wall-clock rather
+than hardware timestamps, so a dropped packet during capture would not have
+been recorded (design spec Appendix A, item 2). The fixtures below are
+byte-identical to their slices of that recording, so this caveat applies to
+them too, even though they are otherwise a faithful, useful sample of real
+signal.
+
 Usage:
     python tools/make_fixtures.py <source.raw> <source_meta.json>
 """

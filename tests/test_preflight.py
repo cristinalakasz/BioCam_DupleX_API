@@ -22,6 +22,13 @@ def test_present_dlls_are_reported_as_passing(tmp_path):
     assert all(r.ok for r in results if r.name.endswith(".dll"))
 
 
+def test_zero_length_dlls_are_reported_as_failures(tmp_path):
+    for name in REQUIRED_DLLS:
+        (tmp_path / name).write_bytes(b"")
+    results = check_environment(tmp_path)
+    assert all(not r.ok for r in results if r.name.endswith(".dll"))
+
+
 def test_python_version_check_passes_on_the_running_interpreter():
     results = check_environment(Path("."))
     version_check = next(r for r in results if r.name == "Python version")

@@ -68,18 +68,22 @@ short on purpose.
    that.
 2. **Seat the MEA plate** on the DupleX head before connecting. A recording
    started with an unseated plate fails at `MeaPlate.IsConnected`.
-3. **Run preflight** (§6): `python -m biocam.preflight`. It confirms the
-   environment only — Python version, `numpy`, and the seven DLLs on disk. It
-   does **not** confirm the device is detected or the plate is seated; that
-   check is not implemented yet (arrives with Phase 1).
+3. **Run preflight** (§6), **from the repository root**: `python -m
+   biocam.preflight`. It confirms the environment only — Python version,
+   `numpy`, and the seven DLLs on disk. It does **not** confirm the device is
+   detected or the plate is seated; that check is not implemented yet
+   (arrives with Phase 1).
 4. **Check free disk space.** Recording all 4096 channels consumes
    **~152 MB per second — about 9 GB per minute**
    (18,557.72 Hz × 4096 channels × 2 bytes/sample ≈ 152 MB/s; verify with
-   `python -c "print(18557.720703125*4096*2)"` any time this figure is in
-   doubt). A drive that looks empty enough for "a quick recording" can fill up
-   mid-session and lose the run — there is no resume. A real 10-second session
-   already recorded in this repository (`BioCam_DupleX_API/recordings/`) is
-   ~1.5 GB, consistent with this rate.
+   `python -c "print(18557.720703125*4096*2)"` — this one can be run from
+   anywhere — any time this figure is in doubt). A drive that looks empty
+   enough for "a quick recording" can fill up mid-session and lose the run —
+   there is no resume. A real 10-second session recorded on the development
+   machine this manual was verified on (its metadata sidecar is committed at
+   `BioCam_DupleX_API/recordings/20260624_140615_meta.json`; the `.raw` itself
+   is gitignored and is **not** in a fresh clone) is ~1.5 GB, consistent with
+   this rate.
 
 ---
 
@@ -152,12 +156,18 @@ For the DLLs preflight does check (`API/`), copy the full set:
 | `3Brain.Processing.Native.dll` | 50,722,816 |
 | `Newtonsoft.Json.dll` | 711,952 |
 
-Sizes are exact — they come from a real preflight run on this development
-machine (§6) and are the number to check against, not "roughly the right
-file." If your copy differs in size, re-copy it from the SDK rather than
-assuming it's fine.
+Sizes above come from a real preflight run on this development machine (§6).
+Preflight does **not** compare against them — it only confirms each file
+exists and is not zero-length, then reports the size it found so **you** can
+eyeball it against this table. A DLL that is truncated to a small but
+nonzero size, or is simply the wrong version, will still pass — only a
+completely empty (0-byte) file is caught automatically. If your copy's
+reported size differs noticeably from the table, re-copy it from the SDK
+rather than assuming it's fine; a size of a similar order but not identical
+can be legitimate (SDK versions differ across installs), a size wildly off
+or near-zero is not.
 
-**Verify all seven are present and correctly sized:**
+**Check that all seven are present, from the repository root:**
 
 ```
 python -m biocam.preflight
@@ -194,26 +204,54 @@ pip install -r requirements-dev.txt    # development machine
 
 ### venv
 
+The activation command depends on which shell you're using. Getting this
+wrong is easy to miss: the wrong command does not error, it just fails to
+activate, and `pip install` then silently installs into your global Python
+instead of the venv.
+
+**PowerShell:**
+
 ```
 python -m venv .venv
-.venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt        # lab machine
 pip install -r requirements-dev.txt    # development machine
 ```
 
+**cmd.exe:**
+
+```
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt        # lab machine
+pip install -r requirements-dev.txt    # development machine
+```
+
+Do **not** use plain `.venv\Scripts\activate` (no extension) in PowerShell —
+that file is a POSIX shell script. PowerShell does not error on it or run it;
+it silently does nothing, `$env:VIRTUAL_ENV` stays empty, and every `pip
+install` after that goes into the global interpreter with no sign anything is
+wrong. After activating (either shell), confirm it worked before installing
+anything: `echo $env:VIRTUAL_ENV` (PowerShell) or `echo %VIRTUAL_ENV%`
+(cmd.exe) should print the path to `.venv`, not be empty.
+
 (`conda` was not available to re-verify on the machine this README was written
 on — the syntax above is standard conda usage. The **venv path was run
-end-to-end** on this machine: a fresh venv, `pip install -r
-requirements-dev.txt`, then `python -m pytest` and `python -m
-biocam.preflight` both succeeded from inside it — see the real output in §6
-and §12.)
+end-to-end in PowerShell** on this machine: a fresh venv, `.\.venv\Scripts\
+Activate.ps1`, `pip install -r requirements-dev.txt`, then `python -m pytest`
+and `python -m biocam.preflight` (from the repository root — see §6) both
+succeeded from inside it — see the real output in §6 and §12.)
 
 ---
 
 ## 6. Preflight check
 
 Run this before every experiment (§2) and any time the environment might have
-changed:
+changed, **from the repository root** (the directory containing this
+README and the `biocam/` folder — not from inside `BioCam_DupleX_API/`;
+`python -m biocam.preflight` needs `biocam` importable from the current
+directory, and it fails with `ModuleNotFoundError: No module named 'biocam'`
+from anywhere else, including `BioCam_DupleX_API/`, which §7 sends you into):
 
 ```
 python -m biocam.preflight
@@ -287,12 +325,24 @@ writes happen inside the time-critical data callback, and the stimulator's
 `Start()` call is missing (§9, §10). Treat its output as usable but not
 provably complete.
 
-**Command line**, run from inside `BioCam_DupleX_API/` so the DLLs at
-`API/` are found by the default path:
+**Command line**, run from inside `BioCam_DupleX_API/` (not the repository
+root):
 
 ```
 python recorder.py --duration 10 --name test1
 ```
+
+The cwd requirement here is **not** about the DLLs — `connector.py` finds
+`API/` from its own file location (`os.path.dirname(__file__)`, connector.py
+line 26), not from the current working directory, so DLL loading works
+regardless of where you run from. The cwd matters for two other reasons:
+`--output-dir` defaults to `recordings`, a path resolved relative to the
+current working directory (see the table below); and `recorder.py` imports
+`connector` by bare module name (`from connector import ...`), which only
+resolves when `BioCam_DupleX_API/` is on the Python path — guaranteed when
+you run `python recorder.py` from inside that directory. If you see a DLL
+error, the cause is a missing/misplaced file in `API/` (§4), not the working
+directory.
 
 Options (from `recorder.py`'s `argparse` definitions):
 
@@ -323,6 +373,12 @@ data, meta = load_recording("recordings/test1.raw", "recordings/test1_meta.json"
 
 Pass `as_analog=False` to `load_recording` to get raw ADC counts (`uint16`)
 instead of microvolts.
+
+**Return to the repository root when you're done recording.** Both commands
+above must be run from inside `BioCam_DupleX_API/`, but preflight (§6) and
+the full gate checklist (§13, item 4) must be run from the repository root —
+staying inside `BioCam_DupleX_API/` after a recording session will make the
+next preflight run fail with `ModuleNotFoundError: No module named 'biocam'`.
 
 ---
 
@@ -511,14 +567,26 @@ Phase 1 adds a test.
 
 ### Fixtures
 
-`tests/fixtures/`, used by Layer 2/3 tests as a **replay source** — real
+`tests/fixtures/`, used by **Layer 3** tests as a **replay source** — real
 recorded signal rather than synthetic data, because real recordings contain
-noise, drift, and artifacts nobody thinks to simulate:
+noise, drift, and artifacts nobody thinks to simulate. Layer 2 tests use
+synthetic buffers instead, not these fixtures: a decoder test needs an exact
+expected output, and only a constructed input lets you assert one (§12 "The
+three-layer rule"; `.claude/agents/dsp-implementer.md`).
 
 - `sample_32ch_2s` — 37,115 frames × 32 channels (2,375,360 bytes). The 32
   most active channels (by variance) from a real session, 2 seconds.
 - `sample_full_100frames` — 100 frames × 4096 channels (819,200 bytes). Full
   channel width, for testing anything that depends on `total_channels == 4096`.
+
+Both are cut from the same source recording (`20260624_140615`), byte-for-byte
+identical to it over the slices taken. That source recording's own
+completeness was never verifiable: no subscription to `DataLoss` existed when
+it was captured, and its packet log recorded wall-clock time rather than
+hardware timestamps, so a dropped packet during capture would be invisible in
+hindsight (design spec Appendix A, item 2). The fixtures are still useful —
+they carry real noise and artifacts synthetic data wouldn't — just don't treat
+them as certified gap-free.
 
 Load either with `load_fixture(name)` from `tests/test_fixture_integrity.py`,
 returning `(data, meta)` — `data` is raw ADC counts, shape
