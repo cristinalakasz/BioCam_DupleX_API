@@ -37,7 +37,9 @@ Never guess a .NET member name, signature, or behavior. Verify against:
 
 The stimulator lifecycle is `Initialize → Start → Stop → Close`. `connector.py`
 currently never calls `Start()`, so stimulation silently fails to fire — a known
-defect, restructured in Phase 1.
+defect. Remediation is scheduled in
+`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md`; check that
+file for the current phase rather than assuming one here.
 
 `RectangularStimPulse` and `StimProperties` live in `_3Brain.Common`, which has
 **no XML documentation in this repo**. Their members cannot be verified from
