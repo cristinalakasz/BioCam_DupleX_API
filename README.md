@@ -109,24 +109,38 @@ section.
 The 3Brain driver requires seven DLLs that are **not committed to this
 repository** — `.gitignore` excludes all `*.dll` files. Reasons:
 
-- One set is **~70 MB** (measured: sum of the sizes in the table below), which
-  is unnecessary repository weight for files that never change per-commit. A
-  full install is **two copies** — see below — so **~140 MB** total.
+- One full set is **~70 MB** (measured: sum of the sizes in the table below).
+  They are needed in **two directories** (below); as populated on the
+  development machine this manual was verified on, `API/` (all seven) plus
+  `SampleApp_BioCamCL/Dependencies/` (six of the seven — see below) together
+  measure **140,236,048 bytes, ≈ 140 MB** — unnecessary repository weight for
+  files that never change per-commit, in either count.
 - They are 3Brain's licensed SDK, not code we wrote, and not ours to
   redistribute.
 
 They come from the **3Brain SDK / BrainWave installation** on the lab machine,
-and are needed in **two places**:
+and are read from **two directories**:
 
 - `BioCam_DupleX_API/API/` — used by the Python scripts (`connector.py`,
-  `recorder.py`, `Hello_BioCam.py`, and `biocam.preflight`).
+  `recorder.py`, `Hello_BioCam.py`) and by `biocam.preflight`, which checks
+  **only this directory** (§6) — a clean preflight pass says nothing about
+  the second directory below.
 - `BioCam_DupleX_API/SampleApp_BioCamCL/Dependencies/` — used by 3Brain's own
   C# reference application (§11), which you will want buildable if you're
   cross-checking a .NET call against known-working code rather than against
-  the XML alone. Copy the same seven files here too; a build of
-  `SampleApp_BioCamCL` will fail with missing-assembly errors otherwise.
+  the XML alone. Its `.csproj` explicitly references five of the seven from
+  here (`3Brain.BioCamDriver`, `3Brain.Common`, `3Brain.Deployment.Drivers`,
+  `3Brain.Diagnostic`, `3Brain.Processing.Core`), plus `FTD3XX_NET.dll` — an
+  FTDI USB driver assembly that preflight does not track and that is not in
+  this repository at all; get it from the 3Brain/FTDI install if you need to
+  build the sample app. `3Brain.Processing.Native.dll` is also present here
+  (a native runtime dependency, not a compile-time `<Reference>`).
+  `Newtonsoft.Json.dll` is the one file **not** currently present in this
+  directory and not referenced by the `.csproj` — there is no evidence it is
+  needed here; copy it in only if a build or run specifically reports it
+  missing.
 
-Copy the full set into both locations:
+For the DLLs preflight does check (`API/`), copy the full set:
 
 | File | Size (bytes) |
 |---|---|
