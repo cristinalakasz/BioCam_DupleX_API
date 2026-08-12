@@ -1,0 +1,16 @@
+{
+  "frame_rate_hz": 18557.720703125,
+  "n_wells": 1,
+  "n_channels_per_well": 4096,
+  "total_channels": 4096,
+  "ch_sample_byte_size": 2,
+  "bit_depth": 12,
+  "adc_counts_to_value": 2.0146520146520146,
+  "offset": -4125.0,
+  "min_digital_value": 0,
+  "max_digital_value": 4095,
+  "n_frames_total": 100,
+  "duration_sec": 0.005388592791094256,
+  "source_recording": "20260624_140615",
+  "source_channels": null
+}
