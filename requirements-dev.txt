@@ -1,0 +1,5 @@
+# Development and test dependencies.
+# Deliberately EXCLUDES pythonnet: the test suite must run on a machine with
+# no BioCAM and no 3Brain DLLs. See tests/test_no_hardware_imports.py.
+numpy==2.5.2
+pytest==9.1.1
