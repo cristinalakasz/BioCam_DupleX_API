@@ -41,7 +41,7 @@ preference, places it last.
 
 | Phase | Contents | Status |
 |---|---|---|
-| **0** | Setup: `CLAUDE.md`, verifier agents, test scaffolding, README | Specced 2026-08-03. **Building first.** |
+| **0** | Setup: `CLAUDE.md`, verifier agents, test scaffolding, README | Specced 2026-08-03. **Done** (2026-08-12). |
 | **1** | Acquisition: recording, saving, data integrity | Next to spec |
 | **2** | Stimulation engine + manual (a) + scheduled (b) | |
 | **3** | Session control: recording and stimulation together, changing live | |

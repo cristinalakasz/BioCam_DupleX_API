@@ -44,7 +44,7 @@ signal and delivering electrical stimulation.
 
 - **Works today:** recording raw signal from all 4096 channels to disk, and
   reading it back into a NumPy array (`BioCam_DupleX_API/recorder.py`). This
-  script has known defects (§7, §13 Appendix A of the design spec) and is
+  script has known defects (§7, Appendix A of the design spec) and is
   scheduled for a rebuild.
 - **Does not exist yet:** the rebuilt acquisition path (Phase 1), a stimulation
   engine (Phase 2), combined recording+stimulation sessions (Phase 3), a UI
@@ -93,9 +93,11 @@ short on purpose.
 - .NET Framework 4.7 or later installed (4.8 satisfies this)
 - USB connection to the BioCAM
 
-A development machine (no instrument attached) does not need any of the above
-except Windows is *not* required there either — see §5 for the split between
-the lab machine and a development machine.
+A **development machine** (no instrument attached, running only the test
+suite) needs none of the above — not the instrument, not USB, not even
+Windows or .NET Framework. It only needs Python 3.12 and the packages in
+`requirements-dev.txt` (§5). Everything in this section is required on the
+**lab machine** only.
 
 ---
 
@@ -107,14 +109,24 @@ section.
 The 3Brain driver requires seven DLLs that are **not committed to this
 repository** — `.gitignore` excludes all `*.dll` files. Reasons:
 
-- Together they are **~70 MB** (measured: sum of the sizes in the table
-  below), which is unnecessary repository weight for files that never change
-  per-commit.
+- One set is **~70 MB** (measured: sum of the sizes in the table below), which
+  is unnecessary repository weight for files that never change per-commit. A
+  full install is **two copies** — see below — so **~140 MB** total.
 - They are 3Brain's licensed SDK, not code we wrote, and not ours to
   redistribute.
 
-They come from the **3Brain SDK / BrainWave installation** on the lab machine.
-Copy them into `BioCam_DupleX_API/API/`:
+They come from the **3Brain SDK / BrainWave installation** on the lab machine,
+and are needed in **two places**:
+
+- `BioCam_DupleX_API/API/` — used by the Python scripts (`connector.py`,
+  `recorder.py`, `Hello_BioCam.py`, and `biocam.preflight`).
+- `BioCam_DupleX_API/SampleApp_BioCamCL/Dependencies/` — used by 3Brain's own
+  C# reference application (§11), which you will want buildable if you're
+  cross-checking a .NET call against known-working code rather than against
+  the XML alone. Copy the same seven files here too; a build of
+  `SampleApp_BioCamCL` will fail with missing-assembly errors otherwise.
+
+Copy the full set into both locations:
 
 | File | Size (bytes) |
 |---|---|
@@ -282,7 +294,10 @@ Each run writes two files: `<name>.raw` (the signal, §8) and
 committed to git — `.raw` files are gitignored everywhere except
 `tests/fixtures/` (§12), because a single session is gigabytes (§2).
 
-**Reading a recording back**, programmatically:
+**Reading a recording back**, programmatically. As with the CLI above, run
+this from inside `BioCam_DupleX_API/` (or otherwise put that directory on
+`sys.path`) — `recorder.py` imports `connector` by bare module name, which
+only resolves when `BioCam_DupleX_API/` is the working directory:
 
 ```python
 from recorder import load_recording
@@ -412,7 +427,7 @@ scheduling belongs on the instrument rather than in a Python loop).
 |---|---|---|
 | `TakeBioCamControl` returns `None` | BrainWave, or another 3Brain program (including a previous crashed Python process), still holds the device — only one process may control the BioCAM at a time | Close BrainWave and any other 3Brain software, then retry (§2) |
 | No device found / connection times out | USB not connected, or BioCAM not powered | Check the USB cable and power; confirm the BioCAM's status LED is on |
-| Plate not seated | `MeaPlate.IsConnected` is `False` after `TakeBioCamControl` succeeds | Reseat the MEA plate on the DupleX head and retry |
+| `MeaPlate.IsConnected` is `False` after `TakeBioCamControl` succeeds | The MEA plate is not seated on the DupleX head | Reseat the MEA plate on the DupleX head and retry |
 | **No stimulation output, with no error reported** | **Known defect.** The stimulator lifecycle is `Initialize → Start → Stop → Close`; `BioCam_DupleX_API/connector.py` calls `Initialize` and `Close` but never `Start()`, so pulses silently never fire | Add the missing `Start()` call, or wait for the Phase 1/2 rebuild (§14) — do not assume stimulation is working just because nothing errored |
 | Data-loss warnings, or gaps that look like signal but aren't | Acquisition period too short for the work being done per packet, or slow work inside the data callback (`recorder.py` currently writes to disk and prints inside the callback — a known defect, §7) | Increase `--packet-ms`; longer term, wait for the Phase 1 rebuild that moves I/O off the callback thread (§12 callback rule) |
 | `ModuleNotFoundError: No module named 'clr'` | `pythonnet` is not installed — you are on a development machine, not the lab machine | Use `requirements-dev.txt`, not `requirements.txt` (§5). Installing `pythonnet` is neither necessary nor sufficient without Windows + .NET Framework anyway (§3) |
@@ -474,22 +489,11 @@ Runs the entire suite with **no BioCAM and no 3Brain DLLs installed** — this
 is a structural guarantee, enforced by `tests/test_no_hardware_imports.py`,
 not a convention someone has to remember. Verified on this machine, from a
 freshly created virtual environment with only `requirements-dev.txt`
-installed:
-
-```
-============================= test session starts =============================
-platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0
-rootdir: ...\API
-configfile: pytest.ini
-testpaths: tests
-collected 27 items
-
-tests\test_fixture_integrity.py ..........                               [ 37%]
-tests\test_no_hardware_imports.py ...........                            [ 77%]
-tests\test_preflight.py ......                                           [100%]
-
-============================= 27 passed in 2.23s ==============================
-```
+installed: every test passed, with `test_no_hardware_imports.py` confirming
+that nothing under `tests/` or `biocam/` (outside `biocam/interop/`) imports
+`clr`, `pythonnet`, or `clr_loader`. Run the command yourself for the current
+pass/fail count and test names — pasting them here would go stale the moment
+Phase 1 adds a test.
 
 ### Fixtures
 

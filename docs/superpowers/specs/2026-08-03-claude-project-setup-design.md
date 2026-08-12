@@ -174,7 +174,9 @@ deliberately — per the staleness policy in §5, counts drift.)
 | `pytest.ini` | tests | Test configuration. |
 | `tests/test_fixture_integrity.py` | tests | Proves the fixture is internally consistent. |
 | `tests/test_no_hardware_imports.py` | tests | Guard: enforces that the suite needs no hardware. |
-| `tests/fixtures/sample_5s.raw` + `_meta.json` | tests | Real recorded signal, small enough to commit. |
+| `tests/test_preflight.py` | tests | Tests `biocam/preflight.py`'s check logic and report formatting. |
+| `tests/fixtures/sample_32ch_2s.raw` + `_meta.json` | tests | Real recorded signal, 32 channels × 2 s (~2.4 MB), small enough to commit. |
+| `tests/fixtures/sample_full_100frames.raw` + `_meta.json` | tests | Real recorded signal, full 4096 channels × 100 frames (~819 KB), for anything that depends on the full channel width. |
 
 ### Test fixture
 
