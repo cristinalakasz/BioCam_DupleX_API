@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(python -m biocam.preflight)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Read(//c/Users/crist/OneDrive/Desktop/BIOCOMPUTING/API/**)"
+    ]
+  }
+}
