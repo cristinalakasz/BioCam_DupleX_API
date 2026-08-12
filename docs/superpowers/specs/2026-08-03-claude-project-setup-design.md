@@ -170,6 +170,7 @@ deliberately — per the staleness policy in §5, counts drift.)
 | `.claude/agents/realtime-safety-reviewer.md` | Claude | Read-only callback-latency checker. §7. |
 | `.claude/agents/dsp-implementer.md` | Claude | Test-first implementer, Layers 2–3 only. §7. |
 | `.claude/settings.json` | Claude | Permissions for routine commands. |
+| `biocam/preflight.py` | humans + tests | Environment-only preflight check (`python -m biocam.preflight`): Python version, `numpy`, the seven DLLs. Does not detect the device or the plate — that arrives in Phase 1. Added here to close the gap where §5.5 and Gate 2 item 4 already depended on a preflight script this table never listed. |
 | `pytest.ini` | tests | Test configuration. |
 | `tests/test_fixture_integrity.py` | tests | Proves the fixture is internally consistent. |
 | `tests/test_no_hardware_imports.py` | tests | Guard: enforces that the suite needs no hardware. |
@@ -180,7 +181,19 @@ deliberately — per the staleness policy in §5, counts drift.)
 A few seconds cut from the existing 1.5 GB recording, with a matching metadata
 sidecar. Real signal rather than synthetic: recordings contain noise, drift, and
 artifacts nobody thinks to simulate, and detectors tuned on clean synthetic data
-degrade on real input. Cost is a few hundred KB committed permanently.
+degrade on real input.
+
+**Correction (2026-08-12, Task 8):** the original estimate of "a few hundred KB"
+for a few seconds of full-width data was wrong by three orders of magnitude.
+Measured reality: 18,557.72 Hz × 4096 channels × 2 bytes/sample ≈ 152 MB/s, so
+5 seconds of full-width data is ~760 MB — not committable. What was actually
+committed instead is two smaller fixtures: a 32-channel, 2-second subset
+(~2.4 MB) for general Layer 2/3 testing, and a 100-frame, full-4096-channel
+slice (~819 KB) for anything that specifically depends on
+`total_channels == 4096`. Layer 2 decoder tests additionally use synthetic
+byte buffers rather than either fixture, because asserting exact decoded
+output requires constructed input with a known answer in advance, which a real
+recording — whose correct decoding is the thing under test — cannot supply.
 
 ### Test scaffolding
 
