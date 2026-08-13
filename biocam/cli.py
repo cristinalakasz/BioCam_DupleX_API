@@ -39,6 +39,27 @@ def _queue_size_for(packet_ms: int) -> int:
     return max(MIN_QUEUE_SIZE, int(QUEUE_BUFFER_SECONDS * 1000 / packet_ms))
 
 
+def _packet_ms(value: str) -> int:
+    """argparse type for --packet-ms: a positive integer.
+
+    argparse's own `type=int` accepts 0 and negative values - 0 would divide
+    by zero in _queue_size_for(), and a negative value would silently floor
+    to MIN_QUEUE_SIZE instead of being rejected. Catching that here means the
+    CLI refuses before the device is even opened, with a message that names
+    the valid range, instead of dying inside queue sizing or accepting
+    nonsense.
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--packet-ms must be a positive integer (>= 1), got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"--packet-ms must be a positive integer (>= 1), got {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="biocam")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -49,8 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--name", type=str, default=None,
                         help="base name for the output files")
     record.add_argument("--output-dir", type=str, default="recordings")
-    record.add_argument("--packet-ms", type=int, default=1,
-                        help="acquisition period in milliseconds")
+    record.add_argument("--packet-ms", type=_packet_ms, default=1,
+                        help="acquisition period in milliseconds (positive integer, >= 1)")
 
     convert = sub.add_parser("convert", help="convert a recording to HDF5")
     convert.add_argument("raw")
@@ -112,8 +133,15 @@ def record_command(args) -> int:
                                             stop_event=stop, counters=source)
                 except KeyboardInterrupt:
                     stop.set()
-                    result = record_session(source, writer, stop_event=stop,
-                                            counters=source)
+                    # counters is intentionally omitted on this retry.
+                    # record_session's `finally` already transferred it from
+                    # `source` onto `writer` before this KeyboardInterrupt
+                    # reached us - that guarantee is what closes this path
+                    # against the same bug for every exit, not just a clean
+                    # one. Passing counters=source again here would add the
+                    # same cumulative totals from `source` a second time on
+                    # top of a writer that already has them.
+                    result = record_session(source, writer, stop_event=stop)
         finally:
             source.stop()
 

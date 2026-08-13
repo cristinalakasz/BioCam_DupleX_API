@@ -185,6 +185,26 @@ def test_verdict_read_from_a_schema_2_sidecar():
     assert integrity_verdict(modern) == "clean"
 
 
+def test_a_failed_run_reporting_clean_is_downgraded_to_unknown():
+    """status: failed means the recorder never got to say the run was fine -
+    a crash right after the last write leaves whatever came next, including
+    the raw file's tail, unverified. A 'clean' verdict in that block would
+    claim to know the whole run was fine; we only know it never finished, so
+    it must read 'unknown', the same reasoning already applied to a missing
+    schema_version."""
+    failed = {"schema_version": 2, "status": "failed", "integrity": {"verdict": "clean"}}
+    assert integrity_verdict(failed) == "unknown"
+
+
+def test_a_failed_run_with_recorded_gaps_still_reports_them():
+    """A crash does not erase gaps already detected before it. That is real,
+    more specific information than 'unknown', and downgrading it would throw
+    away what is actually known."""
+    failed = {"schema_version": 2, "status": "failed",
+              "integrity": {"verdict": "gaps_detected"}}
+    assert integrity_verdict(failed) == "gaps_detected"
+
+
 def test_load_recording_round_trips_values(tmp_path):
     raw, meta = _paths(tmp_path)
     with RecordingWriter(raw, meta, PARAMS) as writer:

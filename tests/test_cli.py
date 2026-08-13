@@ -1,6 +1,18 @@
 import pytest
 
-from biocam.cli import build_parser, main
+from biocam.cli import _queue_size_for, build_parser, main
+
+
+def test_queue_size_at_the_1ms_default_matches_the_spec_figure():
+    assert _queue_size_for(1) == 2000
+
+
+def test_queue_size_scales_down_for_a_longer_packet_period():
+    assert _queue_size_for(10) == 200
+
+
+def test_queue_size_has_a_floor_for_a_very_long_packet_period():
+    assert _queue_size_for(5000) == 100
 
 
 def test_parser_accepts_a_duration():
@@ -22,6 +34,35 @@ def test_parser_accepts_convert():
     args = build_parser().parse_args(["convert", "a.raw", "a_meta.json", "a.h5"])
     assert args.raw == "a.raw"
     assert args.out == "a.h5"
+
+
+def test_parser_accepts_a_positive_packet_ms():
+    args = build_parser().parse_args(["record", "--packet-ms", "10"])
+    assert args.packet_ms == 10
+
+
+def test_parser_has_a_packet_ms_default():
+    args = build_parser().parse_args(["record"])
+    assert args.packet_ms == 1
+
+
+def test_parser_rejects_a_zero_packet_ms():
+    """0 would divide by zero in _queue_size_for(); it must be refused at
+    parse time, before the device is even opened."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--packet-ms", "0"])
+
+
+def test_parser_rejects_a_negative_packet_ms():
+    """A negative value used to fall through to _queue_size_for()'s floor
+    silently; it must be refused instead."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--packet-ms", "-1"])
+
+
+def test_parser_rejects_a_non_integer_packet_ms():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--packet-ms", "abc"])
 
 
 def test_importing_the_cli_does_not_load_interop():

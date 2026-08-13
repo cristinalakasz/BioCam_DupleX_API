@@ -1,9 +1,10 @@
 import threading
 
 import numpy as np
+import pytest
 
 from biocam.data.recording import AcquisitionParameters, RecordingWriter, read_sidecar
-from biocam.data.replay import ReplayPacketSource
+from biocam.data.replay import Packet, ReplayPacketSource
 from biocam.session import SessionResult, record_session
 
 PARAMS = AcquisitionParameters(
@@ -94,3 +95,47 @@ def test_result_reports_the_paths_written(tmp_path):
         result = record_session(source, writer)
     assert result.raw_path == str(raw)
     assert result.meta_path == str(meta)
+
+
+class _ExplodingSource:
+    """Yields a couple of packets, like a driver session, then raises - the
+    scenario the reviewer probed: a source that dies mid-recording with
+    non-zero loss counters already accumulated."""
+
+    def __init__(self, driver_loss_events, queue_overflows, callback_errors):
+        self.driver_loss_events = driver_loss_events
+        self.queue_overflows = queue_overflows
+        self.callback_errors = callback_errors
+
+    def __iter__(self):
+        for counter in range(2):
+            yield Packet(timestamp=counter, counter=counter,
+                        payload=np.arange(4, dtype=np.uint16).tobytes())
+        raise RuntimeError("driver connection lost")
+
+
+def test_counters_reach_the_sidecar_even_when_the_source_raises(tmp_path):
+    """Before this fix, the counter transfer sat after the packet loop: an
+    exception raised mid-loop skipped it entirely, and
+    RecordingWriter.__exit__ then wrote the failed-run sidecar itself with
+    driver_loss_events, queue_overflows and callback_errors all still at
+    zero and verdict 'clean' - the same defect Critical 1 closed, reached by
+    a different route (the reviewer reproduced exactly this: 7/3/1 producing
+    an all-zero, 'clean' sidecar alongside status: 'failed'). Moving the
+    transfer into a `finally` closes it for every exit, not just the normal
+    ones. This test fails if the transfer moves back out of the `finally`,
+    because the RuntimeError below would once again skip it."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _ExplodingSource(driver_loss_events=7, queue_overflows=3, callback_errors=1)
+
+    with pytest.raises(RuntimeError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            record_session(source, writer, counters=source)
+
+    record = read_sidecar(meta)
+    assert record["status"] == "failed"
+    integrity = record["integrity"]
+    assert integrity["driver_loss_events"] == 7
+    assert integrity["queue_overflows"] == 3
+    assert integrity["callback_errors"] == 1
+    assert integrity["verdict"] != "clean"

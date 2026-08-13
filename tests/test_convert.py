@@ -104,6 +104,23 @@ def test_verify_detects_a_truncated_tail(tmp_path):
     assert verify(out, raw, meta) is False
 
 
+def test_convert_reports_unknown_not_clean_for_a_crashed_run(tmp_path):
+    """A recording that crashed before finalise() (status: failed) with no
+    counted loss must not have its HDF5 stamped integrity_verdict=clean -
+    the integrity block only reflects what happened up to the crash, not
+    what the rest of the run would have shown."""
+    raw, meta = tmp_path / "r.raw", tmp_path / "r_meta.json"
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(1, 1, np.arange(8, dtype=np.uint16).tobytes())
+            raise ValueError("boom")
+
+    out = tmp_path / "r.h5"
+    convert(raw, meta, out)
+    with h5py.File(out, "r") as handle:
+        assert handle.attrs["integrity_verdict"] == "unknown"
+
+
 def test_real_fixture_round_trips(tmp_path):
     """The strongest test available: real recorded signal, in and out."""
     from tests.test_fixture_integrity import FIXTURE_DIR

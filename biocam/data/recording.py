@@ -212,10 +212,24 @@ def integrity_verdict(meta: dict) -> str:
     'unknown'. It must never report 'clean': absence of evidence is not evidence
     of completeness, and defaulting the other way would launder an unverifiable
     file into a trusted one.
+
+    The same reasoning applies to `status: "failed"`. The integrity block only
+    reflects what the writer observed up to the moment it crashed - it says
+    nothing about what would have happened next, including whatever the raw
+    file's last, possibly partial, write left on disk. If nothing had gone
+    wrong yet at the point of failure, the block honestly computes 'clean',
+    but reporting that as the file's verdict would claim the whole run was
+    fine when what we actually know is narrower: the recorder never got to
+    say so. So a failed run downgrades a 'clean' verdict to 'unknown'.
+    Already-recorded loss ('gaps_detected') is real information the crash
+    does not erase, and is kept rather than downgraded.
     """
     if meta.get("schema_version", 0) < SCHEMA_VERSION:
         return VERDICT_UNKNOWN
-    return meta.get("integrity", {}).get("verdict", VERDICT_UNKNOWN)
+    verdict = meta.get("integrity", {}).get("verdict", VERDICT_UNKNOWN)
+    if meta.get("status") == "failed" and verdict == VERDICT_CLEAN:
+        return VERDICT_UNKNOWN
+    return verdict
 
 
 def load_recording(raw_path, meta_path, as_microvolts: bool = True):

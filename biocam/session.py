@@ -33,12 +33,16 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
 
     `counters`, if given, is the packet source itself (or anything exposing
     the same attributes). Its loss counters are transferred onto the writer
-    immediately before finalise() so they reach the sidecar unconditionally -
-    a caller that queries the source only after this call returns (as the CLI
-    used to) reads a writer that has already written and closed its final
-    sidecar, and those counts never make it to disk. getattr with a default
-    lets a source without these attributes (the replay source) pass through
-    untouched.
+    unconditionally on the way out - normal completion, a stop condition, or
+    an exception raised mid-loop - so they reach the sidecar however this
+    function exits. The transfer lives in a `finally` for exactly that last
+    case: an exception skips straight past a transfer that sat after the
+    loop, and RecordingWriter.__exit__ then writes the failed-run sidecar
+    itself with the counters still at zero - the same "counters never reach
+    disk" defect this parameter was added to close, reached by a different
+    route. The exception still propagates; only the transfer happens before
+    it does. getattr with a default lets a source without these attributes
+    (the replay source) pass through untouched.
     """
     frame_limit = None
     if duration_sec is not None:
@@ -46,23 +50,25 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
 
     stop_reason = "source_exhausted"
 
-    for packet in source:
-        writer.write_packet(
-            timestamp=packet.timestamp,
-            counter=packet.counter,
-            payload=packet.payload,
-        )
-        if stop_event is not None and stop_event.is_set():
-            stop_reason = "user_stopped"
-            break
-        if frame_limit is not None and writer.n_frames_written >= frame_limit:
-            stop_reason = "duration_reached"
-            break
+    try:
+        for packet in source:
+            writer.write_packet(
+                timestamp=packet.timestamp,
+                counter=packet.counter,
+                payload=packet.payload,
+            )
+            if stop_event is not None and stop_event.is_set():
+                stop_reason = "user_stopped"
+                break
+            if frame_limit is not None and writer.n_frames_written >= frame_limit:
+                stop_reason = "duration_reached"
+                break
+    finally:
+        if counters is not None:
+            writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
+            writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
+            writer.note_callback_errors(getattr(counters, "callback_errors", 0))
 
-    if counters is not None:
-        writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
-        writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
-        writer.note_callback_errors(getattr(counters, "callback_errors", 0))
     writer.finalise(stop_reason)
     return SessionResult(
         raw_path=str(writer.raw_path),
