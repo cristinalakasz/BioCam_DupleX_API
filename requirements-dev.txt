@@ -3,3 +3,4 @@
 # no BioCAM and no 3Brain DLLs. See tests/test_no_hardware_imports.py.
 numpy==2.5.2
 pytest==9.1.1
+h5py==3.16.0

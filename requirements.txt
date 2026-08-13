@@ -2,3 +2,4 @@
 # Requires Windows and .NET Framework 4.7+ — pythonnet will not install elsewhere.
 numpy==2.5.2
 pythonnet==3.1.0
+h5py==3.16.0
