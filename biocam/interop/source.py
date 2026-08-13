@@ -2,13 +2,21 @@
 
 The callback does four things and returns: read the header, copy the payload,
 put it on a bounded queue, return. Nothing else. No file I/O, no printing, no
-allocation beyond the copy, no locks.
+allocation beyond the copy, and no operation that can block: `put_nowait`
+only, never `put`. A `threading.Event` is used as a stop flag - a check, not
+a wait - so it never blocks the driver's event thread either.
 
 If the queue is full the packet is dropped and counted. Blocking the callback
-would stall the driver and lose more than the packet being saved.
+would stall the driver and lose more than the packet being saved. If the
+callback itself raises - the driver's docs allow a null payload for a chunk
+where nothing was retrieved, and `bytes(None)` is a `TypeError` - the
+exception is caught and counted rather than allowed to cross back into the
+.NET dispatcher, whose behavior on a Python exception is undocumented and
+cannot be tested here.
 """
 
 import queue
+import threading
 
 from biocam.data.events import QueuePressure
 from biocam.data.replay import Packet
@@ -16,6 +24,11 @@ from biocam.data.replay import Packet
 STOP = object()
 
 PRESSURE_FRACTION = 0.8
+
+# How long __iter__ waits on an empty queue before re-checking the stop
+# flag. Paid only while idle, waiting for the next packet - never inside a
+# driver callback - so it does not compete with the 1 ms packet budget.
+POLL_INTERVAL_SEC = 0.1
 
 
 class DriverPacketSource:
@@ -30,51 +43,22 @@ class DriverPacketSource:
         self._handler = None
         self._loss_handler = None
         self._error_handler = None
+        self._stop_event = threading.Event()
         self.queue_overflows = 0
         self.driver_loss_events = 0
+        self.callback_errors = 0
         self._streaming = False
 
-    def start(self, packet_timespan_ms: int = 1) -> None:
-        biocam = self._device.biocam
+    def _unsubscribe(self, biocam):
+        """Detach every handler this instance may have subscribed.
 
-        def on_data(_sender, args):
-            try:
-                self._queue.put_nowait(Packet(
-                    timestamp=args.Header.Timestamp,
-                    counter=args.Header.PacketCounter,
-                    payload=bytes(args.Payload),
-                ))
-            except queue.Full:
-                self.queue_overflows += 1
-
-        def on_loss(_sender, args):
-            self.driver_loss_events += 1
-
-        def on_error(_sender, _args):
-            self._queue.put(STOP)
-
-        self._handler = on_data
-        self._loss_handler = on_loss
-        self._error_handler = on_error
-
-        biocam.DataReceived += self._handler
-        biocam.DataLossAsync += self._loss_handler
-        biocam.DataStreamingError += self._error_handler
-
-        started = biocam.StartDataStreaming(
-            dataPacketTimeSpanMs=packet_timespan_ms,
-            optimizeDataPacketLatency=True,
-        )
-        if not started:
-            raise RuntimeError("StartDataStreaming failed.")
-        self._streaming = True
-
-    def stop(self) -> None:
-        biocam = self._device.biocam
-        stopped_ok = True
-        if self._streaming:
-            stopped_ok = biocam.StopDataStreaming()
-            self._streaming = False
+        Safe to call any number of times, including before any start() call:
+        a handler that was never subscribed is skipped (still None), and a
+        driver-side failure to detach one handler does not stop the others
+        from being tried. Used both to clear a stale subscription from a
+        previous start() before subscribing again, and to unwind a start()
+        that failed partway through.
+        """
         if self._handler is not None:
             try:
                 biocam.DataReceived -= self._handler
@@ -90,14 +74,109 @@ class DriverPacketSource:
                 biocam.DataStreamingError -= self._error_handler
             except Exception:
                 pass
-        self._queue.put(STOP)
+
+    def start(self, packet_timespan_ms: int = 1) -> None:
+        biocam = self._device.biocam
+        self._stop_event.clear()
+
+        # Detach any handlers left over from a previous start() - including
+        # one that failed after subscribing - before subscribing again.
+        # MainForm.cs:143-148 does the same: unsubscribe immediately before
+        # subscribing rather than assuming a clean slate.
+        self._unsubscribe(biocam)
+
+        def on_data(_sender, args):
+            try:
+                packet = Packet(
+                    timestamp=args.Header.Timestamp,
+                    counter=args.Header.PacketCounter,
+                    payload=bytes(args.Payload),
+                )
+            except Exception:
+                # Covers a null Payload (documented as possible when no data
+                # was retrieved) and any other marshaling failure. Never let
+                # an exception cross back into the .NET dispatcher.
+                self.callback_errors += 1
+                return
+            try:
+                self._queue.put_nowait(packet)
+            except queue.Full:
+                self.queue_overflows += 1
+
+        def on_loss(_sender, args):
+            try:
+                self.driver_loss_events += 1
+            except Exception:
+                self.callback_errors += 1
+
+        def on_error(_sender, _args):
+            try:
+                self._stop_event.set()
+                try:
+                    self._queue.put_nowait(STOP)
+                except queue.Full:
+                    # The consumer will notice via _stop_event on its next
+                    # poll; a full queue must never make this handler wait -
+                    # DataStreamingError fires exactly when the queue is
+                    # most likely to be full and nothing may be draining it.
+                    pass
+            except Exception:
+                self.callback_errors += 1
+
+        self._handler = on_data
+        self._loss_handler = on_loss
+        self._error_handler = on_error
+
+        biocam.DataReceived += self._handler
+        biocam.DataLossAsync += self._loss_handler
+        biocam.DataStreamingError += self._error_handler
+
+        try:
+            started = biocam.StartDataStreaming(
+                dataPacketTimeSpanMs=packet_timespan_ms,
+                optimizeDataPacketLatency=True,
+            )
+            if not started:
+                raise RuntimeError("StartDataStreaming failed.")
+        except Exception:
+            # A failed start must not leave three live handlers subscribed:
+            # that leaks a Python closure into the driver for the rest of
+            # the process, and a second start() call would leak another set
+            # on top of it.
+            self._unsubscribe(biocam)
+            raise
+        self._streaming = True
+
+    def stop(self) -> None:
+        biocam = self._device.biocam
+        stopped_ok = True
+        if self._streaming:
+            stopped_ok = biocam.StopDataStreaming()
+            if stopped_ok:
+                self._streaming = False
+            # If it failed, leave _streaming True so a retried stop() calls
+            # StopDataStreaming() again instead of silently skipping it.
+        self._unsubscribe(biocam)
+        self._stop_event.set()
+        try:
+            self._queue.put_nowait(STOP)
+        except queue.Full:
+            # __iter__ still returns: it re-checks _stop_event on every
+            # empty-queue poll, so the sentinel is a fast path, not the
+            # only way out.
+            pass
         if not stopped_ok:
             raise RuntimeError("StopDataStreaming failed.")
 
     def __iter__(self):
         threshold = int(self._queue_size * PRESSURE_FRACTION)
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=POLL_INTERVAL_SEC)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    return
+                continue
             if item is STOP:
                 return
             depth = self._queue.qsize()

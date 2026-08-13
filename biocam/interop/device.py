@@ -22,9 +22,11 @@ def load_assemblies(dll_dir=None) -> None:
     import sys
 
     dll_dir = Path(dll_dir or DEFAULT_DLL_DIR)
-    os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ["PATH"]
-    if str(dll_dir) not in sys.path:
-        sys.path.insert(0, str(dll_dir))
+    path_str = str(dll_dir)
+    if path_str not in os.environ["PATH"].split(os.pathsep):
+        os.environ["PATH"] = path_str + os.pathsep + os.environ["PATH"]
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
     import pythonnet
     pythonnet.load("netfx")
@@ -68,22 +70,34 @@ class BioCamDevice:
                 "is closed - it holds the device."
             )
 
-        self.biocam = BioCamPool.TakeBioCamControl(self._slot_index)
-        if self.biocam is None:
-            BioCamPool.Deactivate()
-            raise RuntimeError(
-                "TakeBioCamControl returned nothing. Close BrainWave or any "
-                "other 3Brain software and try again."
-            )
-        if not self.biocam.IsConnected:
+        # From here on, any failure - including one that raises instead of
+        # returning falsy, which the XML doc does not rule out - must still
+        # release the slot and deactivate the pool. Otherwise the BioCAM
+        # stays claimed until the process dies, and the next person on the
+        # instrument finds it held by nothing.
+        try:
+            self.biocam = BioCamPool.TakeBioCamControl(self._slot_index)
+            if self.biocam is None:
+                raise RuntimeError(
+                    "TakeBioCamControl returned nothing. Close BrainWave or "
+                    "any other 3Brain software and try again."
+                )
+            if not self.biocam.IsConnected:
+                raise RuntimeError("BioCAM reports it is not connected.")
+            if not self.biocam.MeaPlate.IsConnected:
+                raise RuntimeError("The MEA plate is not seated.")
+        except Exception:
             self.__exit__(None, None, None)
-            raise RuntimeError("BioCAM reports it is not connected.")
-        if not self.biocam.MeaPlate.IsConnected:
-            self.__exit__(None, None, None)
-            raise RuntimeError("The MEA plate is not seated.")
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if self._pool is None:
+            # __enter__ never got as far as BioCamPool.Activate() (e.g.
+            # load_assemblies() itself failed). Nothing was claimed.
+            self._slot_index = -1
+            self.biocam = None
+            return False
         try:
             if self._slot_index >= 0:
                 self._pool.ReleaseBioCamControl(self._slot_index)
