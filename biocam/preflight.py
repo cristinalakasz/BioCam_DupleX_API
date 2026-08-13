@@ -11,6 +11,7 @@ Usage:
 """
 
 import importlib
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +92,30 @@ def format_report(results):
     else:
         lines.append(f"{failures} CHECK{'S' if failures != 1 else ''} FAILED")
     return "\n".join(lines)
+
+
+def bytes_per_second(total_channels: int, ch_sample_byte_size: int,
+                     frame_rate_hz: float) -> float:
+    """Raw data rate of a recording, in bytes per second."""
+    return total_channels * ch_sample_byte_size * frame_rate_hz
+
+
+def check_disk_space(directory, planned_seconds: float,
+                     bytes_per_sec: float) -> CheckResult:
+    """Whether the drive holds a recording of the planned length.
+
+    Losing the final hour of an experiment to a full disk is entirely
+    preventable, and this is where it is prevented. See
+    docs/lab/storage-setup.md for the arithmetic behind the rate.
+    """
+    directory = Path(directory)
+    required = int(planned_seconds * bytes_per_sec)
+    free = shutil.disk_usage(directory).free
+    return CheckResult(
+        f"disk space for {planned_seconds:g}s",
+        free >= required,
+        f"{free:,} bytes free in {directory}, {required:,} required",
+    )
 
 
 def main():
