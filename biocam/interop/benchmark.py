@@ -11,13 +11,16 @@ Usage:
     python -m biocam.interop.benchmark
 """
 
+import statistics
 import time
+from ctypes import addressof, c_char
 from pathlib import Path
 
 DLL_DIR = Path(__file__).resolve().parent.parent.parent / "BioCam_DupleX_API" / "API"
 
 PAYLOAD_BYTES = 152_000      # ~1 ms at the reference rate
 REPEATS = 2000
+WARMUP = 3
 
 
 def _load_runtime():
@@ -28,16 +31,46 @@ def _load_runtime():
     clr.AddReference(str(DLL_DIR / "3Brain.BioCamDriver.dll"))
 
 
+def _expected_pattern():
+    """A recognisable, non-zero byte pattern. A strategy that returns a
+    correctly-sized block of zeros (or garbage) must still fail verification,
+    so every value in range 1..251 is used and the sequence repeats with a
+    period that does not evenly divide PAYLOAD_BYTES-aligned chunks."""
+    return bytes((i % 251) + 1 for i in range(PAYLOAD_BYTES))
+
+
+def _verify(label, fn, payload, expected):
+    """Run the strategy once outside the timed loop and confirm it actually
+    produced PAYLOAD_BYTES of the expected content. Without this, a strategy
+    that silently short-circuits or copies the wrong bytes would still get a
+    (meaningless) timing number."""
+    result = bytes(fn(payload))
+    if len(result) != PAYLOAD_BYTES:
+        raise AssertionError(
+            f"{label}: expected {PAYLOAD_BYTES:,} bytes, got {len(result):,}"
+        )
+    if result != expected:
+        raise AssertionError(f"{label}: copied content does not match the expected pattern")
+    print(f"{label:<34} verified: {len(result):,} bytes match expected pattern")
+
+
 def _time(label, fn, payload):
-    fn(payload)                                  # warm up
+    for _ in range(WARMUP):
+        fn(payload)
+    samples = []
     start = time.perf_counter()
     for _ in range(REPEATS):
+        call_start = time.perf_counter()
         fn(payload)
+        samples.append(time.perf_counter() - call_start)
     elapsed = time.perf_counter() - start
-    per_call_us = elapsed / REPEATS * 1e6
+    mean_us = elapsed / REPEATS * 1e6
+    median_us = statistics.median(samples) * 1e6
     mb_per_s = (PAYLOAD_BYTES * REPEATS / 1e6) / elapsed
-    print(f"{label:<34} {per_call_us:8.1f} us/packet   {mb_per_s:8.0f} MB/s")
-    return per_call_us
+    print(
+        f"{label:<34} mean {mean_us:7.1f} us   median {median_us:7.1f} us   {mb_per_s:8.0f} MB/s"
+    )
+    return mean_us, median_us
 
 
 def main():
@@ -45,17 +78,28 @@ def main():
     import System
     from System.Runtime.InteropServices import Marshal
 
-    payload = System.Array.CreateInstance(System.Byte, PAYLOAD_BYTES)
+    expected = _expected_pattern()
+    payload = System.Array[System.Byte](expected)
 
-    print(f"payload {PAYLOAD_BYTES:,} bytes, {REPEATS:,} repeats\n")
+    print(f"payload {PAYLOAD_BYTES:,} bytes, {REPEATS:,} repeats, {WARMUP} warm-up calls\n")
+
+    print("Verification (run once, outside the timed loop):")
+    _verify("bytes(payload)", lambda p: bytes(p), payload, expected)
+
+    # All ctypes machinery is built exactly once, outside the timed closure,
+    # so the timed call does nothing but Marshal.Copy itself.
+    buffer = bytearray(PAYLOAD_BYTES)
+    view = (c_char * PAYLOAD_BYTES).from_buffer(buffer)
+    dest_ptr = System.IntPtr(addressof(view))
+
+    def marshal_copy(p):
+        Marshal.Copy(p, 0, dest_ptr, PAYLOAD_BYTES)
+        return buffer
+
+    _verify("Marshal.Copy into bytearray", marshal_copy, payload, expected)
+    print()
 
     _time("bytes(payload)", lambda p: bytes(p), payload)
-
-    buffer = bytearray(PAYLOAD_BYTES)
-    def marshal_copy(p):
-        from ctypes import addressof, c_char
-        target = (c_char * PAYLOAD_BYTES).from_buffer(buffer)
-        Marshal.Copy(p, 0, System.IntPtr(addressof(target)), PAYLOAD_BYTES)
     _time("Marshal.Copy into bytearray", marshal_copy, payload)
 
     budget_us = 1000.0
