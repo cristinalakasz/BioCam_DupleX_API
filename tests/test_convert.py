@@ -84,6 +84,26 @@ def test_verify_rejects_a_corrupted_conversion(tmp_path):
     assert verify(out, raw, meta) is False
 
 
+def test_verify_detects_a_truncated_tail(tmp_path):
+    """write_packet never requires a payload to be frame-aligned (see its
+    docstring in recording.py), so a session whose last packet ends mid-frame
+    - a crash, or a driver-reported partial chunk - leaves a raw file whose
+    byte count is not a whole multiple of bytes_per_frame. _load_raw() floor-
+    divides that remainder away on every call, so comparing two calls to it
+    against each other can never see the truncation - verify() must check the
+    raw file's actual size instead."""
+    raw, meta = tmp_path / "r.raw", tmp_path / "r_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        # bytes_per_frame is 8 (4 channels x 2 bytes); 12 bytes is 1.5 frames,
+        # so 4 trailing bytes are not a whole frame.
+        writer.write_packet(1, 1, np.arange(6, dtype=np.uint16).tobytes())
+        writer.finalise("duration_reached")
+
+    out = tmp_path / "r.h5"
+    convert(raw, meta, out)
+    assert verify(out, raw, meta) is False
+
+
 def test_real_fixture_round_trips(tmp_path):
     """The strongest test available: real recorded signal, in and out."""
     from tests.test_fixture_integrity import FIXTURE_DIR

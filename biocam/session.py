@@ -23,13 +23,22 @@ class SessionResult:
 
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
-                   stop_event=None) -> SessionResult:
+                   stop_event=None, counters=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
     been written, or when stop_event is set. Duration is measured in recorded
     frames rather than wall-clock, so it means the same thing for a live
     instrument and for a replay.
+
+    `counters`, if given, is the packet source itself (or anything exposing
+    the same attributes). Its loss counters are transferred onto the writer
+    immediately before finalise() so they reach the sidecar unconditionally -
+    a caller that queries the source only after this call returns (as the CLI
+    used to) reads a writer that has already written and closed its final
+    sidecar, and those counts never make it to disk. getattr with a default
+    lets a source without these attributes (the replay source) pass through
+    untouched.
     """
     frame_limit = None
     if duration_sec is not None:
@@ -50,6 +59,10 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
             stop_reason = "duration_reached"
             break
 
+    if counters is not None:
+        writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
+        writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
+        writer.note_callback_errors(getattr(counters, "callback_errors", 0))
     writer.finalise(stop_reason)
     return SessionResult(
         raw_path=str(writer.raw_path),

@@ -64,7 +64,8 @@ def convert(raw_path, meta_path, out_path, compression: str = "gzip",
                 continue
             handle.attrs[key] = value
         handle.attrs["integrity_verdict"] = verdict
-        for key in ("n_frames_missing", "driver_loss_events", "queue_overflows"):
+        for key in ("n_frames_missing", "driver_loss_events", "queue_overflows",
+                    "callback_errors"):
             handle.attrs[key] = meta.get("integrity", {}).get(key, -1)
 
     return {
@@ -76,12 +77,32 @@ def convert(raw_path, meta_path, out_path, compression: str = "gzip",
 
 
 def verify(out_path, raw_path, meta_path) -> bool:
-    """True if the HDF5 file reproduces the raw bytes exactly."""
+    """True if the HDF5 file reproduces the raw bytes exactly.
+
+    Comparing `_load_raw()` against `_load_raw()` only proves the two calls
+    agree with each other - both floor-divide to a whole number of frames, so
+    a raw file with a trailing partial frame gets truncated identically on
+    both sides and the discrepancy cancels out. That is not the same claim as
+    "the HDF5 file reproduces the raw data exactly": it must be checked
+    against what the raw file actually contains on disk, not against a second
+    reading of the same truncation.
+    """
     meta = read_sidecar(meta_path)
     expected = _load_raw(raw_path, meta)
     with h5py.File(out_path, "r") as handle:
         restored = handle["data"][:]
-    return bool(restored.shape == expected.shape and np.array_equal(restored, expected))
+    if restored.shape != expected.shape or not np.array_equal(restored, expected):
+        return False
+
+    bytes_per_frame = meta["total_channels"] * meta["ch_sample_byte_size"]
+    raw_bytes = Path(raw_path).stat().st_size
+    converted_bytes = expected.shape[0] * bytes_per_frame
+    remainder = raw_bytes - converted_bytes
+    if remainder:
+        print(f"VERIFY: {remainder} trailing byte(s) in {raw_path} were not "
+              "a whole frame and are not represented in the HDF5 output.")
+        return False
+    return True
 
 
 def main(argv=None) -> int:

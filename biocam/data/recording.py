@@ -61,6 +61,7 @@ class RecordingWriter:
         self._last_timestamp: Optional[int] = None
         self._driver_loss = 0
         self._queue_overflows = 0
+        self._callback_errors = 0
         self._started_utc = None
         self._finalised = False
 
@@ -122,6 +123,9 @@ class RecordingWriter:
     def note_queue_overflow(self, count: int = 1) -> None:
         self._queue_overflows += count
 
+    def note_callback_errors(self, count: int = 1) -> None:
+        self._callback_errors += count
+
     def finalise(self, stop_reason: str) -> None:
         if self._file is not None:
             self._file.flush()
@@ -152,8 +156,18 @@ class RecordingWriter:
     @property
     def verdict(self) -> str:
         if (self._tracker.gaps or self._driver_loss or self._queue_overflows
-                or self._tracker.counter_anomalies):
+                or self._callback_errors):
             return VERDICT_GAPS
+        if self._tracker.counter_anomalies:
+            # A counter anomaly is not a gap: GapTracker deliberately declines
+            # to turn an anomalous step into a Gap record (see integrity.py),
+            # so there are no missing frames on file to point to - reporting
+            # gaps_detected here would pair that verdict with an empty gaps
+            # list and n_frames_missing == 0, a self-contradictory record. It
+            # is also not evidence of a clean run: something moved the
+            # counter in a way we cannot interpret. `unknown` is the only
+            # verdict that does not claim more than we actually know.
+            return VERDICT_UNKNOWN
         return VERDICT_CLEAN
 
     def _emit(self, event) -> None:
@@ -179,6 +193,7 @@ class RecordingWriter:
                 "gaps": [asdict(g) for g in self._tracker.gaps],
                 "driver_loss_events": self._driver_loss,
                 "queue_overflows": self._queue_overflows,
+                "callback_errors": self._callback_errors,
                 "counter_anomalies": self._tracker.counter_anomalies,
             },
         })

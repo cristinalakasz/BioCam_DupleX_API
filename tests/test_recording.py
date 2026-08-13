@@ -95,6 +95,18 @@ def test_driver_loss_and_queue_overflow_are_counted_separately(tmp_path):
     assert integrity["verdict"] == "gaps_detected"
 
 
+def test_callback_errors_are_counted_and_reach_the_sidecar(tmp_path):
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.note_callback_errors(3)
+        writer.finalise("error")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["callback_errors"] == 3
+    assert integrity["verdict"] == "gaps_detected"
+
+
 def test_counter_anomaly_alone_is_non_clean_and_lands_in_sidecar(tmp_path):
     """A counter moving backwards is not a gap and not a clean run - we do not
     know what happened, so the verdict must not claim either."""
@@ -107,7 +119,7 @@ def test_counter_anomaly_alone_is_non_clean_and_lands_in_sidecar(tmp_path):
     integrity = read_sidecar(meta)["integrity"]
     assert integrity["counter_anomalies"] == 1
     assert integrity["gaps"] == []
-    assert integrity["verdict"] == "gaps_detected"
+    assert integrity["verdict"] == "unknown"
 
 
 def test_partial_frame_payloads_still_yield_a_correct_frame_count(tmp_path):

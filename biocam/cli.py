@@ -20,6 +20,24 @@ from biocam.data.recording import AcquisitionParameters, RecordingWriter
 from biocam.preflight import bytes_per_second, check_disk_space
 from biocam.session import record_session
 
+# Queue default: approximately two seconds of buffering (design spec §6). That
+# reasoning is stated in packets-per-second, not in a fixed packet count - it
+# only comes out to 2000 packets at the 1 ms default. Sizing the queue with a
+# fixed packet count instead of this formula would silently redefine "two
+# seconds" at any other --packet-ms: 10 ms packets would need only ~200 of
+# them for two seconds, while a fixed 2000-packet queue at 10 ms packets would
+# ask for roughly 3 GB. MIN_QUEUE_SIZE keeps a long packet period (few
+# packets, but a burst can still arrive) from being sized down to something
+# that overflows immediately.
+QUEUE_BUFFER_SECONDS = 2.0
+MIN_QUEUE_SIZE = 100
+
+
+def _queue_size_for(packet_ms: int) -> int:
+    """Queue capacity for roughly QUEUE_BUFFER_SECONDS of packets at the
+    chosen acquisition period, with a floor."""
+    return max(MIN_QUEUE_SIZE, int(QUEUE_BUFFER_SECONDS * 1000 / packet_ms))
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="biocam")
@@ -82,7 +100,8 @@ def record_command(args) -> int:
                                required_bytes=int(args.duration * rate)))
                 return 1
 
-        source = DriverPacketSource(device, listener=report)
+        source = DriverPacketSource(device, queue_size=_queue_size_for(args.packet_ms),
+                                    listener=report)
         source.start(packet_timespan_ms=args.packet_ms)
         try:
             with RecordingWriter(raw_path, meta_path, params,
@@ -90,12 +109,11 @@ def record_command(args) -> int:
                 try:
                     result = record_session(source, writer,
                                             duration_sec=args.duration,
-                                            stop_event=stop)
+                                            stop_event=stop, counters=source)
                 except KeyboardInterrupt:
                     stop.set()
-                    result = record_session(source, writer, stop_event=stop)
-                writer.note_driver_loss(source.driver_loss_events)
-                writer.note_queue_overflow(source.queue_overflows)
+                    result = record_session(source, writer, stop_event=stop,
+                                            counters=source)
         finally:
             source.stop()
 

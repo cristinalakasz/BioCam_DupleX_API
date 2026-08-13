@@ -5,9 +5,10 @@
 **Predecessor:** Phase 0 setup, `2026-08-03-claude-project-setup-design.md`
 **Roadmap:** `2026-08-12-api-roadmap-decomposition.md` §2
 
-Rebuilds the recording path on the three-layer split. Closes ten of the eleven
-defects catalogued in the Phase 0 spec's Appendix A, most of them as a
-consequence of the structure rather than as individual patches.
+Rebuilds the recording path on the three-layer split. Closes eight of the
+eleven defects catalogued in the Phase 0 spec's Appendix A, most of them as a
+consequence of the structure rather than as individual patches. Defects 3, 6
+and 11 are deferred or unverified rather than closed - see §10.
 
 ---
 
@@ -153,7 +154,10 @@ hardware samples went missing.
 ```
 
 `status` is one of `in_progress`, `complete`, `failed`.
-`stop_reason` is one of `duration_reached`, `user_stopped`, `error`.
+`stop_reason` is one of `duration_reached`, `user_stopped`, `error`,
+`source_exhausted` (the packet source ran out on its own - a replay reaching
+the end of its file, or a driver session that stopped supplying packets
+without an error being reported).
 `verdict` is one of `clean`, `gaps_detected`, `unknown`.
 
 `first_timestamp` and `last_timestamp` are the instrument's own clock values in
@@ -356,12 +360,14 @@ From the Phase 0 spec's Appendix A:
 | 8 | `optimizeDataPacketLatency` unused | Closed |
 | 9 | Inconsistent pythonnet initialisation | Closed — one `device.py` |
 | 10 | `import threading` after use | Closed — rewritten |
-| 11 | Process and thread priority not raised | Closed |
+| 11 | Process and thread priority not raised | **Not done** — nothing in this branch sets process or thread priority; belongs on the Gate 2 untested list |
 
-**Nine closed outright.** Defect 3 belongs to Phase 2. Defect 6 is designed for
+**Eight closed outright.** Defect 3 belongs to Phase 2. Defect 6 is designed for
 but cannot honestly be called closed until it has been measured at the real data
 rate, which needs the instrument — so it belongs on the Gate 2 untested list, not
-in the closed column.
+in the closed column. Defect 11 was never attempted in this branch — no code
+here sets process or thread priority — so it joins defect 6 on that same
+untested list rather than being counted as closed.
 
 ---
 
