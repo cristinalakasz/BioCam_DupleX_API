@@ -17,6 +17,10 @@
 recordings/*
 !recordings/*_meta.json
 
+# Test fixtures are deliberately committed: small slices of real signal, needed
+# to test analysis code on a machine with no instrument.
+!tests/fixtures/*.raw
+
 # --- Build output ------------------------------------------------------
 bin/
 obj/

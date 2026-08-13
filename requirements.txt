@@ -1,0 +1,4 @@
+# Runtime dependencies for running the BioCAM on the lab machine.
+# Requires Windows and .NET Framework 4.7+ — pythonnet will not install elsewhere.
+numpy==2.5.2
+pythonnet==3.1.0
