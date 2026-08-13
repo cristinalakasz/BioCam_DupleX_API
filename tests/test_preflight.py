@@ -1,3 +1,4 @@
+import pytest
 import sys
 from pathlib import Path
 
@@ -50,3 +51,29 @@ def test_report_ends_with_an_overall_verdict():
     failing = format_report([CheckResult("a", False, "")])
     assert passing.strip().endswith("ALL CHECKS PASSED")
     assert "1 CHECK FAILED" in failing
+
+
+def test_bytes_per_second_matches_the_reference_recording():
+    from biocam.preflight import bytes_per_second
+    rate = bytes_per_second(total_channels=4096, ch_sample_byte_size=2,
+                            frame_rate_hz=18557.720703125)
+    assert rate == pytest.approx(152_024_848, rel=1e-6)
+
+
+def test_disk_check_passes_when_there_is_room(tmp_path):
+    from biocam.preflight import check_disk_space
+    result = check_disk_space(tmp_path, planned_seconds=1, bytes_per_sec=1000)
+    assert result.ok is True
+    assert "1,000" in result.detail or "1000" in result.detail
+
+
+def test_disk_check_fails_when_the_requirement_exceeds_free_space(tmp_path):
+    from biocam.preflight import check_disk_space
+    result = check_disk_space(tmp_path, planned_seconds=10**9, bytes_per_sec=10**9)
+    assert result.ok is False
+
+
+def test_disk_check_names_the_directory_it_examined(tmp_path):
+    from biocam.preflight import check_disk_space
+    result = check_disk_space(tmp_path, planned_seconds=1, bytes_per_sec=1)
+    assert str(tmp_path) in result.detail

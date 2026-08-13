@@ -547,20 +547,31 @@ def test_carries_a_partial_frame_to_the_next_call():
 
 
 def test_no_sample_is_ever_dropped_across_many_ragged_packets():
+    """Feed deliberately uneven packets; every sample must come back in order.
+
+    Sizes cycle so that packet boundaries land at every possible offset within
+    a frame - which is the situation that made the original code lose data.
+    """
+    import itertools
+
     decoder = FrameDecoder(total_channels=4, ch_sample_byte_size=2)
     source = np.arange(400, dtype=np.uint16)
+    sizes = itertools.cycle([3, 7, 1, 11, 5, 13])
     recovered = []
     cursor = 0
-    for size in [3, 7, 1, 11, 5, 13]:                          # deliberately ragged
-        while cursor < len(source):
-            chunk = source[cursor:cursor + size]
-            cursor += size
-            block = decoder.decode(chunk.tobytes())
-            if block.size:
-                recovered.append(block)
+    while cursor < len(source):
+        size = next(sizes)
+        chunk = source[cursor:cursor + size]
+        cursor += size
+        block = decoder.decode(chunk.tobytes())
+        if block.size:
+            recovered.append(block)
+
     joined = np.concatenate(recovered).reshape(-1)
     assert joined.tolist() == source[:len(joined)].tolist()
-    assert len(joined) >= len(source) - 4
+    # At most one incomplete frame may remain held back.
+    assert len(source) - len(joined) < 4
+    assert decoder.pending_bytes == (len(source) - len(joined)) * 2
 
 
 def test_empty_payload_yields_no_frames():
