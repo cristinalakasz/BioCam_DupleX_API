@@ -69,7 +69,10 @@ somewhere data is kept. Everything streams over USB to the host in real time,
 which is also why a disk stall is unforgiving: there is no meaningful buffer
 upstream to absorb it.
 
-If an official figure is ever needed, it is a support enquiry to 3Brain.
+An official figure has been requested from 3Brain, along with several other
+questions this documentation cannot answer. See
+[`docs/vendor/3brain-correspondence.md`](../vendor/3brain-correspondence.md) for
+what was asked and whatever has come back.
 
 ---
 
