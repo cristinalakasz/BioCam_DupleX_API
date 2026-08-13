@@ -38,14 +38,14 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     stop_reason = "source_exhausted"
 
     for packet in source:
-        if stop_event is not None and stop_event.is_set():
-            stop_reason = "user_stopped"
-            break
         writer.write_packet(
             timestamp=packet.timestamp,
             counter=packet.counter,
             payload=packet.payload,
         )
+        if stop_event is not None and stop_event.is_set():
+            stop_reason = "user_stopped"
+            break
         if frame_limit is not None and writer.n_frames_written >= frame_limit:
             stop_reason = "duration_reached"
             break

@@ -47,9 +47,11 @@ def test_stops_when_the_stop_event_is_set(tmp_path):
     source, _ = _source(tmp_path, 1000, frames_per_packet=10)
     raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
     stop = threading.Event()
+    pulled = []
 
     def stopping_after_three(packets):
         for index, packet in enumerate(packets):
+            pulled.append(index)
             yield packet
             if index == 2:
                 stop.set()
@@ -58,7 +60,18 @@ def test_stops_when_the_stop_event_is_set(tmp_path):
         result = record_session(stopping_after_three(source), writer, stop_event=stop)
 
     assert result.stop_reason == "user_stopped"
-    assert result.n_frames == 30
+    # The session never discards a packet it has already pulled from the
+    # source: it writes first, then checks stop_event. `stop` is set from
+    # inside the generator's post-yield code for packet index 2, which only
+    # runs once the loop asks for packet index 3 - so packet 3 has already
+    # been pulled and handed to record_session by the time the flag becomes
+    # visible. That packet gets written before the loop breaks, so four
+    # packets (40 frames) are recorded, not three. A stop that lands one
+    # packet late is invisible; a recording that silently drops signal it
+    # already received is not - so this 40, not 30, is correct on purpose.
+    assert pulled == [0, 1, 2, 3]
+    assert result.n_frames == 40
+    assert result.n_frames == len(pulled) * 10  # every pulled packet was written
 
 
 def test_an_injected_gap_reaches_the_sidecar(tmp_path):
