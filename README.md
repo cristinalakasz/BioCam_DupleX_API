@@ -85,6 +85,14 @@ short on purpose.
    is gitignored and is **not** in a fresh clone) is ~1.5 GB, consistent with
    this rate.
 
+   **Where the recording is written matters as much as how much room there is.**
+   Never record into a OneDrive or other synced folder, onto a network share, or
+   onto the Windows drive — each loses data in a way this software cannot yet
+   detect. Setting a machine up correctly, including a sustained-write test the
+   drive must pass, is covered in
+   [`docs/lab/storage-setup.md`](docs/lab/storage-setup.md). Read it before the
+   first recording on any new machine.
+
 ---
 
 ## 3. Hardware and requirements
