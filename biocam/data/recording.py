@@ -56,7 +56,7 @@ class RecordingWriter:
 
         self._file = None
         self._tracker = GapTracker(frame_rate_hz=params.frame_rate_hz)
-        self._n_frames = 0
+        self._bytes_written = 0
         self._first_timestamp: Optional[int] = None
         self._last_timestamp: Optional[int] = None
         self._driver_loss = 0
@@ -81,17 +81,26 @@ class RecordingWriter:
             self._file.close()
             self._file = None
         if not self._finalised:
-            self._write_sidecar(status="failed", stop_reason="error")
+            error = exc_type.__name__ if exc_type is not None else None
+            self._write_sidecar(status="failed", stop_reason="error", error=error)
         return False
 
     def write_packet(self, timestamp: int, counter: int, payload: bytes) -> None:
-        """Append one packet. Bytes are written exactly as received."""
+        """Append one packet. Bytes are written exactly as received.
+
+        The frame count is derived from total bytes written, not accumulated
+        packet-by-packet: a payload that is not a whole number of frames must
+        never let the sidecar's frame count drift from what the raw file
+        actually contains. frames_in_packet stays a floor-divided, per-packet
+        quantity because that is what the gap tracker needs to size a loss.
+        """
         frames_in_packet = len(payload) // self._params.bytes_per_frame
+        frames_written_before = self._bytes_written // self._params.bytes_per_frame
 
         gap = self._tracker.observe(
             counter=counter,
             frames_in_packet=frames_in_packet,
-            frames_written=self._n_frames,
+            frames_written=frames_written_before,
         )
         if gap is not None:
             self._emit(GapDetected(
@@ -101,7 +110,7 @@ class RecordingWriter:
             ))
 
         self._file.write(payload)
-        self._n_frames += frames_in_packet
+        self._bytes_written += len(payload)
 
         if self._first_timestamp is None:
             self._first_timestamp = timestamp
@@ -120,13 +129,13 @@ class RecordingWriter:
         self._finalised = True
         self._emit(RecordingStopped(
             reason=stop_reason,
-            n_frames=self._n_frames,
+            n_frames=self.n_frames_written,
             verdict=self.verdict,
         ))
 
     @property
     def n_frames_written(self) -> int:
-        return self._n_frames
+        return self._bytes_written // self._params.bytes_per_frame
 
     @property
     def params(self) -> AcquisitionParameters:
@@ -151,15 +160,17 @@ class RecordingWriter:
         if self._listener is not None:
             self._listener(event)
 
-    def _write_sidecar(self, status: str, stop_reason) -> None:
+    def _write_sidecar(self, status: str, stop_reason, error=None) -> None:
+        n_frames = self.n_frames_written
         record = dict(asdict(self._params))
         record.update({
             "schema_version": SCHEMA_VERSION,
             "status": status,
             "stop_reason": stop_reason,
+            "error": error,
             "started_utc": self._started_utc,
-            "n_frames_written": self._n_frames,
-            "duration_sec": self._n_frames / self._params.frame_rate_hz,
+            "n_frames_written": n_frames,
+            "duration_sec": n_frames / self._params.frame_rate_hz,
             "integrity": {
                 "verdict": self.verdict,
                 "first_timestamp": self._first_timestamp,

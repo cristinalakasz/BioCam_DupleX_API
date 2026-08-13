@@ -110,6 +110,41 @@ def test_counter_anomaly_alone_is_non_clean_and_lands_in_sidecar(tmp_path):
     assert integrity["verdict"] == "gaps_detected"
 
 
+def test_partial_frame_payloads_still_yield_a_correct_frame_count(tmp_path):
+    """The frame count must be derived from bytes written, not accumulated
+    per-packet: two payloads that are each 1.5 frames still write 3 whole
+    frames of bytes to the file, and the sidecar must agree."""
+    raw, meta = _paths(tmp_path)
+    payload_a = np.arange(0, 6, dtype=np.uint16).tobytes()   # 12 bytes = 1.5 frames
+    payload_b = np.arange(6, 12, dtype=np.uint16).tobytes()  # 12 bytes = 1.5 frames
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=payload_a)
+        writer.write_packet(timestamp=2, counter=2, payload=payload_b)
+        writer.finalise("duration_reached")
+        assert writer.n_frames_written == 3
+
+    assert raw.read_bytes() == payload_a + payload_b
+    record = read_sidecar(meta)
+    assert record["n_frames_written"] == 3
+
+
+def test_exit_without_finalise_writes_failed_status_with_exception_type(tmp_path):
+    """The claim that a killed process leaves an honest marker rests on this:
+    a with-block that never reaches finalise() must leave status 'failed',
+    not 'in_progress' and certainly not 'complete', with the exception type
+    recorded for later diagnosis."""
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            raise ValueError("boom")
+
+    record = read_sidecar(meta)
+    assert record["status"] == "failed"
+    assert record["stop_reason"] == "error"
+    assert record["error"] == "ValueError"
+
+
 def test_events_are_emitted_to_the_listener(tmp_path):
     raw, meta = _paths(tmp_path)
     seen = []
