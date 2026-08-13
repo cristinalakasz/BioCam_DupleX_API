@@ -28,9 +28,22 @@ The BioCAM produces one frame per sample containing every channel:
 | 1 hour | 547 GB | ~274 GB |
 | 8 hours | 4.4 TB | ~2.2 TB |
 
-Recompute for your own configuration rather than trusting the table — the frame
-rate and channel count come from the instrument and are written into every
-recording's `_meta.json`:
+**The table is configuration-specific and is a floor, not a ceiling.** It is
+derived from a real recording made at 18,557.72 Hz. 3Brain specifies the
+DupleX's standard operation as 4,096 channels at 20 kHz, which is *higher*:
+
+| Configuration | Rate | Per hour |
+| --- | --- | --- |
+| The reference recording, 18.56 kHz | 152 MB/s | 547 GB |
+| Vendor standard, 20 kHz | **164 MB/s** | **590 GB** |
+
+The published maximum sampling frequency is 64 kHz, which almost certainly
+applies to a reduced channel count rather than the full array — treat any figure
+derived from it as unverified until confirmed with 3Brain.
+
+Always recompute for the configuration actually in use rather than trusting
+either table. The frame rate and channel count come from the instrument and are
+written into every recording's `_meta.json`:
 
 ```
 bytes_per_second = total_channels x ch_sample_byte_size x frame_rate_hz
@@ -40,8 +53,23 @@ The ~2x figure is measured, not assumed: lossless compression of real 4096-chann
 data from this instrument gives 1.86x with fast settings and 2.18x with byte
 splitting. Neural noise limits how much better it gets.
 
-Two consequences drive everything below. The disk must **sustain** 152 MB/s
+Two consequences drive everything below. The disk must **sustain** this rate
 without pausing, and it fills **fast**.
+
+### Why these numbers are derived rather than quoted
+
+3Brain publishes **no host-computer storage requirement** — none appears in the
+BioCAM DupleX user guide, the product page, or the BrainWave documentation. The
+only stated host requirement anywhere is Windows 10 or 11. The figures above are
+therefore computed from real recordings rather than taken from a specification.
+
+The instrument itself has **no recording storage**. Its only memory is 2 GB of
+DDR4 attached to the acquisition FPGA — a working buffer for the pipeline, not
+somewhere data is kept. Everything streams over USB to the host in real time,
+which is also why a disk stall is unforgiving: there is no meaningful buffer
+upstream to absorb it.
+
+If an official figure is ever needed, it is a support enquiry to 3Brain.
 
 ---
 
@@ -121,8 +149,10 @@ $fs.Close(); $sw.Stop()
 Remove-Item $f
 ```
 
-**Anything under 200 MB/s is not safe to record on.** You want comfortably more
-than 152.
+**Anything under 250 MB/s is not safe to record on.** That threshold allows
+roughly 50% headroom over the 164 MB/s of the vendor's standard 20 kHz
+configuration — margin the drive will need once its write cache fills and the
+operating system competes for the same device.
 
 **Step 4 — exclude the folder from every sync and backup client** that runs live.
 Sync during recording is the single most likely cause of silent data loss on an
