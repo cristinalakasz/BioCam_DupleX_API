@@ -73,20 +73,64 @@ If an official figure is ever needed, it is a support enquiry to 3Brain.
 
 ---
 
-## 2. What you need
+## 2. What the recording computer needs
 
 ### The recording drive
 
 | Requirement | Why |
 | --- | --- |
-| **NVMe SSD** | Sustains 1-3 GB/s, roughly 10x the needed rate. A SATA SSD (~500 MB/s) works with less margin. **A hard disk does not** — at ~150 MB/s it sits exactly at the data rate and will drop samples. |
+| **NVMe SSD** | Sustains 1-3 GB/s, roughly 10x the needed rate. A SATA SSD (~500 MB/s) works with less margin. **A hard disk does not** — at ~150 MB/s it sits at the data rate and will drop samples. |
+| **TLC, not QLC** | See below — this is the single most important choice for long recordings. |
+| **With a DRAM cache** | DRAM-less models collapse once their write cache fills. |
+| **With a heatsink** | Either on the drive or on the motherboard slot. Sustained writes heat an NVMe until it throttles to protect itself. |
 | **Internal, not USB** | A USB bridge adds a controller that can stall. Stalls lose data. |
-| **A separate drive from Windows** | The OS competes for the same disk, and a full system drive destabilises Windows in the middle of an experiment rather than merely stopping the recording. |
+| **A separate drive from Windows** | The OS competes for the same disk, and a full system drive destabilises Windows mid-experiment rather than merely stopping the recording. |
 | **Enough space for a week of sessions** | So a failed or delayed transfer does not block the next experiment. |
-| **Avoid DRAM-less budget models** | They collapse to ~100 MB/s once their write cache fills. A long recording is precisely the workload that fills it. |
 
-2 TB suits recording in bouts; 4 TB suits long sessions. Any mainstream model
-from a known manufacturer is fine.
+2 TB suits recording in bouts; 4 TB suits multi-hour sessions.
+
+#### Why long recordings fail on drives that benchmark well
+
+Two effects appear only after sustained writing, so a short test never sees them.
+
+**Cache exhaustion.** Consumer SSDs write into a small fast pseudo-SLC region and
+fall back to their native speed once it fills. That region is typically 50-200 GB.
+At 590 GB/hour it is exhausted in **six to twenty minutes**. A QLC drive can then
+drop to around 100 MB/s — *below the data rate*. The drive that benchmarked at
+3 GB/s starts losing samples in minute fifteen. TLC degrades far less and stays
+usable; this is why the TLC-not-QLC line above matters more than peak speed.
+
+**Thermal throttling.** An NVMe under continuous write heats up and reduces its
+own speed to survive. A ten-minute recording never reaches this point. A two-hour
+one does.
+
+Both are the reason §3's verification writes ~100 GB and reports the *minimum*
+rate rather than the average. A 10 GB test fits inside the cache and would pass a
+drive that fails twenty minutes into an experiment.
+
+### The rest of the machine
+
+| Component | Requirement | Why |
+| --- | --- | --- |
+| **RAM** | 16 GB minimum, **32 GB comfortable** | The buffer between the acquisition callback and the disk writer needs room to absorb hiccups without dropping packets. |
+| **CPU** | Any modern multi-core | The acquisition thread runs at elevated priority and must never wait. Core count matters less than not competing with other work. |
+| **USB** | USB 3, **directly on the motherboard** | Never through a hub, never sharing a controller with other high-bandwidth devices. The link to the instrument is the one path with no redundancy. |
+| **OS** | Windows 10 or 11 | The 3Brain driver targets .NET Framework; there is no Linux or macOS option. |
+
+There is no GPU requirement for recording.
+
+### Windows configuration
+
+These cost nothing and matter as much as the hardware:
+
+- **Exclude the recordings folder from Windows Defender** and any other
+  antivirus. Real-time scanning of a file being written at 164 MB/s is a genuine
+  throughput problem.
+- **Set the power plan to High Performance.** Disable sleep and hibernation, and
+  turn off **USB selective suspend** — it can drop the instrument mid-session.
+- **Pause Windows Update** before a long recording. An automatic restart ends the
+  experiment.
+- **Close everything else**, including browsers, BrainWave, and any sync client.
 
 ### Somewhere to archive
 
@@ -134,25 +178,51 @@ D:\recordings\
 
 Not under `Documents`, `Desktop`, or `OneDrive` — see §4.
 
-**Step 3 — confirm the drive actually sustains the rate.** Model numbers describe
-peak, not sustained, performance. Write a file larger than the drive's cache and
-time it:
+**Step 3 — confirm the drive sustains the rate.** Model numbers and short
+benchmarks describe *peak* performance, which every candidate drive will pass.
+What matters is the speed after the cache is exhausted and the drive is hot, so
+this test writes **100 GB** and reports the rate for each window rather than one
+average. Needs 100 GB free and takes several minutes.
 
 ```powershell
-$f = "D:\recordings\_speedtest.bin"
-$buf = New-Object byte[] (64MB)
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$fs = [IO.File]::Create($f)
-1..160 | ForEach-Object { $fs.Write($buf, 0, $buf.Length) }   # 10 GB
+$path    = "D:\recordings\_speedtest.bin"
+$chunkMB = 64
+$totalGB = 100
+$chunks  = [int]($totalGB * 1024 / $chunkMB)
+$window  = 10                                    # report every 640 MB
+
+$buf = New-Object byte[] ($chunkMB * 1MB)
+(New-Object Random).NextBytes($buf)              # random: defeats any compression
+$fs  = [IO.File]::Create($path)
+$min = [double]::MaxValue
+$sw  = [Diagnostics.Stopwatch]::StartNew(); $t0 = $sw.Elapsed.TotalSeconds
+
+for ($i = 1; $i -le $chunks; $i++) {
+    $fs.Write($buf, 0, $buf.Length)
+    if ($i % $window -eq 0) {
+        $fs.Flush($true)                         # force to the device, not the OS cache
+        $now  = $sw.Elapsed.TotalSeconds
+        $rate = ($window * $chunkMB) / ($now - $t0)
+        if ($rate -lt $min) { $min = $rate }
+        "{0,6:N1} GB written   {1,7:N0} MB/s" -f ($i * $chunkMB / 1024), $rate
+        $t0 = $now
+    }
+}
 $fs.Close(); $sw.Stop()
-"{0:N0} MB/s sustained" -f (10240 / $sw.Elapsed.TotalSeconds)
-Remove-Item $f
+"`nAverage {0:N0} MB/s    MINIMUM {1:N0} MB/s   <-- judge the drive on this" -f `
+    ($totalGB * 1024 / $sw.Elapsed.TotalSeconds), $min
+Remove-Item $path
 ```
 
-**Anything under 250 MB/s is not safe to record on.** That threshold allows
-roughly 50% headroom over the 164 MB/s of the vendor's standard 20 kHz
-configuration — margin the drive will need once its write cache fills and the
-operating system competes for the same device.
+**Judge the drive on the MINIMUM, not the average. Anything under 250 MB/s is not
+safe to record on.** That threshold leaves roughly 50% headroom over the
+164 MB/s of the vendor's standard 20 kHz configuration.
+
+Watch the per-window numbers as they print. A healthy TLC drive stays roughly
+flat. A drive that starts near 2,000 MB/s and drops to a few hundred partway
+through has just exhausted its cache in front of you — that collapse point is
+where a real recording would begin losing samples, and it is exactly what a short
+benchmark hides.
 
 **Step 4 — exclude the folder from every sync and backup client** that runs live.
 Sync during recording is the single most likely cause of silent data loss on an
@@ -232,11 +302,28 @@ Not yet implemented; recorded here so it is not reinvented later.
 
 ## 7. Checklist for a new machine
 
-- [ ] Dedicated NVMe SSD present, separate from the Windows drive
-- [ ] Sustained write measured above 200 MB/s (§3 step 3)
+**Hardware**
+
+- [ ] Dedicated NVMe SSD, separate from the Windows drive
+- [ ] TLC with DRAM cache, not QLC, and heatsinked
+- [ ] 16 GB RAM minimum, 32 GB preferred
+- [ ] Instrument on a motherboard USB 3 port, not a hub
+
+**Verification**
+
+- [ ] 100 GB sustained-write test run, **minimum** window above 250 MB/s (§3 step 3)
+- [ ] Free space checked against planned session length
+- [ ] `python -m biocam.preflight` passes
+
+**Configuration**
+
 - [ ] `D:\recordings\` created outside any user profile
 - [ ] Folder excluded from OneDrive and every other sync client
-- [ ] Free space checked against planned session length
+- [ ] Folder excluded from Windows Defender / antivirus
+- [ ] Power plan High Performance; sleep, hibernation and USB selective suspend off
+- [ ] Windows Update paused before long sessions
+
+**Data safety**
+
 - [ ] Archive destination decided and reachable
 - [ ] Backup covers the archive — at least two copies, two devices
-- [ ] `python -m biocam.preflight` passes
