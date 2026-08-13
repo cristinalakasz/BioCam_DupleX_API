@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 COUNTER_MODULUS = 65536
+COUNTER_ANOMALY_THRESHOLD = COUNTER_MODULUS // 2
+# Deltas exceeding this threshold likely represent out-of-order packets, device
+# resets, or anomalous steps rather than genuine loss. A delta > 32768 means
+# more than half the counter space was traversed in a single jump — implausible
+# at normal packet rates (1ms intervals would require ~32 seconds of consecutive
+# loss). We treat such steps as counter anomalies, not loss.
 
 
 @dataclass(frozen=True)
@@ -27,12 +33,17 @@ class Gap:
 def packets_lost(previous_counter: int, counter: int) -> int:
     """How many packets are missing between two counter values.
 
-    Returns 0 for consecutive counters and for a repeated counter. A repeat is
-    treated as a duplicate rather than as a full 65536-packet wrap, because a
-    duplicate is plausible and losing exactly one modulus is not.
+    Returns 0 for consecutive counters, repeated counters, and anomalous steps.
+    A repeated counter is treated as a duplicate rather than as a full 65536-packet
+    wrap, because a duplicate is plausible and losing exactly one modulus is not.
+    An anomalous step (delta > COUNTER_ANOMALY_THRESHOLD) is likely an out-of-order
+    packet, device reset, or transient issue; we return 0 and let GapTracker record
+    the anomaly separately.
     """
     delta = (counter - previous_counter) % COUNTER_MODULUS
     if delta == 0:
+        return 0
+    if delta > COUNTER_ANOMALY_THRESHOLD:
         return 0
     return delta - 1
 
@@ -51,6 +62,7 @@ class GapTracker:
         self._previous_counter: Optional[int] = None
         self._gaps: List[Gap] = []
         self._n_frames_missing = 0
+        self._counter_anomalies = 0
 
     def observe(self, counter: int, frames_in_packet: int,
                 frames_written: int) -> Optional[Gap]:
@@ -58,6 +70,11 @@ class GapTracker:
         previous = self._previous_counter
         self._previous_counter = counter
         if previous is None:
+            return None
+
+        delta = (counter - previous) % COUNTER_MODULUS
+        if delta > COUNTER_ANOMALY_THRESHOLD:
+            self._counter_anomalies += 1
             return None
 
         lost = packets_lost(previous, counter)
@@ -81,3 +98,7 @@ class GapTracker:
     @property
     def n_frames_missing(self) -> int:
         return self._n_frames_missing
+
+    @property
+    def counter_anomalies(self) -> int:
+        return self._counter_anomalies
