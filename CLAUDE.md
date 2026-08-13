@@ -72,6 +72,38 @@ not repeatable on demand):
 A green suite is evidence for Layers 2–3. It is never evidence that instrument
 code works — say so explicitly whenever reporting test results.
 
+## Git workflow
+
+**Never commit directly to `main`.** Feature work happens on a branch.
+
+**Starting.** Fetch before branching, always — changes reach `origin/main` from
+outside any given session, including through the GitHub web UI. `git log --all`
+covers *local* refs only, so without a fetch you can look straight at a stale
+`main` and conclude, wrongly, that work does not exist. This has already caused a
+false "nothing found" report on this repo.
+
+```
+git fetch origin
+git checkout main && git merge --ff-only origin/main
+git checkout -b <feature-branch>
+```
+
+If `--ff-only` is refused, local `main` has diverged — stop and report it rather
+than forcing the merge.
+
+**Finishing.** Land the work on `main` and keep a PR as the record of what the
+phase delivered. The order is fixed, because a forge will refuse to open a pull
+request once `main` already contains the branch's commits:
+
+1. Push the feature branch.
+2. Open the PR against `main`. **Before the merge, not after.**
+3. `git checkout main`, then `git merge --no-ff` — the phase boundary should stay
+   visible in history rather than vanish into a fast-forward.
+4. Run the full suite on the merged result. A green run on the branch only proves
+   the branch.
+5. Push `main`. The PR is then marked merged automatically.
+6. Delete the local feature branch.
+
 ## Conventions
 
 English throughout. Never commit `.dll` files, `.raw` files outside
