@@ -157,6 +157,76 @@ def test_exit_without_finalise_writes_failed_status_with_exception_type(tmp_path
     assert record["error"] == "ValueError"
 
 
+def test_a_crashed_run_with_no_losses_writes_unknown_not_clean_to_the_sidecar(tmp_path):
+    """The write path, not just integrity_verdict(): a failed sidecar must
+    not literally contain "verdict": "clean" in its JSON. A human opening
+    the file, a reader in another language, and load_recording() all read
+    the integrity block directly and never call integrity_verdict() at all -
+    so the file itself has to be correct, not just correct when read through
+    the one function that knows to correct it."""
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            raise ValueError("boom")
+
+    record = read_sidecar(meta)
+    assert record["status"] == "failed"
+    assert record["integrity"]["verdict"] == "unknown"
+    # The property being protected: the file and the function must agree.
+    # Asserting the string alone would let them drift apart again.
+    assert record["integrity"]["verdict"] == integrity_verdict(record)
+
+
+def test_a_crashed_run_with_losses_keeps_gaps_detected_in_the_sidecar(tmp_path):
+    """A crash does not erase loss that was genuinely detected before it -
+    that stays gaps_detected on disk, not downgraded to unknown."""
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            writer.note_driver_loss(2)
+            raise ValueError("boom")
+
+    record = read_sidecar(meta)
+    assert record["status"] == "failed"
+    assert record["integrity"]["verdict"] == "gaps_detected"
+    assert record["integrity"]["verdict"] == integrity_verdict(record)
+
+
+def test_a_normal_clean_recording_agrees_on_disk_and_via_integrity_verdict(tmp_path):
+    """The control case: a normal, complete, loss-free recording is still
+    exactly "clean" both in the raw JSON and through integrity_verdict() -
+    the write-path fix must not touch the case it was never about."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    record = read_sidecar(meta)
+    assert record["status"] == "complete"
+    assert record["integrity"]["verdict"] == "clean"
+    assert record["integrity"]["verdict"] == integrity_verdict(record)
+
+
+def test_the_in_progress_sidecar_does_not_claim_clean(tmp_path):
+    """Written by __enter__ before a single packet has arrived. Nothing has
+    gone wrong yet, but nothing has been verified either - the recording is
+    not over, so "clean" would claim more than is known. Same reasoning as
+    a failed run, applied before the run even starts writing frames."""
+    raw, meta = _paths(tmp_path)
+    writer = RecordingWriter(raw, meta, PARAMS)
+    writer.__enter__()
+    try:
+        record = read_sidecar(meta)
+        assert record["status"] == "in_progress"
+        assert record["integrity"]["verdict"] == "unknown"
+        assert record["integrity"]["verdict"] == integrity_verdict(record)
+    finally:
+        writer.finalise("duration_reached")
+        writer.__exit__(None, None, None)
+
+
 def test_events_are_emitted_to_the_listener(tmp_path):
     raw, meta = _paths(tmp_path)
     seen = []

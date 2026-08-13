@@ -174,6 +174,36 @@ class RecordingWriter:
         if self._listener is not None:
             self._listener(event)
 
+    def _verdict_for_status(self, status: str) -> str:
+        """The verdict to write into a sidecar with the given status.
+
+        `verdict` (the property above) answers "what does the evidence
+        gathered so far say" - gaps or losses found, a counter anomaly, or
+        neither. That question is only fully answered once `status` is
+        `"complete"`: nothing more will be observed after that. For
+        `"in_progress"` (written by __enter__, before a single packet has
+        arrived) and `"failed"` (written by __exit__ for a run that never
+        reached finalise()), the writer stopped watching before the
+        recording was known to be over - because it is not finished yet, or
+        because it crashed - so a `clean` verdict would assert "the whole
+        run was fine" when what is actually known is only "nothing wrong
+        was found before we stopped watching". That gap between what is
+        known and what `clean` claims is exactly what must not ship in the
+        sidecar itself: it is what a human, another language, or
+        `load_recording()` reads directly, none of which go through
+        `integrity_verdict()`'s read-path correction. So a non-`"complete"`
+        status downgrades a `clean` verdict to `unknown`, the same call
+        already made for a missing schema_version and for `failed` on the
+        read path. Already-detected `gaps_detected` is real and is kept
+        regardless of status - an unfinished or crashed run does not erase a
+        gap that genuinely happened, and a counter anomaly alone already
+        reads `unknown` on its own terms.
+        """
+        verdict = self.verdict
+        if status != "complete" and verdict == VERDICT_CLEAN:
+            return VERDICT_UNKNOWN
+        return verdict
+
     def _write_sidecar(self, status: str, stop_reason, error=None) -> None:
         n_frames = self.n_frames_written
         record = dict(asdict(self._params))
@@ -186,7 +216,7 @@ class RecordingWriter:
             "n_frames_written": n_frames,
             "duration_sec": n_frames / self._params.frame_rate_hz,
             "integrity": {
-                "verdict": self.verdict,
+                "verdict": self._verdict_for_status(status),
                 "first_timestamp": self._first_timestamp,
                 "last_timestamp": self._last_timestamp,
                 "n_frames_missing": self._tracker.n_frames_missing,
