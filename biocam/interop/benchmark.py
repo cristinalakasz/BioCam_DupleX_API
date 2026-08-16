@@ -27,8 +27,20 @@ def _load_runtime():
     import pythonnet
     pythonnet.load("netfx")
     import clr
-    clr.AddReference(str(DLL_DIR / "3Brain.Common.dll"))
-    clr.AddReference(str(DLL_DIR / "3Brain.BioCamDriver.dll"))
+    # device.py's load_assemblies() checks path.is_file() before
+    # clr.AddReference() so a missing DLL fails with a clear
+    # FileNotFoundError naming the path, rather than whatever opaque error
+    # clr.AddReference() itself raises for a path that does not exist. This
+    # benchmark loads both 3Brain assemblies too (it needs 3Brain.Common
+    # loaded for 3Brain.BioCamDriver to resolve, even though it uses no
+    # 3Brain type directly - only System.Array/System.Byte/Marshal.Copy) and
+    # had no such check, so a missing DLL here failed less clearly than the
+    # same mistake in device.py. Same check, same reasoning.
+    for name in ("3Brain.Common", "3Brain.BioCamDriver"):
+        path = DLL_DIR / f"{name}.dll"
+        if not path.is_file():
+            raise FileNotFoundError(f"assembly not found: {path}")
+        clr.AddReference(str(path))
 
 
 def _expected_pattern():

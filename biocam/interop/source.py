@@ -79,11 +79,17 @@ nothing and loses nothing either way. `callback_errors` sums the three when
 read, which is safe because summing ints is not a read-modify-write of any
 of the counters themselves.
 
-`start()` also tightens `sys.setswitchinterval` and disables cyclic garbage
-collection for the duration of the stream, restoring both, unconditionally,
-in `stop()`. Both changes exist to keep the driver's thread from stalling
-waiting for the GIL or being the one to run a collection - see the
-docstrings on `_apply_runtime_tuning`/`_restore_runtime_tuning` below.
+`start()` also tightens `sys.setswitchinterval`, freezes the current object
+graph into gc's permanent generation, and disables *automatic* cyclic
+collection for the duration of the stream. `stop()` restores the switch
+interval, unfreezes (HIGH: this used to be the one half of freeze/disable
+that was never undone - see `_restore_runtime_tuning` below), and
+re-enables automatic collection. With automatic collection off for a run
+that can run for hours, `__iter__` also runs a manual `gc.collect(1)` -
+generations 0 and 1 only, never generation 2 - at GC_COLLECT_INTERVAL_
+PACKETS, on the consumer thread that iterates it, precisely because that is
+never the driver's thread. See the docstrings on `_apply_runtime_tuning`/
+`_restore_runtime_tuning` and on `__iter__` below.
 """
 
 import collections
@@ -102,7 +108,31 @@ PRESSURE_FRACTION = 0.8
 # How long __iter__ sleeps on an empty queue before re-checking the stop
 # flag. Paid only while idle, waiting for the next packet - never inside a
 # driver callback - so it does not compete with the 1 ms packet budget.
-POLL_INTERVAL_SEC = 0.1
+# HIGH: this was 0.1 s. A packet arriving just after the consumer starts
+# sleeping waited nearly 100 ms to be picked up - bursty even for recording,
+# and fatal against the ~1.5 ms closed-loop target a later phase plans. 1 ms
+# trades idle CPU (more frequent wake-ups while the queue is genuinely
+# empty) for that latency; it must not be closed instead by having a
+# callback signal a threading.Event - that would put a wait/notify
+# primitive back on the driver's thread, exactly what this module exists to
+# avoid (see the module docstring above on why a deque, not queue.Queue).
+POLL_INTERVAL_SEC = 0.001
+
+# How often (in packets yielded by __iter__) a manual, generation-1 gc pass
+# runs on the consumer thread. HIGH: gc.disable() (see _apply_runtime_tuning
+# below) turns off *automatic* collection for the whole stream, which can
+# run for hours; a manual collect() run periodically, and only ever on this
+# thread, reclaims any cycles created during that time without ever risking
+# a collection landing on the driver's thread. gen 1, not gen 2: everything
+# alive at start() was moved to the permanent generation by gc.freeze() and
+# is never rescanned regardless, so a young-generation pass is what is left
+# to usefully collect, and it is the short one. A few thousand packets is a
+# few seconds at the reference 1 ms rate - frequent enough that any cycle
+# pythonnet's bookkeeping might create (undocumented - see the module
+# docstring) does not accumulate for the length of a whole session, rare
+# enough that gc.collect()'s own cost (still a full scan of gen 0 and 1,
+# whatever is tracked and not frozen) is immaterial next to per-packet work.
+GC_COLLECT_INTERVAL_PACKETS = 5000
 
 # sys.getswitchinterval() defaults to 0.005 s - five packet periods at a 1 ms
 # acquisition rate. The callback runs on a .NET thread and must acquire the
@@ -145,11 +175,27 @@ class DriverPacketSource:
         self._loss_errors = 0
         self._error_errors = 0
         self._streaming = False
+        # MEDIUM: set True immediately before the StartDataStreaming() call
+        # in start() - before we know whether it will succeed, raise before
+        # engaging, or raise after engaging (the XML documents a separate
+        # AssertCanStartStreaming that can throw; whether that happens
+        # before or after the hardware is told to start is unanswerable
+        # from documentation here - issue #18). `_streaming` alone is only
+        # set once StartDataStreaming has already returned, so a start()
+        # that raises leaves it False even if the device is now streaming.
+        # stop() checks `_streaming or _maybe_streaming` for exactly that
+        # reason: attempting StopDataStreaming on a device that was never
+        # started is harmless (see stop()); never attempting it on one that
+        # may actually be streaming is not.
+        self._maybe_streaming = False
         # Set in start(), consumed and cleared in stop()/_restore_runtime_
         # tuning(). None means "nothing to restore" - covers stop() being
         # called without a preceding successful start().
         self._prev_switch_interval = None
         self._prev_gc_enabled = None
+        # Packets yielded by __iter__ since the last manual gc.collect(1) -
+        # see GC_COLLECT_INTERVAL_PACKETS above.
+        self._packets_since_gc = 0
 
     @property
     def stopped(self) -> bool:
@@ -175,11 +221,20 @@ class DriverPacketSource:
         """The driver's cumulative data-loss count when available.
 
         `DataLossEventArgs.Counter` is documented as cumulative since the
-        start of acquisition, so the latest value read is the correct
-        answer - it is stored, not accumulated. Falls back to a count of
-        DataLossAsync events if Counter was ever unreadable on this
-        instance; that fallback can undercount, because DataLossAsync is
-        documented as firing asynchronously and events may coalesce.
+        start of acquisition, so the latest successfully-read value is the
+        correct answer - it is stored, not accumulated. Once a Counter has
+        been read successfully at least once (`_driver_loss_counter` is no
+        longer None), this property reports it and keeps reporting it for
+        the rest of the session, even if a later DataLossAsync event's
+        Counter is unreadable - that later failure still increments
+        `_loss_fallback_events` internally, but no longer changes what this
+        property returns, on the reasoning that a cumulative driver-
+        reported value seen earlier in the run is a better answer than a
+        locally-counted approximation. The event-count fallback is only
+        ever what this property reports if Counter has never once been
+        successfully read on this instance; it can itself undercount,
+        because DataLossAsync is documented as firing asynchronously and
+        events may coalesce.
         """
         if self._driver_loss_counter is not None:
             return self._driver_loss_counter
@@ -285,14 +340,32 @@ class DriverPacketSource:
           driver thread can wait to acquire the GIL from the consumer.
         - gc.freeze() moves everything currently tracked into the
           permanent generation so it is never rescanned, then
-          gc.disable() (FIX 6) stops further automatic collections. The
+          gc.disable() (FIX 6) stops further *automatic* collections. The
           hot path allocates a Packet plus a bytes copy per call and
           creates no reference cycles, so automatic cyclic collection buys
           nothing there and only risks running - a generation-2 pass scans
           every tracked object in the process - on whichever thread
           happens to cross the threshold, usually the driver's.
 
-        Both are restored unconditionally in _restore_runtime_tuning().
+        HIGH: gc.freeze() must be paired with gc.unfreeze() in
+        _restore_runtime_tuning() below, or the permanent generation only
+        ever grows - measured at 377 -> 20,658 objects after a single
+        start/stop cycle on this codebase, larger every cycle after,
+        because a second freeze() moves whatever is newly tracked into a
+        permanent generation that nothing ever moves back out of. Disabling
+        collection is not left in place for the whole run either: with
+        cyclic collection off for a session that can run for hours, any
+        reference cycle created anywhere - not just on this hot path, which
+        creates none, but also pythonnet's own CLR-wrapper bookkeeping,
+        whose cycle behaviour is undocumented and unverifiable here -
+        becomes permanent for the life of the process. __iter__ below runs
+        a periodic gc.collect(1) on the consumer thread instead, so
+        automatic collection can safely stay off (never risking a
+        collection on the driver's thread) while cycles still get reclaimed
+        somewhere.
+
+        Both switch interval and freeze/disable are restored unconditionally
+        in _restore_runtime_tuning().
         """
         self._prev_switch_interval = sys.getswitchinterval()
         sys.setswitchinterval(GIL_SWITCH_INTERVAL_SEC)
@@ -308,6 +381,17 @@ class DriverPacketSource:
         matching the unconditional-cleanup pattern already used for handler
         unsubscription. A None sentinel means start() never ran (or already
         restored), so there is nothing to undo.
+
+        HIGH: gc.unfreeze() is the fix - it moves everything gc.freeze()
+        put into the permanent generation back into a normal one, so a
+        subsequent gc.collect() (automatic, once re-enabled below, or the
+        periodic manual one in __iter__ during the *next* session) can
+        actually reclaim what is now unreachable, and so the permanent
+        generation does not simply grow by one freeze()'s worth every
+        cycle. Called unconditionally here, matching gc.enable() below,
+        regardless of whether this session actually created any garbage -
+        symmetry with _apply_runtime_tuning() is the point, not a
+        conditional optimisation.
         """
         if self._prev_switch_interval is not None:
             try:
@@ -317,6 +401,7 @@ class DriverPacketSource:
             self._prev_switch_interval = None
         if self._prev_gc_enabled is not None:
             try:
+                gc.unfreeze()
                 if self._prev_gc_enabled:
                     gc.enable()
             except Exception:
@@ -330,7 +415,42 @@ class DriverPacketSource:
                 "call stop() first."
             )
         biocam = self._device.biocam
+        if biocam is None:
+            # Without this check, the first attribute access below
+            # (biocam.DataReceived) raises a plain AttributeError -
+            # "'NoneType' object has no attribute 'DataReceived'" - which
+            # names the symptom, not the problem: BioCamDevice.__enter__
+            # never completed (or __exit__ already ran), so there is no
+            # claimed device to stream from. Naming that here means a
+            # caller sees the actual mistake - start() called outside a
+            # live BioCamDevice context - instead of having to infer it
+            # from an opaque attribute error three lines further down.
+            raise RuntimeError(
+                "DriverPacketSource.start() called with device.biocam is "
+                "None; a BioCamDevice must be successfully __enter__()'d "
+                "(claiming the device) before starting a packet source."
+            )
         self._stop_event.clear()
+
+        # Counters reflect the session about to start, not a running total
+        # across however many start()/stop() cycles this instance has been
+        # through. Without this reset, a second start() on the same
+        # DriverPacketSource (a retry, or any future caller that reuses one
+        # instance across sessions) would carry a previous session's
+        # loss/overflow/error counts into a new sidecar via session.py's
+        # writer.note_driver_loss()/note_queue_overflow()/
+        # note_callback_errors() - silently reporting losses from a run
+        # that already ended and was already reported on. queue_overflows
+        # is a plain int attribute (not behind a property), so it is reset
+        # directly like the private counters below it.
+        self.queue_overflows = 0
+        self._driver_loss_counter = None
+        self._loss_fallback_events = 0
+        self._data_errors = 0
+        self._loss_errors = 0
+        self._error_errors = 0
+        self._pressure_reported = False
+        self._packets_since_gc = 0
 
         # Clear anything left over from a previous start()/stop() cycle - a
         # stale STOP sentinel, or straggler packets a consumer that broke out
@@ -447,18 +567,35 @@ class DriverPacketSource:
             biocam.DataLossAsync += self._loss_handler
             biocam.DataStreamingError += self._error_handler
 
+            # issue #18: set immediately before the call, not after. The
+            # XML documents a separate AssertCanStartStreaming that can
+            # throw, but not whether that assertion runs before or after
+            # the hardware is actually told to start - unanswerable from
+            # documentation here. `_streaming` alone is only set once
+            # StartDataStreaming has already returned successfully, so a
+            # call that raises (or is interrupted mid-call - see the
+            # BaseException note below) after the hardware engaged would
+            # otherwise leave no record that stop() still needs to attempt
+            # StopDataStreaming().
+            self._maybe_streaming = True
             started = biocam.StartDataStreaming(
                 dataPacketTimeSpanMs=packet_timespan_ms,
                 optimizeDataPacketLatency=True,
             )
             if not started:
                 raise RuntimeError("StartDataStreaming failed.")
-        except Exception:
-            # A failed start must not leave any live handlers subscribed:
-            # that leaks a Python closure into the driver for the rest of
-            # the process, and a second start() call would leak another set
-            # on top of it. Nor should it leave the switch interval/GC
-            # tuning applied with no active stream to justify it.
+        except BaseException:
+            # BaseException, not Exception: a KeyboardInterrupt landing
+            # between attaching a handler and StartDataStreaming returning
+            # (or during the call itself) must hit this cleanup too, or it
+            # leaves live handlers subscribed and the switch interval/GC
+            # tuning applied with no active stream to justify either -
+            # exactly the leak this except block exists to prevent, just
+            # from an exception type that `except Exception` does not
+            # catch. _maybe_streaming is deliberately left as this branch
+            # found it (True, set just above): stop() still needs to
+            # attempt StopDataStreaming in case the failure happened after
+            # the hardware was actually told to start (issue #18).
             self._unsubscribe(biocam)
             self._restore_runtime_tuning()
             raise
@@ -469,7 +606,15 @@ class DriverPacketSource:
         stopped_ok = True
         stop_error = None
         try:
-            if self._streaming:
+            # issue #18: `_maybe_streaming` (set in start(), immediately
+            # before StartDataStreaming) covers the gap `_streaming` alone
+            # cannot - a start() that raised or was interrupted after the
+            # hardware was actually told to start, but before `_streaming`
+            # itself was set. Attempting StopDataStreaming on a device that
+            # never started is harmless (nothing for the driver to stop);
+            # never attempting it on one that may actually be streaming is
+            # not - so both flags are checked, not just `_streaming`.
+            if self._streaming or self._maybe_streaming:
                 if biocam is not None:
                     try:
                         stopped_ok = biocam.StopDataStreaming()
@@ -483,9 +628,10 @@ class DriverPacketSource:
                         stop_error = exc
                     if stopped_ok:
                         self._streaming = False
-                    # If it failed or raised, leave _streaming True so a
-                    # retried stop() calls StopDataStreaming() again instead
-                    # of silently skipping it.
+                        self._maybe_streaming = False
+                    # If it failed or raised, leave both flags as they were
+                    # so a retried stop() calls StopDataStreaming() again
+                    # instead of silently skipping it.
                 else:
                     # biocam is None: BioCamDevice.__exit__ has already
                     # cleared our reference to it (it calls
@@ -495,7 +641,7 @@ class DriverPacketSource:
                     # StopDataStreaming() on, and nothing to retry either -
                     # unlike the stopped_ok=False branch above, a future
                     # stop() call would find biocam still None and be no
-                    # more able to call it. _streaming must still be
+                    # more able to call it. Both flags must still be
                     # cleared here, or start()'s re-entrancy guard blocks
                     # every subsequent start() on this instance permanently.
                     # Whether the driver still considers itself streaming,
@@ -505,6 +651,7 @@ class DriverPacketSource:
                     # the Gate 1 report - but that is a driver-side question
                     # this Python flag cannot answer either way.
                     self._streaming = False
+                    self._maybe_streaming = False
             if biocam is not None:
                 self._unsubscribe(biocam)
             self._stop_event.set()
@@ -545,4 +692,18 @@ class DriverPacketSource:
                                                  capacity=self._queue_size))
             elif depth < threshold // 2:
                 self._pressure_reported = False
+
+            # HIGH: gc.disable() in _apply_runtime_tuning() turns off
+            # *automatic* collection for the whole stream; this is the
+            # manual replacement, gated by GC_COLLECT_INTERVAL_PACKETS
+            # (see that constant's comment above) and run only here, on
+            # this generator's own thread - the consumer, never the
+            # driver's DataReceived thread. gen 1, not gen 2: everything
+            # alive at start() was moved to the permanent generation by
+            # gc.freeze() and is never rescanned regardless.
+            self._packets_since_gc += 1
+            if self._packets_since_gc >= GC_COLLECT_INTERVAL_PACKETS:
+                self._packets_since_gc = 0
+                gc.collect(1)
+
             yield item

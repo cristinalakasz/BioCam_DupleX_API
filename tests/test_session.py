@@ -551,7 +551,22 @@ def test_session_stops_cleanly_with_reason_disk_low(tmp_path, monkeypatch):
     check at all - the writer's own periodic check is what has to catch a
     filling disk there. record_session must notice writer.disk_low and stop
     cleanly, with a properly finalised (status: complete) sidecar, rather
-    than running the source dry or crashing."""
+    than running the source dry or crashing.
+
+    HIGH: the free-space check now runs on its own daemon thread
+    (RecordingWriter._disk_poll_loop), polled every disk_poll_interval_sec -
+    see biocam/data/recording.py's module docstring. That makes disk_low
+    detection asynchronous with respect to write_packet(): a real poll
+    interval (even a short one) races record_session's consumption of a
+    10-packet source, which can exhaust the source before the daemon thread
+    ever ticks - flaky, not deterministic. A huge disk_poll_interval_sec
+    keeps the real timer from firing during the test at all, and
+    writer._poll_disk_once() - the same method the poll thread calls, and
+    already used the same way in test_recording.py - triggers exactly one
+    synchronous check before record_session runs, so the flag is set
+    (deterministically, no timing race) before the first packet is
+    consumed.
+    """
     source, _ = _source(tmp_path, 1000, frames_per_packet=10)
     raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
 
@@ -562,7 +577,8 @@ def test_session_stops_cleanly_with_reason_disk_low(tmp_path, monkeypatch):
                         lambda path: FakeUsage())
 
     with RecordingWriter(raw, meta, PARAMS, min_free_bytes=1_000_000,
-                         upkeep_interval_frames=1) as writer:
+                         disk_poll_interval_sec=3600) as writer:
+        writer._poll_disk_once()  # deterministic: what the poll thread would do
         result = record_session(source, writer)
 
     assert result.stop_reason == "disk_low"

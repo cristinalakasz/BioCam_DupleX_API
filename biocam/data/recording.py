@@ -11,12 +11,26 @@ parameters and an honest marker that it was never finished.
 Every sidecar write is atomic (temp file + os.replace - see _write_sidecar)
 and a failure writing the __exit__ failure sidecar can never mask whatever
 exception is already propagating (see __exit__). The writer also watches free
-disk space periodically, on the consumer thread only - see
-DEFAULT_MIN_FREE_BYTES and DEFAULT_UPKEEP_INTERVAL_FRAMES below. It fsyncs the
-raw file exactly once, in finalise() - MEDIUM 5: earlier drafts of this
-docstring (and of _periodic_upkeep's) claimed the periodic upkeep pass also
-fsyncs and so bounds the power-loss exposure window to one interval. It does
-not: _periodic_upkeep only flushes, which is a much weaker guarantee (see
+disk space - see DEFAULT_MIN_FREE_BYTES and DEFAULT_DISK_POLL_INTERVAL_SEC
+below. HIGH: shutil.disk_usage() is GetDiskFreeSpaceEx on Windows, which can
+block for seconds on a network share, a volume under antivirus scan, or a
+OneDrive-synced tree - and the packet queue upstream of this writer covers
+only a couple of seconds (see QUEUE_BUFFER_SECONDS in cli.py). The check used
+to run from write_packet() on the consumer thread - the same thread that
+drains that queue - so a slow disk_usage() call could itself cause the drop
+it exists to warn about. It now runs on its own daemon thread
+(_disk_poll_loop/_poll_disk_once), started in __enter__ and stopped in
+__exit__; that thread only ever sets `_disk_low` and stashes the free-byte
+count it saw. write_packet() still runs on the consumer thread and still
+decides when to emit the DiskLow event, but it only ever reads that flag - a
+plain attribute read, not a syscall - so the listener remains consumer-thread-
+only (see _emit()) without the poll itself being able to stall the drain.
+_periodic_upkeep(), gated by DEFAULT_UPKEEP_INTERVAL_FRAMES below, now only
+flushes; the disk check is no longer part of it. It fsyncs the raw file
+exactly once, in finalise() - MEDIUM 5: earlier drafts of this docstring (and
+of _periodic_upkeep's) claimed the periodic upkeep pass also fsyncs and so
+bounds the power-loss exposure window to one interval. It does not:
+_periodic_upkeep only flushes, which is a much weaker guarantee (see
 _periodic_upkeep below), so that window is "the entire run" until finalise()
 runs, not "at most one interval".
 """
@@ -25,6 +39,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -55,19 +70,27 @@ VERDICT_UNKNOWN = "unknown"
 # to notice disk_low and stop cleanly.
 DEFAULT_MIN_FREE_BYTES = 2 * 1024 ** 3  # 2 GiB
 
-# How often (in frames written, not packets) the writer calls
-# shutil.disk_usage() and flushes the raw file (FIX 3 and FIX 4 share one
-# interval, per the task: both are "check something expensive every so
-# often, on the consumer thread, never in the callback"). MEDIUM 5: this is
-# a flush, not an fsync - it pushes bytes to the OS cache, not to disk; only
-# finalise() fsyncs (once, at the end of the run). Frames arrive at up to
-# ~18.5 kHz; doing either of these on every packet would mean tens of
-# thousands of syscalls per second on a path that sits downstream of the
-# time-critical callback. Every 50,000 frames is a couple of seconds at
-# typical frame rates - frequent enough to catch a filling disk or bound the
-# data-loss window on power loss with room to spare, rare enough that the
-# syscall overhead is immaterial.
+# How often (in frames written, not packets) the writer flushes the raw file
+# (FIX 4). MEDIUM 5: this is a flush, not an fsync - it pushes bytes to the
+# OS cache, not to disk; only finalise() fsyncs (once, at the end of the
+# run). Frames arrive at up to ~18.5 kHz; flushing on every packet would mean
+# tens of thousands of syscalls per second on a path that sits downstream of
+# the time-critical callback. Every 50,000 frames is a couple of seconds at
+# typical frame rates - rare enough that the syscall overhead is immaterial.
+# The free-space check used to share this interval (FIX 3); it no longer
+# does - see DEFAULT_DISK_POLL_INTERVAL_SEC below and the HIGH fix in the
+# module docstring.
 DEFAULT_UPKEEP_INTERVAL_FRAMES = 50_000
+
+# How often (in wall-clock seconds) the disk-poll thread calls
+# shutil.disk_usage(). Independent of DEFAULT_UPKEEP_INTERVAL_FRAMES on
+# purpose: that constant is a frame count meaningful only on the consumer
+# thread; this one is a real-time interval for a thread that runs
+# independently of how fast (or slowly) packets are arriving. 2 seconds
+# matches the packet queue's own buffering budget (QUEUE_BUFFER_SECONDS in
+# cli.py) - a filling disk is caught within about one buffer's worth of time
+# either way.
+DEFAULT_DISK_POLL_INTERVAL_SEC = 2.0
 
 # Gate 1, item G: how many GapDetected events RecordingWriter emits to its
 # listener in full before switching to throttled GapSummary events. cli.py's
@@ -110,7 +133,8 @@ class RecordingWriter:
                  upkeep_interval_frames: int = DEFAULT_UPKEEP_INTERVAL_FRAMES,
                  max_retained_gaps: int = MAX_RETAINED_GAPS,
                  gap_emit_full_count: int = GAP_EMIT_FULL_COUNT,
-                 gap_summary_interval: int = GAP_SUMMARY_INTERVAL):
+                 gap_summary_interval: int = GAP_SUMMARY_INTERVAL,
+                 disk_poll_interval_sec: float = DEFAULT_DISK_POLL_INTERVAL_SEC):
         self._raw_path = Path(raw_path)
         self._meta_path = Path(meta_path)
         self._params = params
@@ -119,6 +143,7 @@ class RecordingWriter:
         self._upkeep_interval_frames = upkeep_interval_frames
         self._gap_emit_full_count = gap_emit_full_count
         self._gap_summary_interval = gap_summary_interval
+        self._disk_poll_interval_sec = disk_poll_interval_sec
 
         self._file = None
         self._tracker = GapTracker(frame_rate_hz=params.frame_rate_hz,
@@ -132,7 +157,17 @@ class RecordingWriter:
         self._discarded_at_stop = 0
         self._started_utc = None
         self._finalised = False
+        # HIGH: _disk_low and _disk_low_free_bytes are written by the poll
+        # thread (_disk_poll_loop/_poll_disk_once) and only ever read here on
+        # the consumer thread - a plain bool/int attribute read is atomic
+        # under the GIL, so no lock is needed for that direction. Only the
+        # consumer thread sets _disk_low_reported, gating the one-time
+        # DiskLow emit in write_packet() - see the module docstring.
         self._disk_low = False
+        self._disk_low_free_bytes = None
+        self._disk_low_reported = False
+        self._disk_poll_stop = threading.Event()
+        self._disk_poll_thread = None
         self._frames_at_last_upkeep = 0
         # Gate 1, item G: how many gaps have been emitted (in full or
         # counted toward a pending summary) so far this run, and the
@@ -155,9 +190,19 @@ class RecordingWriter:
             total_channels=self._params.total_channels,
             frame_rate_hz=self._params.frame_rate_hz,
         ))
+        # HIGH: the free-space poll runs on its own daemon thread from here
+        # until __exit__ stops it - see the module docstring and
+        # _disk_poll_loop below. Started only once the directory exists
+        # (mkdir above), since shutil.disk_usage() needs it to.
+        self._disk_poll_thread = threading.Thread(
+            target=self._disk_poll_loop, name="biocam-disk-poll", daemon=True)
+        self._disk_poll_thread.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        self._disk_poll_stop.set()
+        if self._disk_poll_thread is not None:
+            self._disk_poll_thread.join(timeout=2.0)
         if self._file is not None:
             self._file.close()
             self._file = None
@@ -210,6 +255,15 @@ class RecordingWriter:
         if self._first_timestamp is None:
             self._first_timestamp = timestamp
         self._last_timestamp = timestamp
+
+        # HIGH: this is a plain attribute read, not a syscall, so it runs on
+        # every packet with none of the stall risk shutil.disk_usage() carries
+        # - see the module docstring. _disk_low is set by the poll thread;
+        # this is the only place it is acted on, and only once per run.
+        if self._disk_low and not self._disk_low_reported:
+            self._disk_low_reported = True
+            self._emit(DiskLow(free_bytes=self._disk_low_free_bytes,
+                               required_bytes=self._min_free_bytes))
 
         frames_now = self.n_frames_written
         if frames_now - self._frames_at_last_upkeep >= self._upkeep_interval_frames:
@@ -324,13 +378,20 @@ class RecordingWriter:
             self._frames_missing_since_summary = 0
 
     def _periodic_upkeep(self) -> None:
-        """Run every DEFAULT_UPKEEP_INTERVAL_FRAMES frames (FIX 3 / FIX 4).
+        """Run every DEFAULT_UPKEEP_INTERVAL_FRAMES frames (FIX 4).
 
-        Both a disk-space check and a flush are relatively expensive
-        (a syscall each) and must not run per-packet at up to ~18.5 kHz.
-        The disk check matters enough that waiting until finalise() would
-        defeat the point: it is the only way an open-ended (Ctrl+C)
-        recording ever learns the disk is filling at all.
+        HIGH: this used to also call the free-space check (FIX 3), sharing
+        one frame-count-gated interval with the flush below on the theory
+        that both are "check something expensive every so often, on the
+        consumer thread, never in the callback". That theory undercounted
+        the disk check's cost: shutil.disk_usage() is GetDiskFreeSpaceEx on
+        Windows, which can block for seconds on a network share, a volume
+        under antivirus scan, or a OneDrive-synced tree - long enough to
+        stall the very consumer thread that is the only thing draining the
+        packet queue upstream of this writer, on a queue that covers only a
+        couple of seconds (QUEUE_BUFFER_SECONDS in cli.py). The check now
+        runs on its own daemon thread (_disk_poll_loop/_poll_disk_once,
+        started in __enter__); this method only flushes.
 
         MEDIUM 5: the flush is honest about what it is not. Earlier drafts
         of this docstring claimed it "shrinks the power-loss exposure
@@ -360,13 +421,44 @@ class RecordingWriter:
         """
         if self._file is not None:
             self._file.flush()
-        self._check_disk_space()
 
-    def _check_disk_space(self) -> None:
-        free = shutil.disk_usage(self._raw_path.parent).free
-        if free < self._min_free_bytes and not self._disk_low:
+    def _disk_poll_loop(self) -> None:
+        """Runs on its own daemon thread - never the consumer thread.
+
+        Started by __enter__, stopped by __exit__. Polls at a fixed
+        wall-clock interval (DEFAULT_DISK_POLL_INTERVAL_SEC), independent of
+        how many frames have been written, so it keeps working even for a
+        source that has stalled (the exact condition a filling disk is most
+        dangerous during). See the module docstring and the HIGH fix on
+        _periodic_upkeep above.
+
+        Waits one interval before the first poll (Event.wait() returning
+        False means it timed out rather than being told to stop) rather
+        than polling immediately on thread start - a run that finishes
+        inside one interval never touches shutil.disk_usage() at all, and a
+        long-lived one is checked well within its first buffer's worth of
+        recording either way.
+        """
+        while not self._disk_poll_stop.wait(self._disk_poll_interval_sec):
+            self._poll_disk_once()
+
+    def _poll_disk_once(self) -> None:
+        """One free-space check. Only ever sets `_disk_low`/stashes the
+        free-byte count - never emits. write_packet(), on the consumer
+        thread, is the only thing that reads those and emits DiskLow (once).
+        Exposed as its own method, separate from the loop above, so a test
+        can call it directly and deterministically instead of racing a real
+        timer.
+        """
+        try:
+            free = shutil.disk_usage(self._raw_path.parent).free
+        except OSError:
+            # A transient failure (e.g. a network share blipping) must not
+            # kill the poll thread outright - try again next interval.
+            return
+        if free < self._min_free_bytes:
             self._disk_low = True
-            self._emit(DiskLow(free_bytes=free, required_bytes=self._min_free_bytes))
+            self._disk_low_free_bytes = free
 
     @property
     def disk_low(self) -> bool:

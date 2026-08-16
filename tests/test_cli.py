@@ -1,9 +1,13 @@
+import threading
+import time
+
 import pytest
 
 from biocam.cli import (
     MAX_PACKET_MS, MAX_QUEUE_BYTES, MIN_QUEUE_PACKETS,
-    _bytes_per_packet, _queue_size_for, build_parser, main,
+    _bytes_per_packet, _queue_size_for, _ConsolePrinter, build_parser, main,
 )
+from biocam.data.events import RecordingStarted
 from biocam.data.recording import AcquisitionParameters
 
 # The full BioCAM DupleX config (4096 channels, 2 bytes/sample, ~18.5 kHz -
@@ -334,6 +338,66 @@ def test_record_command_drains_buffered_packets_on_keyboard_interrupt(tmp_path, 
     assert integrity["discarded_at_stop"] == 0
     assert meta["stop_reason"] == "source_exhausted"
     assert exit_code == 0
+
+
+# --- Critical: printing must never happen on the consumer thread ---
+
+def test_console_printer_prints_off_the_calling_thread(monkeypatch):
+    """report() enqueues; only the printer's own daemon thread calls
+    print(). If report() printed directly, print() would run on this
+    test's thread instead."""
+    caller_thread = threading.current_thread()
+    seen_threads = []
+    real_print = print
+
+    def spying_print(*args, **kwargs):
+        seen_threads.append(threading.current_thread())
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr("biocam.cli.print", spying_print, raising=False)
+
+    printer = _ConsolePrinter()
+    assert printer._thread.daemon
+    assert printer._thread is not caller_thread
+
+    printer.report(RecordingStarted(path="x.raw", total_channels=4,
+                                    frame_rate_hz=1000.0))
+    printer.close()
+
+    assert seen_threads
+    assert seen_threads[0] is not caller_thread
+    assert seen_threads[0] is printer._thread
+
+
+def test_console_printer_report_never_blocks_when_the_ring_is_full():
+    # maxsize=1 with the daemon thread's own _run replaced by a no-op means
+    # nothing ever drains the queue, so the second report() call must find
+    # the ring full and drop-and-count rather than block.
+    printer = _ConsolePrinter(maxsize=1)
+    printer._stop.set()
+    printer._thread.join(timeout=2.0)  # stop the real daemon from draining
+
+    event = RecordingStarted(path="x.raw", total_channels=4, frame_rate_hz=1000.0)
+    printer.report(event)  # fills the ring (maxsize=1)
+
+    start = time.monotonic()
+    printer.report(event)  # must drop, not block
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0
+    assert printer.dropped == 1
+
+
+def test_console_printer_close_drains_pending_events_before_returning(capsys):
+    printer = _ConsolePrinter(maxsize=10)
+    for i in range(5):
+        printer.report(RecordingStarted(path=f"{i}.raw", total_channels=4,
+                                        frame_rate_hz=1000.0))
+    printer.close()
+
+    out = capsys.readouterr().out
+    assert out.count("\n") == 5
+    assert printer.dropped == 0
 
 
 def test_a_failing_source_stop_in_the_outer_finally_does_not_mask_the_real_exception(

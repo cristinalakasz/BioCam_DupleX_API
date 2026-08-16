@@ -44,6 +44,7 @@ if any, is already propagating out of this function.
 """
 
 import argparse
+import queue
 import shutil
 import threading
 import time
@@ -203,6 +204,91 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ConsolePrinter:
+    """Bounded ring plus a daemon thread that owns every actual print().
+
+    Critical: `report = lambda event: print(describe(event))` used to run
+    print() itself on the consumer thread - the same thread that is the
+    only thing draining record_session's packet queue (see
+    QUEUE_BUFFER_SECONDS above). print() blocks under entirely ordinary
+    operating conditions, not just exotic ones: on Windows, clicking inside
+    a console window enables QuickEdit mode and suspends every further
+    write to stdout until Enter is pressed; a full pipe, or a slow log
+    collector reading the other end of stdout, has the same effect. An
+    operator glancing at the console mid-recording - the most ordinary
+    thing an operator does - could stall the drain and start dropping
+    packets in the callback, silently, for no reason connected to the
+    instrument at all.
+
+    report() (called from the consumer thread, via RecordingWriter's and
+    DriverPacketSource's listener parameters) only ever enqueues; it must
+    never block or print. The daemon thread started in __init__ is the only
+    thing that calls print(), and it does so off the consumer thread
+    entirely. The queue is bounded (`maxsize`) and, mirroring the
+    drop-and-count discipline biocam/interop/source.py already uses for its
+    own packet queue (see that module's docstring on why not
+    deque(maxlen=...)), a full ring drops the *new* event and counts it
+    rather than blocking report() or silently evicting something already
+    queued. Losing console output is acceptable; losing it without saying
+    so is not - see `dropped`.
+    """
+
+    def __init__(self, maxsize: int = 1000):
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._dropped = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="biocam-printer", daemon=True)
+        self._thread.start()
+
+    def report(self, event) -> None:
+        """The listener callback. Runs on the consumer thread - must never
+        block, print, or otherwise do anything but enqueue."""
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            self._dropped += 1
+
+    def _run(self) -> None:
+        """The daemon thread body. Never the consumer thread, never the
+        driver's thread - it exists to keep print() off both."""
+        while True:
+            try:
+                event = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                print(describe(event))
+            except Exception:
+                # A broken stdout (or an event type describe() does not
+                # recognise) must not kill the printer thread - later
+                # events should still get a chance. Mirrors
+                # RecordingWriter._emit()'s own listener-exception handling
+                # (MEDIUM 4): a console failure is not a reason to lose
+                # anything else.
+                pass
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Stop the daemon thread once the ring is drained (or `timeout`
+        elapses), so every event enqueued before this call is printed
+        before the run reports its dropped count and exits."""
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 def _parameters_from(data_format) -> AcquisitionParameters:
     return AcquisitionParameters(
         frame_rate_hz=data_format.FrameRate,
@@ -226,9 +312,17 @@ def record_command(args) -> int:
     meta_path = out_dir / f"{base}_meta.json"
 
     stop = threading.Event()
-    report = lambda event: print(describe(event))
+    # Critical: printing must never happen on the consumer thread - see
+    # _ConsolePrinter's docstring. report() only enqueues; printer's own
+    # daemon thread is the only thing that calls print(). Combined into the
+    # same `with` as BioCamDevice so printer.close() runs unconditionally
+    # on every exit from the block below (normal return, the early
+    # disk-space return, or an exception propagating out) without adding a
+    # further level of nesting to the block itself.
+    printer = _ConsolePrinter()
+    report = printer.report
 
-    with BioCamDevice() as device:
+    with BioCamDevice() as device, printer:
         params = _parameters_from(device.data_format)
 
         if args.duration is not None:
@@ -310,6 +404,16 @@ def record_command(args) -> int:
                     f"source.stop() failed during cleanup: {exc}",
                     RuntimeWarning,
                 )
+
+    # Printer thread: report anything the console ring dropped. This only
+    # reaches events lost from the *screen* - nothing here implies data was
+    # lost from the recording itself (that is queue_overflows/
+    # driver_loss_events/callback_errors below, and the sidecar).
+    if printer.dropped:
+        print(f"CONSOLE OUTPUT DROPPED: {printer.dropped} event(s) - "
+              "printing lagged behind acquisition and the console ring "
+              "was full; nothing was lost from the recording itself, only "
+              "from what reached the screen")
 
     # Gate 1, item F: queue_overflows and driver_loss_events get the same
     # end-of-run visibility callback_errors already had - a run that dropped

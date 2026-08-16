@@ -352,3 +352,91 @@ def test_start_clears_a_buffer_left_over_from_a_prior_cycle():
 
     assert len(source._queue) == 0
     assert biocam.start_calls == 2
+
+
+def test_start_with_no_biocam_raises_a_named_error_not_attributeerror():
+    device = _FakeDevice(biocam=None)
+    source = DriverPacketSource(device, queue_size=10)
+
+    with pytest.raises(RuntimeError, match="biocam is None"):
+        source.start()
+
+
+def test_start_resets_counters_left_over_from_a_prior_session():
+    # A DriverPacketSource can be start()ed more than once (a retry, or any
+    # future multi-session caller). Loss/overflow/error counts must reflect
+    # only the session in progress - carrying a previous session's counts
+    # forward would report losses, via session.py's writer.note_*() calls,
+    # from a run that already ended and was already reported on.
+    source, device, biocam = _make_started_source()
+    _fire_data(biocam, 0)
+    biocam.DataReceived.handlers[0](None, None)  # None args -> data error
+    biocam.DataLossAsync.handlers[0](None, _FakeLossArgs(counter=7))
+    for counter in range(10):
+        _fire_data(biocam, counter)
+    _fire_data(biocam, 99)  # 11th packet - overflow
+
+    assert source.queue_overflows == 2
+    assert source.driver_loss_events == 7
+    assert source.callback_errors == 1
+
+    source.stop()
+    source.start()
+
+    assert source.queue_overflows == 0
+    assert source.driver_loss_events == 0
+    assert source.callback_errors == 0
+
+
+def test_stop_still_attempts_stopdatastreaming_after_a_start_that_raised_post_engage():
+    # issue #18: simulates AssertCanStartStreaming (or anything else inside
+    # the guarded try) raising *after* the hardware may already have been
+    # told to start. `_streaming` alone would stay False and stop() would
+    # skip StopDataStreaming entirely - the exact defect `_maybe_streaming`
+    # exists to close.
+    biocam = _FakeBioCam()
+
+    def raise_after_engaging(**kwargs):
+        biocam.start_calls += 1
+        raise RuntimeError("AssertCanStartStreaming failed after engaging")
+
+    biocam.StartDataStreaming = raise_after_engaging
+    device = _FakeDevice(biocam)
+    source = DriverPacketSource(device, queue_size=10)
+
+    with pytest.raises(RuntimeError, match="after engaging"):
+        source.start()
+
+    assert source._streaming is False
+    assert source._maybe_streaming is True  # stop() must still try
+
+    source.stop()
+
+    assert biocam.stop_calls == 1  # StopDataStreaming was attempted
+    assert source._maybe_streaming is False
+
+
+def test_periodic_manual_gc_collect_runs_on_the_consumer_thread(monkeypatch):
+    # HIGH: gc.disable() turns off *automatic* collection for the whole
+    # stream; __iter__ must run a manual, generation-1-only collect() every
+    # GC_COLLECT_INTERVAL_PACKETS packets so cycles still get reclaimed
+    # somewhere, without ever risking a collection landing on the driver's
+    # thread.
+    import biocam.interop.source as source_module
+
+    monkeypatch.setattr(source_module, "GC_COLLECT_INTERVAL_PACKETS", 3)
+    calls = []
+    monkeypatch.setattr(source_module.gc, "collect", lambda gen: calls.append(gen))
+
+    source, _device, biocam = _make_started_source()
+    for counter in range(7):
+        _fire_data(biocam, counter)
+
+    consumed = []
+    it = iter(source)
+    for _ in range(7):
+        consumed.append(next(it))
+
+    assert len(consumed) == 7
+    # 7 packets at an interval of 3 -> collect() after packet 3 and 6.
+    assert calls == [1, 1]

@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -442,9 +444,17 @@ def test_an_interrupted_sidecar_write_leaves_the_previous_complete_sidecar_intac
     assert leftovers == []
 
 
-# --- FIX 3: a running disk-space check, for open-ended recordings too ---
+# --- FIX 3 / HIGH: a running disk-space check, for open-ended recordings
+# too, that cannot itself stall the consumer thread ---
 
 def test_disk_check_trips_and_emits_disk_low(tmp_path, monkeypatch):
+    # HIGH: the free-space poll now runs on its own daemon thread
+    # (_disk_poll_loop), decoupled from write_packet(). A huge
+    # disk_poll_interval_sec keeps that real thread from ticking during this
+    # test, so the check is instead triggered deterministically by calling
+    # _poll_disk_once() directly - the same method the poll thread calls -
+    # and the assertions exercise write_packet()'s side of the fix: it only
+    # ever reads the flag the poll set, and emits DiskLow exactly once.
     raw, meta = _paths(tmp_path)
     seen = []
 
@@ -456,10 +466,17 @@ def test_disk_check_trips_and_emits_disk_low(tmp_path, monkeypatch):
 
     with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
                          min_free_bytes=1_000_000,
-                         upkeep_interval_frames=1) as writer:
+                         disk_poll_interval_sec=3600) as writer:
         assert writer.disk_low is False
+        assert not any(isinstance(e, DiskLow) for e in seen)
+
+        writer._poll_disk_once()  # what the poll thread would have done
+        assert writer.disk_low is True  # flag set; nothing emitted yet
+        assert not any(isinstance(e, DiskLow) for e in seen)
+
         writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
-        assert writer.disk_low is True
+        # write_packet() noticed the flag and emitted exactly once.
+        writer.write_packet(timestamp=2, counter=2, payload=_frame([1, 2, 3, 4]))
         writer.finalise("disk_low")
 
     disk_low_events = [e for e in seen if isinstance(e, DiskLow)]
@@ -468,28 +485,52 @@ def test_disk_check_trips_and_emits_disk_low(tmp_path, monkeypatch):
     assert disk_low_events[0].required_bytes == 1_000_000
 
 
-def test_disk_check_does_not_run_on_every_packet(tmp_path, monkeypatch):
+def test_disk_poll_never_runs_on_the_caller_thread(tmp_path, monkeypatch):
+    # HIGH: the actual shutil.disk_usage() call must happen off the
+    # consumer/caller thread - that is the whole point of the fix.
     raw, meta = _paths(tmp_path)
-    calls = []
+    caller_thread = threading.current_thread()
+    seen_threads = []
 
     class FakeUsage:
         free = 999_999_999_999  # always plenty free
 
     def fake_disk_usage(path):
-        calls.append(path)
+        seen_threads.append(threading.current_thread())
         return FakeUsage()
 
     monkeypatch.setattr("biocam.data.recording.shutil.disk_usage", fake_disk_usage)
 
-    with RecordingWriter(raw, meta, PARAMS, upkeep_interval_frames=5) as writer:
+    with RecordingWriter(raw, meta, PARAMS, disk_poll_interval_sec=0.02) as writer:
+        deadline = time.monotonic() + 2.0
+        while not seen_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
         for counter in range(1, 23):  # 22 packets, 1 frame each
             writer.write_packet(timestamp=counter, counter=counter,
                                 payload=_frame([1, 2, 3, 4]))
         writer.finalise("duration_reached")
 
-    # 22 frames at an interval of 5 -> checks after frame 5, 10, 15, 20:
-    # four calls, not twenty-two.
-    assert len(calls) == 4
+    assert seen_threads, "disk_usage() was never polled"
+    assert all(t is not caller_thread for t in seen_threads)
+    assert all(t.daemon for t in seen_threads)
+
+
+def test_disk_poll_thread_stops_on_exit(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+
+    class FakeUsage:
+        free = 999_999_999_999
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, disk_poll_interval_sec=0.02) as writer:
+        thread = writer._disk_poll_thread
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert thread is not None
+    assert not thread.is_alive()
 
 
 # --- Gate 1, item G: throttled gap emission ---
