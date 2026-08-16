@@ -54,7 +54,28 @@ class BioCamDevice:
         from _3Brain.BioCamDriver import BioCamPool
 
         self._pool = BioCamPool
-        BioCamPool.Activate()
+        # issue #17: the XML documents only Activate(System.Boolean)
+        # (param supportBioCamInvalidSerial) - 3Brain's own sample
+        # (MainForm.cs:72) calls Activate() with no arguments, relying on
+        # a C# default parameter value the XML does not state anywhere in
+        # this repo. C# supplies that default automatically; whether
+        # pythonnet does the same for a zero-argument call from Python is
+        # unverified here - untested, worth confirming in the lab. Try the
+        # no-argument form first, mirroring the sample as closely as
+        # pythonnet allows; if pythonnet does not fill the default,
+        # Activate() raises TypeError (missing required argument) rather
+        # than silently doing the wrong thing, and the fallback below
+        # supplies an explicit value. We do not know what C#'s actual
+        # default is, so `False` here is a guess, not a verified value -
+        # chosen only because "do not support invalid-serial BioCAMs"
+        # reads as the more conservative default for a flag named
+        # supportBioCamInvalidSerial. Flag for the lab: confirm which path
+        # is taken, and if the fallback runs, confirm False matches
+        # 3Brain's real default.
+        try:
+            BioCamPool.Activate()
+        except TypeError:
+            BioCamPool.Activate(False)
 
         deadline = time.time() + self._timeout_sec
         while time.time() < deadline:

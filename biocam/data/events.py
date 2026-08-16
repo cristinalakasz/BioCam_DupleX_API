@@ -25,6 +25,22 @@ class GapDetected:
 
 
 @dataclass(frozen=True)
+class GapSummary:
+    """A throttled stand-in for a run of individual GapDetected events.
+
+    RecordingWriter emits the first N gaps of a run in full (as GapDetected)
+    and then, under sustained loss, batches the rest: one of these per
+    interval instead of one GapDetected per gap (Gate 1, item G) - printing
+    one line per lost packet on the consumer thread would itself risk
+    stalling the drain that is the only thing keeping the queue from
+    overflowing further. The sidecar's own gap list is unaffected by this -
+    it is a listener-side throttle only.
+    """
+    n_gaps: int
+    missing_frames: int
+
+
+@dataclass(frozen=True)
 class QueuePressure:
     depth: int
     capacity: int
@@ -54,7 +70,7 @@ class RecordingStopped:
 
 
 RecordingEvent = Union[
-    RecordingStarted, GapDetected, QueuePressure, QueueOverflow,
+    RecordingStarted, GapDetected, GapSummary, QueuePressure, QueueOverflow,
     DriverDataLoss, DiskLow, RecordingStopped,
 ]
 
@@ -69,6 +85,9 @@ def describe(event) -> str:
     if isinstance(event, GapDetected):
         return (f"GAP after frame {event.after_frame}: "
                 f"{event.missing_frames} frames missing ({event.duration_ms:.2f} ms)")
+    if isinstance(event, GapSummary):
+        return (f"{event.n_gaps} more gaps since the last summary "
+                f"({event.missing_frames} frames missing)")
     if isinstance(event, QueuePressure):
         return f"Queue {event.depth}/{event.capacity} - the writer is falling behind"
     if isinstance(event, QueueOverflow):

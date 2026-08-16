@@ -1,9 +1,14 @@
 import json
+import os
+import threading
+import time
 
 import numpy as np
 import pytest
 
-from biocam.data.events import GapDetected, RecordingStarted, RecordingStopped
+from biocam.data.events import (
+    DiskLow, GapDetected, GapSummary, RecordingStarted, RecordingStopped,
+)
 from biocam.data.recording import (
     SCHEMA_VERSION, AcquisitionParameters, RecordingWriter,
     integrity_verdict, load_recording, read_sidecar,
@@ -104,6 +109,18 @@ def test_callback_errors_are_counted_and_reach_the_sidecar(tmp_path):
 
     integrity = read_sidecar(meta)["integrity"]
     assert integrity["callback_errors"] == 3
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_discarded_at_stop_is_counted_and_never_reports_clean(tmp_path):
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.note_discarded(4)
+        writer.finalise("drain_deadline_exceeded")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == 4
     assert integrity["verdict"] == "gaps_detected"
 
 
@@ -241,6 +258,60 @@ def test_events_are_emitted_to_the_listener(tmp_path):
     assert seen[-1].verdict == "gaps_detected"
 
 
+# --- MEDIUM 4: a listener exception must not abort the recording ---
+
+def test_a_listener_that_raises_does_not_abort_write_packet(tmp_path):
+    """print() raises OSError on a broken stdout; describe() raises
+    TypeError for an event type it does not recognise. Either must be
+    counted and swallowed, not allowed to propagate out of write_packet()
+    and lose the rest of the recording."""
+    raw, meta = _paths(tmp_path)
+
+    def exploding_listener(event):
+        raise OSError("broken stdout")
+
+    with RecordingWriter(raw, meta, PARAMS, listener=exploding_listener) as writer:
+        # __enter__ already emitted RecordingStarted, which the listener
+        # blew up on - one error already, and the write below must still
+        # succeed despite it.
+        assert writer.listener_errors == 1
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.write_packet(timestamp=2, counter=2, payload=_frame([5, 6, 7, 8]))
+        writer.finalise("duration_reached")
+        # finalise() emits RecordingStopped - one more error.
+        assert writer.listener_errors == 2
+
+    # The recording itself is unaffected - both packets made it to disk.
+    assert raw.read_bytes() == _frame([1, 2, 3, 4, 5, 6, 7, 8])
+    assert read_sidecar(meta)["status"] == "complete"
+
+
+def test_a_listener_that_raises_does_not_abort_finalise(tmp_path):
+    raw, meta = _paths(tmp_path)
+    calls = []
+
+    def flaky_listener(event):
+        calls.append(event)
+        if len(calls) > 1:  # let RecordingStarted through, fail afterwards
+            raise TypeError("unrecognised event")
+
+    with RecordingWriter(raw, meta, PARAMS, listener=flaky_listener) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+        assert writer.listener_errors >= 1
+
+    assert read_sidecar(meta)["status"] == "complete"
+
+
+def test_listener_errors_default_to_zero_when_the_listener_behaves(tmp_path):
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+    assert writer.listener_errors == 0
+
+
 def test_verdict_unknown_when_the_sidecar_predates_schema_2():
     assert integrity_verdict({"total_channels": 4096}) == "unknown"
 
@@ -302,3 +373,270 @@ def test_committed_fixtures_are_reported_as_unknown():
     from tests.test_fixture_integrity import load_fixture
     _, meta = load_fixture("sample_32ch_2s")
     assert integrity_verdict(meta) == "unknown"
+
+
+# --- FIX 1: a failed __exit__ sidecar write must not mask the real error ---
+
+def test_a_sidecar_write_failure_in_exit_does_not_mask_the_original_exception(
+        tmp_path, monkeypatch):
+    """Simulates a full disk: the __exit__ failure-sidecar write itself
+    raises OSError. The caller must still see the original ValueError, not a
+    confusing OSError about the sidecar - and must not see nothing at all."""
+    raw, meta = _paths(tmp_path)
+
+    with pytest.raises(ValueError, match="boom"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            # Only now make the sidecar path unwritable - __enter__'s
+            # in_progress write must succeed normally.
+            monkeypatch.setattr(
+                "biocam.data.recording.os.replace",
+                lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+            raise ValueError("boom")
+
+
+def test_a_masked_sidecar_write_failure_still_warns(tmp_path, monkeypatch):
+    """Not swallowed silently - a failure worth knowing about is surfaced as
+    a warning rather than becoming (or hiding as) the raised exception."""
+    raw, meta = _paths(tmp_path)
+
+    with pytest.warns(RuntimeWarning, match="could not write failure sidecar"):
+        with pytest.raises(ValueError):
+            with RecordingWriter(raw, meta, PARAMS) as writer:
+                writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+                monkeypatch.setattr(
+                    "biocam.data.recording.os.replace",
+                    lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+                raise ValueError("boom")
+
+
+# --- FIX 2: the sidecar write is atomic ---
+
+def test_an_interrupted_sidecar_write_leaves_the_previous_complete_sidecar_intact(
+        tmp_path, monkeypatch):
+    """A write that fails part-way (simulated via a failing os.replace, the
+    same atomic step a crash or full disk would interrupt) must not touch the
+    sidecar already on disk - the whole point of writing to a temp file
+    first."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+    complete_text = meta.read_text()
+    json.loads(complete_text)  # sanity: it is valid JSON before we begin
+
+    writer2 = RecordingWriter(raw, meta, PARAMS)
+
+    def failing_replace(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("biocam.data.recording.os.replace", failing_replace)
+    with pytest.raises(OSError):
+        writer2._write_sidecar(status="in_progress", stop_reason=None)
+
+    # The previous, complete sidecar is untouched - not truncated, not
+    # replaced with a half-written temp file.
+    assert meta.read_text() == complete_text
+    json.loads(meta.read_text())
+
+    # No stray temp file left behind either.
+    leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
+# --- FIX 3 / HIGH: a running disk-space check, for open-ended recordings
+# too, that cannot itself stall the consumer thread ---
+
+def test_disk_check_trips_and_emits_disk_low(tmp_path, monkeypatch):
+    # HIGH: the free-space poll now runs on its own daemon thread
+    # (_disk_poll_loop), decoupled from write_packet(). A huge
+    # disk_poll_interval_sec keeps that real thread from ticking during this
+    # test, so the check is instead triggered deterministically by calling
+    # _poll_disk_once() directly - the same method the poll thread calls -
+    # and the assertions exercise write_packet()'s side of the fix: it only
+    # ever reads the flag the poll set, and emits DiskLow exactly once.
+    raw, meta = _paths(tmp_path)
+    seen = []
+
+    class FakeUsage:
+        free = 10  # far below any threshold
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         min_free_bytes=1_000_000,
+                         disk_poll_interval_sec=3600) as writer:
+        assert writer.disk_low is False
+        assert not any(isinstance(e, DiskLow) for e in seen)
+
+        writer._poll_disk_once()  # what the poll thread would have done
+        assert writer.disk_low is True  # flag set; nothing emitted yet
+        assert not any(isinstance(e, DiskLow) for e in seen)
+
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        # write_packet() noticed the flag and emitted exactly once.
+        writer.write_packet(timestamp=2, counter=2, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("disk_low")
+
+    disk_low_events = [e for e in seen if isinstance(e, DiskLow)]
+    assert len(disk_low_events) == 1
+    assert disk_low_events[0].free_bytes == 10
+    assert disk_low_events[0].required_bytes == 1_000_000
+
+
+def test_disk_poll_never_runs_on_the_caller_thread(tmp_path, monkeypatch):
+    # HIGH: the actual shutil.disk_usage() call must happen off the
+    # consumer/caller thread - that is the whole point of the fix.
+    raw, meta = _paths(tmp_path)
+    caller_thread = threading.current_thread()
+    seen_threads = []
+
+    class FakeUsage:
+        free = 999_999_999_999  # always plenty free
+
+    def fake_disk_usage(path):
+        seen_threads.append(threading.current_thread())
+        return FakeUsage()
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage", fake_disk_usage)
+
+    with RecordingWriter(raw, meta, PARAMS, disk_poll_interval_sec=0.02) as writer:
+        deadline = time.monotonic() + 2.0
+        while not seen_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for counter in range(1, 23):  # 22 packets, 1 frame each
+            writer.write_packet(timestamp=counter, counter=counter,
+                                payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert seen_threads, "disk_usage() was never polled"
+    assert all(t is not caller_thread for t in seen_threads)
+    assert all(t.daemon for t in seen_threads)
+
+
+def test_disk_poll_thread_stops_on_exit(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+
+    class FakeUsage:
+        free = 999_999_999_999
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, disk_poll_interval_sec=0.02) as writer:
+        thread = writer._disk_poll_thread
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert thread is not None
+    assert not thread.is_alive()
+
+
+# --- Gate 1, item G: throttled gap emission ---
+
+def _write_n_one_packet_gaps(writer, n):
+    counter = 1
+    writer.write_packet(timestamp=1, counter=counter, payload=_frame([1, 2, 3, 4]))
+    for _ in range(n):
+        counter += 2  # delta 2 -> exactly one packet (one frame) lost each time
+        writer.write_packet(timestamp=counter, counter=counter, payload=_frame([1, 2, 3, 4]))
+
+
+def test_gap_emission_is_throttled_after_the_full_count(tmp_path):
+    """cli.py prints on the consumer thread - the same thread that is the
+    only thing draining the queue - so one GapDetected per gap under
+    sustained loss would print at the same rate the loss is happening. The
+    first gap_emit_full_count gaps must still be emitted individually;
+    after that, gaps are batched into GapSummary events instead, with a
+    trailing partial summary flushed at finalise()."""
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         gap_emit_full_count=2, gap_summary_interval=3) as writer:
+        _write_n_one_packet_gaps(writer, 9)
+        writer.finalise("duration_reached")
+
+    gap_events = [e for e in seen if isinstance(e, GapDetected)]
+    summary_events = [e for e in seen if isinstance(e, GapSummary)]
+    assert len(gap_events) == 2  # gap_emit_full_count, emitted in full
+    # 9 gaps total: 2 in full, 7 remaining -> two summaries of 3 plus one
+    # trailing summary of 1 (flushed by finalise()).
+    assert [s.n_gaps for s in summary_events] == [3, 3, 1]
+    assert sum(s.n_gaps for s in summary_events) == 7
+
+    # The sidecar keeps every gap regardless of what reached the listener.
+    integrity = read_sidecar(meta)["integrity"]
+    assert len(integrity["gaps"]) == 9
+    assert integrity["gaps_truncated"] == 0
+
+
+def test_gap_summary_is_not_emitted_when_nothing_exceeds_the_full_count(tmp_path):
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         gap_emit_full_count=5, gap_summary_interval=3) as writer:
+        _write_n_one_packet_gaps(writer, 2)
+        writer.finalise("duration_reached")
+
+    assert len([e for e in seen if isinstance(e, GapDetected)]) == 2
+    assert not [e for e in seen if isinstance(e, GapSummary)]
+
+
+# --- Gate 1, item H: the retained gap list is capped ---
+
+def test_gaps_truncated_appears_in_the_sidecar_when_the_cap_is_exceeded(tmp_path):
+    """Once the retained gap list hits its cap, further gaps are still
+    counted (gaps_truncated) rather than silently understating how much was
+    lost."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=2) as writer:
+        _write_n_one_packet_gaps(writer, 5)
+        writer.finalise("duration_reached")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert len(integrity["gaps"]) == 2
+    assert integrity["gaps_truncated"] == 3
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_verdict_reports_gaps_detected_even_when_all_gaps_are_truncated(tmp_path):
+    """A gap that happened but was not retained (item H) must still flip
+    the verdict away from clean - RecordingWriter.verdict must account for
+    gaps_truncated, not just an empty retained list (item I's has_gaps)."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=0) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.write_packet(timestamp=2, counter=3, payload=_frame([5, 6, 7, 8]))  # 1 lost
+        writer.finalise("duration_reached")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["gaps"] == []
+    assert integrity["gaps_truncated"] == 1
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_gaps_truncated_defaults_to_zero_on_an_ordinary_run(tmp_path):
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert read_sidecar(meta)["integrity"]["gaps_truncated"] == 0
+
+
+# --- FIX 4: finalise fsyncs, not just flushes ---
+
+def test_finalise_calls_fsync(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+    fsync_calls = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        "biocam.data.recording.os.fsync",
+        lambda fd: fsync_calls.append(fd) or real_fsync(fd))
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert len(fsync_calls) == 1

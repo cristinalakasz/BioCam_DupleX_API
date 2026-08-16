@@ -3,6 +3,7 @@ import pytest
 from biocam.data.integrity import (
     COUNTER_MODULUS,
     COUNTER_ANOMALY_THRESHOLD,
+    MAX_RETAINED_GAPS,
     Gap,
     GapTracker,
     packets_lost,
@@ -43,6 +44,9 @@ def test_tracker_reports_nothing_on_a_clean_run():
     assert tracker.gaps == []
     assert tracker.n_frames_missing == 0
     assert tracker.counter_anomalies == 0
+    assert tracker.has_gaps is False
+    assert tracker.n_gaps == 0
+    assert tracker.gaps_truncated == 0
 
 
 def test_tracker_reports_a_gap_with_position_and_duration():
@@ -125,3 +129,55 @@ def test_large_plausible_gap_still_reported_as_loss():
     assert gap is not None
     assert gap.missing_frames == 99 * 10
     assert tracker.counter_anomalies == 0
+
+
+# --- Gate 1, item I: has_gaps / n_gaps as O(1) alternatives to `gaps` ---
+
+def test_has_gaps_and_n_gaps_reflect_a_single_gap():
+    tracker = GapTracker(frame_rate_hz=RATE)
+    tracker.observe(1, frames_in_packet=10, frames_written=0)
+    tracker.observe(3, frames_in_packet=10, frames_written=10)  # 1 lost packet
+    assert tracker.has_gaps is True
+    assert tracker.n_gaps == 1
+
+
+def test_n_gaps_counts_every_gap_not_just_the_retained_list():
+    """Once the retained list is capped (item H), n_gaps must still count
+    the ones that were not retained - it is not simply len(gaps)."""
+    tracker = GapTracker(frame_rate_hz=RATE, max_retained_gaps=2)
+    counter = 0
+    tracker.observe(counter, frames_in_packet=10, frames_written=0)
+    for _ in range(5):  # 5 separate one-packet gaps
+        counter += 2
+        tracker.observe(counter, frames_in_packet=10, frames_written=0)
+    assert len(tracker.gaps) == 2       # capped
+    assert tracker.gaps_truncated == 3  # the rest, counted rather than dropped
+    assert tracker.n_gaps == 5          # retained + truncated
+    assert tracker.has_gaps is True
+
+
+# --- Gate 1, item H: the retained gap list is capped ---
+
+def test_retained_gap_list_is_capped_and_the_remainder_is_counted():
+    tracker = GapTracker(frame_rate_hz=RATE, max_retained_gaps=3)
+    counter = 0
+    tracker.observe(counter, frames_in_packet=10, frames_written=0)
+    gaps_returned = []
+    for _ in range(10):  # 10 separate one-packet gaps
+        counter += 2
+        gap = tracker.observe(counter, frames_in_packet=10, frames_written=0)
+        gaps_returned.append(gap)
+
+    # The tracker still returns (and the caller can still act on / emit)
+    # every gap, even once the retained list is full.
+    assert all(g is not None for g in gaps_returned)
+    # But only the first 3 are retained in the list.
+    assert len(tracker.gaps) == 3
+    assert tracker.gaps_truncated == 7
+    # Missing-frame accounting is unaffected by truncation.
+    assert tracker.n_frames_missing == 10 * 10
+
+
+def test_default_max_retained_gaps_matches_the_module_constant():
+    tracker = GapTracker(frame_rate_hz=RATE)
+    assert tracker._max_retained_gaps == MAX_RETAINED_GAPS
