@@ -1,7 +1,9 @@
 # Phase 1 — Acquisition
 
 **Date:** 2026-08-13
-**Status:** Design complete, awaiting review
+**Status:** Implemented and merged 2026-08-13 (PR #9). Gate 1 ran after the merge
+and returned findings — the code is **not cleared for a lab session**. See
+`2026-08-13-phase1-followups.md`.
 **Predecessor:** Phase 0 setup, `2026-08-03-claude-project-setup-design.md`
 **Roadmap:** `2026-08-12-api-roadmap-decomposition.md` §2
 

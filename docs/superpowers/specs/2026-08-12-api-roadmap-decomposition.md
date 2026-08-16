@@ -1,7 +1,7 @@
 # API roadmap: decomposition and hardware findings
 
 **Date:** 2026-08-12
-**Status:** Decomposition agreed. Phase 0 selected to build first.
+**Status:** Decomposition agreed. Phases 0 and 1 built; Phase 2 is next to spec.
 **Purpose:** Records the build order and the stimulator capabilities discovered
 while decomposing, so that later phases start from findings rather than
 rediscovering them.
@@ -42,7 +42,7 @@ preference, places it last.
 | Phase | Contents | Status |
 |---|---|---|
 | **0** | Setup: `CLAUDE.md`, verifier agents, test scaffolding, README | Specced 2026-08-03. **Done** (2026-08-12). |
-| **1** | Acquisition: recording, saving, data integrity | Next to spec |
+| **1** | Acquisition: recording, saving, data integrity | Specced and **merged** (2026-08-13). Gate 1 ran afterwards and did **not** come back clean — see `2026-08-13-phase1-followups.md`. Not cleared for the lab. |
 | **2** | Stimulation engine + manual (a) + scheduled (b) | |
 | **3** | Session control: recording and stimulation together, changing live | |
 | **4** | UI | |
