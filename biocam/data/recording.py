@@ -108,6 +108,19 @@ DEFAULT_DISK_POLL_INTERVAL_SEC = 2.0
 GAP_EMIT_FULL_COUNT = 20
 GAP_SUMMARY_INTERVAL = 50
 
+# LOW: how many retained gaps __exit__'s failure-sidecar write will include,
+# distinct from (and much smaller than) MAX_RETAINED_GAPS in integrity.py.
+# MAX_RETAINED_GAPS already bounds the normal finalise() write to a sane
+# size, but the failure write happens at exactly the moment memory pressure
+# is most likely already the problem - an exception mid-run, possibly the
+# proximate cause of the crash itself - so building a list of up to 100,000
+# Gap dicts and json.dumps-ing it is exactly the wrong thing to ask for right
+# then. This caps the failure write specifically, harder than the normal
+# one; any gaps beyond the cap are folded into gaps_truncated (already an
+# integer count, not a boolean - see GapTracker.gaps_truncated), not lost
+# from what the sidecar reports, only from the retained list it writes out.
+FAILURE_SIDECAR_MAX_GAPS = 1_000
+
 
 @dataclass(frozen=True)
 class AcquisitionParameters:
@@ -126,7 +139,24 @@ class AcquisitionParameters:
 
 
 class RecordingWriter:
-    """Appends packets to a raw file and maintains the integrity record."""
+    """Appends packets to a raw file and maintains the integrity record.
+
+    MEDIUM 6: a RecordingWriter is not safely reusable across more than one
+    recording. `__exit__` joins the disk-poll thread (`_disk_poll_thread`)
+    with a `timeout=2.0` and proceeds regardless of whether the join
+    actually succeeded - so a thread that is genuinely stuck (e.g. blocked
+    inside `shutil.disk_usage()` on an unresponsive network share) outlives
+    the writer instance instead of being guaranteed to stop. That is a
+    current constraint, not a bug fixed here: the CLI creates exactly one
+    RecordingWriter per process and exits shortly after `__exit__` runs, so
+    a leaked, already-harmless thread has nowhere to accumulate. A future
+    caller that constructs many RecordingWriters in one long-lived process -
+    the planned Phase 4 UI is exactly this shape - would need to revisit
+    this before doing so, since repeated stuck joins there could accumulate
+    daemon threads for the life of the process. Left undesigned for this
+    Gate 1 pass rather than guessed at without a concrete caller to design
+    against.
+    """
 
     def __init__(self, raw_path, meta_path, params: AcquisitionParameters,
                  listener=None, min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
@@ -134,7 +164,8 @@ class RecordingWriter:
                  max_retained_gaps: int = MAX_RETAINED_GAPS,
                  gap_emit_full_count: int = GAP_EMIT_FULL_COUNT,
                  gap_summary_interval: int = GAP_SUMMARY_INTERVAL,
-                 disk_poll_interval_sec: float = DEFAULT_DISK_POLL_INTERVAL_SEC):
+                 disk_poll_interval_sec: float = DEFAULT_DISK_POLL_INTERVAL_SEC,
+                 failure_sidecar_max_gaps: int = FAILURE_SIDECAR_MAX_GAPS):
         self._raw_path = Path(raw_path)
         self._meta_path = Path(meta_path)
         self._params = params
@@ -143,6 +174,7 @@ class RecordingWriter:
         self._upkeep_interval_frames = upkeep_interval_frames
         self._gap_emit_full_count = gap_emit_full_count
         self._gap_summary_interval = gap_summary_interval
+        self._failure_sidecar_max_gaps = failure_sidecar_max_gaps
         self._disk_poll_interval_sec = disk_poll_interval_sec
 
         self._file = None
@@ -219,8 +251,17 @@ class RecordingWriter:
             # record of what the writer had observed before things went
             # wrong - so it is not swallowed silently either, just kept from
             # masking anything.
+            #
+            # LOW: max_gaps=self._failure_sidecar_max_gaps caps the retained
+            # gap list harder for this write specifically than the normal
+            # finalise() one - see FAILURE_SIDECAR_MAX_GAPS above. This is
+            # exactly the moment memory pressure is most likely already the
+            # problem; building and serialising a much larger list here
+            # would risk turning an already-failing run into a MemoryError
+            # that erases the sidecar entirely, right when it is needed most.
             try:
-                self._write_sidecar(status="failed", stop_reason="error", error=error)
+                self._write_sidecar(status="failed", stop_reason="error", error=error,
+                                    max_gaps=self._failure_sidecar_max_gaps)
             except OSError as sidecar_exc:
                 warnings.warn(
                     f"could not write failure sidecar to {self._meta_path}: "
@@ -573,7 +614,23 @@ class RecordingWriter:
             return VERDICT_UNKNOWN
         return verdict
 
-    def _write_sidecar(self, status: str, stop_reason, error=None) -> None:
+    def _write_sidecar(self, status: str, stop_reason, error=None,
+                       max_gaps: Optional[int] = None) -> None:
+        # LOW: max_gaps, when given (the failure-sidecar write in __exit__
+        # passes self._failure_sidecar_max_gaps; the normal in_progress/
+        # complete writes pass None and rely on MAX_RETAINED_GAPS - see
+        # integrity.py - alone), caps the retained gap list harder for this
+        # one write than the tracker's own retention already does.
+        # gaps_truncated is an integer count, not a boolean (see
+        # GapTracker.gaps_truncated), so any gaps this extra cap removes
+        # from the list are folded into it rather than silently vanishing
+        # from what the sidecar reports - only the retained *list* shrinks.
+        gaps = self._tracker.gaps
+        gaps_truncated = self._tracker.gaps_truncated
+        if max_gaps is not None and len(gaps) > max_gaps:
+            gaps_truncated += len(gaps) - max_gaps
+            gaps = gaps[:max_gaps]
+
         n_frames = self.n_frames_written
         record = dict(asdict(self._params))
         record.update({
@@ -589,8 +646,8 @@ class RecordingWriter:
                 "first_timestamp": self._first_timestamp,
                 "last_timestamp": self._last_timestamp,
                 "n_frames_missing": self._tracker.n_frames_missing,
-                "gaps": [asdict(g) for g in self._tracker.gaps],
-                "gaps_truncated": self._tracker.gaps_truncated,
+                "gaps": [asdict(g) for g in gaps],
+                "gaps_truncated": gaps_truncated,
                 "driver_loss_events": self._driver_loss,
                 "queue_overflows": self._queue_overflows,
                 "callback_errors": self._callback_errors,

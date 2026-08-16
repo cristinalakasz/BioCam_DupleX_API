@@ -173,6 +173,12 @@ class _FakeDrainSource:
 
     def stop(self):
         self.stop_calls += 1
+        # Mirrors DriverPacketSource.stop(), which sets _stop_event before
+        # returning - `stopped` (the property backed by that event) reads
+        # True immediately after a real stop() call. MEDIUM 3 relies on
+        # this: record_session's finally-block drain only enters
+        # `for packet in counters` once `counters.stopped` is True.
+        self.stopped = True
 
     def __iter__(self):
         while self._buffer:
@@ -588,3 +594,135 @@ def test_session_stops_cleanly_with_reason_disk_low(tmp_path, monkeypatch):
     record = read_sidecar(meta)
     assert record["status"] == "complete"
     assert record["stop_reason"] == "disk_low"
+
+
+# --- MEDIUM 1/2/3: the finally-block drain (CRITICAL 1's drain) gets the
+# same disk_low/exception/stopped-confirmation guards the other drain paths
+# already have ---
+
+class _FakeNeverConfirmedStopSource:
+    """A source whose stop() is called but never confirms `stopped` - the
+    MEDIUM 3 scenario. __iter__ never returns once its buffer is empty (it
+    sleeps forever instead), mirroring the real DriverPacketSource.__iter__
+    sleeping on an empty, unstopped queue - so a test using this source
+    would hang if the finally-block drain ever entered it despite `stopped`
+    staying False."""
+
+    def __init__(self, n_packets):
+        self._buffer = collections.deque(
+            Packet(timestamp=i, counter=i,
+                   payload=np.arange(4, dtype=np.uint16).tobytes())
+            for i in range(n_packets)
+        )
+        self.driver_loss_events = 0
+        self.queue_overflows = 0
+        self.callback_errors = 0
+        self.stopped = False
+        self.stop_calls = 0
+
+    def pending_count(self) -> int:
+        return len(self._buffer)
+
+    def stop(self):
+        self.stop_calls += 1
+        # Deliberately does not set self.stopped - the unconfirmed case.
+
+    def __iter__(self):
+        while True:
+            if self._buffer:
+                yield self._buffer.popleft()
+            else:
+                time.sleep(0.01)  # never returns; nothing sets self.stopped
+
+
+def test_finally_drain_is_skipped_when_the_source_never_confirms_it_stopped(tmp_path):
+    """MEDIUM 3: `for packet in counters` must not be entered unless
+    counters.stopped is True - otherwise a source whose __iter__ sleeps on
+    an empty queue (like the real DriverPacketSource's) can hang this
+    forever, since the DRAIN_DEADLINE_SEC deadline is only evaluated between
+    yields. This test would hang - not fail, hang - if the guard were ever
+    removed."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeNeverConfirmedStopSource(n_packets=10)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, duration_sec=0.005,  # 5-frame limit
+                                counters=source, stop_source=source.stop)
+
+    assert source.stop_calls == 1
+    assert result.stop_reason == "duration_reached"
+    assert result.n_frames == 5  # only what the main loop itself wrote
+    # The drain loop was skipped entirely (never confirmed stopped), so the
+    # rest of the source's buffer is counted as abandoned directly via
+    # pending_count(), never drained into the writer.
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == 5
+
+
+def test_finally_drain_stops_on_disk_low_instead_of_draining_the_whole_backlog(
+        tmp_path, monkeypatch):
+    """MEDIUM 1: the finally-block drain must check writer.disk_low on every
+    packet it writes, exactly like the main loop above - a full disk must
+    stop this drain too, not let it keep writing for up to the full
+    DRAIN_DEADLINE_SEC."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeDrainSource(n_packets=1000)
+
+    class FakeUsage:
+        free = 10  # far below any threshold
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, min_free_bytes=1_000_000,
+                         disk_poll_interval_sec=3600) as writer:
+        writer._poll_disk_once()  # deterministic disk_low, before anything runs
+        result = record_session(source, writer, counters=source,
+                                stop_source=source.stop)
+
+    assert result.stop_reason == "disk_low"
+    # The main loop's own FIX 3 check breaks after the very first packet;
+    # the finally-block drain (entered because stop() confirms `stopped` -
+    # MEDIUM 3) must likewise break almost immediately on disk_low, not
+    # drain hundreds more packets from the 1000-packet backlog before
+    # giving up.
+    assert result.n_frames <= 2
+    abandoned = source.pending_count()
+    assert abandoned >= 997
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == abandoned
+
+
+def test_finally_drain_survives_a_write_failure_and_still_finalises(tmp_path, monkeypatch):
+    """MEDIUM 2: an exception raised by write_packet() inside the
+    finally-block drain (most plausibly an OSError from the same full disk
+    that triggered disk_low) must not propagate past pending_count()/
+    note_discarded()/finalise() - otherwise RecordingWriter.__exit__ writes
+    status="failed", stop_reason="error", erasing the real reason
+    (duration_reached here) and leaving the rest of the backlog uncounted."""
+    from biocam.data.recording import RecordingWriter as RW
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeDrainSource(n_packets=100)
+
+    real_write_packet = RW.write_packet
+    calls = {"n": 0}
+
+    def flaky_write_packet(self, timestamp, counter, payload):
+        calls["n"] += 1
+        if calls["n"] == 55:  # fails partway through the drain, not the main loop
+            raise OSError("disk full")
+        return real_write_packet(self, timestamp, counter, payload)
+
+    monkeypatch.setattr(RW, "write_packet", flaky_write_packet)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, duration_sec=0.05,  # 50-frame limit
+                                counters=source, stop_source=source.stop)
+
+    assert result.stop_reason == "duration_reached"  # not "error"
+    record = read_sidecar(meta)
+    assert record["status"] == "complete"  # not "failed"
+    integrity = record["integrity"]
+    assert integrity["discarded_at_stop"] > 0
+    assert integrity["verdict"] != "clean"

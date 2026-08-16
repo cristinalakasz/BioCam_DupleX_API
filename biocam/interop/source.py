@@ -79,17 +79,48 @@ nothing and loses nothing either way. `callback_errors` sums the three when
 read, which is safe because summing ints is not a read-modify-write of any
 of the counters themselves.
 
-`start()` also tightens `sys.setswitchinterval`, freezes the current object
-graph into gc's permanent generation, and disables *automatic* cyclic
-collection for the duration of the stream. `stop()` restores the switch
-interval, unfreezes (HIGH: this used to be the one half of freeze/disable
-that was never undone - see `_restore_runtime_tuning` below), and
-re-enables automatic collection. With automatic collection off for a run
-that can run for hours, `__iter__` also runs a manual `gc.collect(1)` -
-generations 0 and 1 only, never generation 2 - at GC_COLLECT_INTERVAL_
-PACKETS, on the consumer thread that iterates it, precisely because that is
-never the driver's thread. See the docstrings on `_apply_runtime_tuning`/
-`_restore_runtime_tuning` and on `__iter__` below.
+`start()` also tightens `sys.setswitchinterval` and freezes the current
+object graph into gc's permanent generation; `stop()` restores the switch
+interval and unfreezes.
+
+HIGH 2/HIGH 3 (Gate 1 final pass): earlier revisions of this module also
+disabled *automatic* cyclic collection for the duration of the stream and
+ran a manual `gc.collect(1)` from `__iter__` every GC_COLLECT_INTERVAL_
+PACKETS, defended at the time by the argument that the manual pass ran on
+the consumer thread and therefore never the driver's. That argument is
+wrong: `gc.collect()` holds the GIL for the entire traversal it performs,
+and the driver's callback thread cannot execute a single bytecode without
+the GIL regardless of which Python thread is holding it. Measured on this
+codebase: `gc.collect(1)` took 31.8 ms and stalled an unrelated thread for
+32.8 ms - at a 1 ms acquisition period that is 32 packets lost every time it
+fired, from a mechanism that was supposed to be protecting the callback, not
+starving it. Worse, `gc.collect(1)` promotes survivors into generation 2,
+and with automatic collection disabled for the whole run generation 2 was
+never collected either - so the fix intended to stop reference cycles from
+accumulating instead made any cycle that survived one manual pass permanent
+for the session, exactly the outcome it was supposed to prevent.
+
+The fix is to do less: `gc.freeze()` is kept, because it is the genuinely
+valuable part - it moves everything alive at `start()` out of every future
+traversal, which is what keeps a generation-0 collection cheap for the rest
+of the run. Automatic collection is simply left enabled. With startup
+objects frozen, an automatic generation-0 pass only scans what the run
+itself allocated - short, because the hot path allocates one Packet plus one
+bytes copy per call and creates no cycles of its own - and generations 1 and
+2 still run on their own normal, automatic schedule, so nothing accumulates
+in either of them for the length of a session. A manual pause that measured
+worse than the automatic passes it replaced cannot be made safe by choosing
+which thread calls it; the only fix is not to call it. `gc.unfreeze()` stays
+paired with `gc.freeze()` in `stop()`, so the two remain symmetric - see
+`_restore_runtime_tuning` below.
+
+Because "we believe pythonnet does not leak cycles" is exactly the kind of
+claim this codebase should not make on faith, `start()` and `stop()` each
+record `gc.get_count()` (the per-generation allocation counts) and
+`len(gc.get_objects())` (the tracked object total) as `gc_counts_at_start`/
+`gc_objects_at_start` and `gc_counts_at_stop`/`gc_objects_at_stop`. cli.py
+prints the delta in its end-of-run summary, so a real multi-hour lab run
+produces a number to report instead of an assumption to repeat.
 """
 
 import collections
@@ -117,22 +148,6 @@ PRESSURE_FRACTION = 0.8
 # primitive back on the driver's thread, exactly what this module exists to
 # avoid (see the module docstring above on why a deque, not queue.Queue).
 POLL_INTERVAL_SEC = 0.001
-
-# How often (in packets yielded by __iter__) a manual, generation-1 gc pass
-# runs on the consumer thread. HIGH: gc.disable() (see _apply_runtime_tuning
-# below) turns off *automatic* collection for the whole stream, which can
-# run for hours; a manual collect() run periodically, and only ever on this
-# thread, reclaims any cycles created during that time without ever risking
-# a collection landing on the driver's thread. gen 1, not gen 2: everything
-# alive at start() was moved to the permanent generation by gc.freeze() and
-# is never rescanned regardless, so a young-generation pass is what is left
-# to usefully collect, and it is the short one. A few thousand packets is a
-# few seconds at the reference 1 ms rate - frequent enough that any cycle
-# pythonnet's bookkeeping might create (undocumented - see the module
-# docstring) does not accumulate for the length of a whole session, rare
-# enough that gc.collect()'s own cost (still a full scan of gen 0 and 1,
-# whatever is tracked and not frozen) is immaterial next to per-packet work.
-GC_COLLECT_INTERVAL_PACKETS = 5000
 
 # sys.getswitchinterval() defaults to 0.005 s - five packet periods at a 1 ms
 # acquisition rate. The callback runs on a .NET thread and must acquire the
@@ -192,10 +207,20 @@ class DriverPacketSource:
         # tuning(). None means "nothing to restore" - covers stop() being
         # called without a preceding successful start().
         self._prev_switch_interval = None
-        self._prev_gc_enabled = None
-        # Packets yielded by __iter__ since the last manual gc.collect(1) -
-        # see GC_COLLECT_INTERVAL_PACKETS above.
-        self._packets_since_gc = 0
+        # True once _apply_runtime_tuning() has run for the current
+        # start()/stop() cycle - guards _restore_runtime_tuning()'s
+        # gc.unfreeze() the same way _prev_switch_interval guards the switch
+        # interval restore: so it runs exactly once per successful
+        # _apply_runtime_tuning(), and not at all if start() never got that
+        # far.
+        self._tuning_applied = False
+        # HIGH 2/HIGH 3: a measurement, not an assumption - see the module
+        # docstring. Captured in start()/stop() respectively; None until the
+        # corresponding call has run.
+        self.gc_counts_at_start = None
+        self.gc_objects_at_start = None
+        self.gc_counts_at_stop = None
+        self.gc_objects_at_stop = None
 
     @property
     def stopped(self) -> bool:
@@ -331,7 +356,7 @@ class DriverPacketSource:
             self._queue.append(STOP)
 
     def _apply_runtime_tuning(self) -> None:
-        """Tighten the GIL switch interval and freeze/disable GC.
+        """Tighten the GIL switch interval and freeze GC's current graph.
 
         Both changes are about keeping work off the driver's callback
         thread for the duration of the stream:
@@ -339,39 +364,54 @@ class DriverPacketSource:
         - A tighter switch interval (FIX 5) shortens the longest the
           driver thread can wait to acquire the GIL from the consumer.
         - gc.freeze() moves everything currently tracked into the
-          permanent generation so it is never rescanned, then
-          gc.disable() (FIX 6) stops further *automatic* collections. The
-          hot path allocates a Packet plus a bytes copy per call and
-          creates no reference cycles, so automatic cyclic collection buys
-          nothing there and only risks running - a generation-2 pass scans
-          every tracked object in the process - on whichever thread
-          happens to cross the threshold, usually the driver's.
+          permanent generation so it is never rescanned by a later
+          collection, which keeps every future generation-0 pass scoped to
+          only what this run itself allocates.
 
-        HIGH: gc.freeze() must be paired with gc.unfreeze() in
+        HIGH 2/HIGH 3 (Gate 1 final pass): earlier revisions also called
+        gc.disable() here and ran a manual gc.collect(1) from __iter__,
+        defended as safe because the manual pass ran on the consumer thread
+        rather than the driver's. That reasoning does not hold: gc.collect()
+        holds the GIL for its entire traversal, so the driver's callback
+        cannot run regardless of which thread called collect() - measured at
+        31.8 ms per call, stalling an unrelated thread for 32.8 ms, which at
+        a 1 ms acquisition period is 32 dropped packets every time it fired.
+        Disabling automatic collection made it worse, not better:
+        gc.collect(1) promotes survivors into generation 2, and with
+        automatic collection off, generation 2 was never collected - so a
+        cycle surviving one manual pass became permanent for the session,
+        the opposite of what the fix was meant to prevent.
+
+        Automatic collection is therefore left enabled. With the startup
+        object graph frozen, an automatic generation-0 pass only scans what
+        this run has allocated since - short, because the hot path creates
+        one Packet plus one bytes copy per call and no cycles of its own -
+        while generations 1 and 2 keep running on their own normal schedule,
+        so nothing accumulates in either one for the length of a session. A
+        32 ms manual pause was worse than the automatic passes it replaced,
+        and no choice of thread can fix that; not calling it is the fix.
+
+        HIGH: gc.freeze() must still be paired with gc.unfreeze() in
         _restore_runtime_tuning() below, or the permanent generation only
         ever grows - measured at 377 -> 20,658 objects after a single
         start/stop cycle on this codebase, larger every cycle after,
         because a second freeze() moves whatever is newly tracked into a
-        permanent generation that nothing ever moves back out of. Disabling
-        collection is not left in place for the whole run either: with
-        cyclic collection off for a session that can run for hours, any
-        reference cycle created anywhere - not just on this hot path, which
-        creates none, but also pythonnet's own CLR-wrapper bookkeeping,
-        whose cycle behaviour is undocumented and unverifiable here -
-        becomes permanent for the life of the process. __iter__ below runs
-        a periodic gc.collect(1) on the consumer thread instead, so
-        automatic collection can safely stay off (never risking a
-        collection on the driver's thread) while cycles still get reclaimed
-        somewhere.
+        permanent generation that nothing ever moves back out of.
 
-        Both switch interval and freeze/disable are restored unconditionally
-        in _restore_runtime_tuning().
+        The switch interval is restored unconditionally in
+        _restore_runtime_tuning(); gc.unfreeze() is called there too,
+        guarded by `_tuning_applied` rather than by anything gc.disable()-
+        related, since there is no longer an enabled/disabled state to save.
         """
         self._prev_switch_interval = sys.getswitchinterval()
         sys.setswitchinterval(GIL_SWITCH_INTERVAL_SEC)
-        self._prev_gc_enabled = gc.isenabled()
         gc.freeze()
-        gc.disable()
+        self._tuning_applied = True
+        # HIGH 2/HIGH 3: measured, not assumed - see the module docstring.
+        # Captured last, after freeze(), so the "start" snapshot reflects
+        # the state this session actually begins execution in.
+        self.gc_counts_at_start = gc.get_count()
+        self.gc_objects_at_start = len(gc.get_objects())
 
     def _restore_runtime_tuning(self) -> None:
         """Undo _apply_runtime_tuning(), restoring the previous state.
@@ -379,19 +419,18 @@ class DriverPacketSource:
         Called from stop()'s `finally` (and from start()'s failure path)
         so it runs even if stop() itself fails or start() never completes -
         matching the unconditional-cleanup pattern already used for handler
-        unsubscription. A None sentinel means start() never ran (or already
-        restored), so there is nothing to undo.
+        unsubscription. A guard value of None/False means start() never ran
+        (or this was already restored), so there is nothing to undo.
 
         HIGH: gc.unfreeze() is the fix - it moves everything gc.freeze()
         put into the permanent generation back into a normal one, so a
-        subsequent gc.collect() (automatic, once re-enabled below, or the
-        periodic manual one in __iter__ during the *next* session) can
-        actually reclaim what is now unreachable, and so the permanent
-        generation does not simply grow by one freeze()'s worth every
-        cycle. Called unconditionally here, matching gc.enable() below,
-        regardless of whether this session actually created any garbage -
-        symmetry with _apply_runtime_tuning() is the point, not a
-        conditional optimisation.
+        subsequent collection (automatic - see _apply_runtime_tuning() above
+        for why this is no longer manual) can actually reclaim what is now
+        unreachable, and so the permanent generation does not simply grow by
+        one freeze()'s worth every cycle. Called unconditionally here
+        whenever tuning was applied, regardless of whether this session
+        actually created any garbage - symmetry with _apply_runtime_tuning()
+        is the point, not a conditional optimisation.
         """
         if self._prev_switch_interval is not None:
             try:
@@ -399,14 +438,18 @@ class DriverPacketSource:
             except Exception:
                 pass
             self._prev_switch_interval = None
-        if self._prev_gc_enabled is not None:
+        if self._tuning_applied:
+            # HIGH 2/HIGH 3: captured first, before gc.unfreeze() below
+            # changes what gc.get_count()/gc.get_objects() would report, so
+            # the "stop" snapshot reflects the state this session actually
+            # ran with, not the state after cleanup has already begun.
+            self.gc_counts_at_stop = gc.get_count()
+            self.gc_objects_at_stop = len(gc.get_objects())
             try:
                 gc.unfreeze()
-                if self._prev_gc_enabled:
-                    gc.enable()
             except Exception:
                 pass
-            self._prev_gc_enabled = None
+            self._tuning_applied = False
 
     def start(self, packet_timespan_ms: int = 1) -> None:
         if self._streaming:
@@ -450,7 +493,6 @@ class DriverPacketSource:
         self._loss_errors = 0
         self._error_errors = 0
         self._pressure_reported = False
-        self._packets_since_gc = 0
 
         # Clear anything left over from a previous start()/stop() cycle - a
         # stale STOP sentinel, or straggler packets a consumer that broke out
@@ -693,17 +735,18 @@ class DriverPacketSource:
             elif depth < threshold // 2:
                 self._pressure_reported = False
 
-            # HIGH: gc.disable() in _apply_runtime_tuning() turns off
-            # *automatic* collection for the whole stream; this is the
-            # manual replacement, gated by GC_COLLECT_INTERVAL_PACKETS
-            # (see that constant's comment above) and run only here, on
-            # this generator's own thread - the consumer, never the
-            # driver's DataReceived thread. gen 1, not gen 2: everything
-            # alive at start() was moved to the permanent generation by
-            # gc.freeze() and is never rescanned regardless.
-            self._packets_since_gc += 1
-            if self._packets_since_gc >= GC_COLLECT_INTERVAL_PACKETS:
-                self._packets_since_gc = 0
-                gc.collect(1)
+            # HIGH 2/HIGH 3: there used to be a manual gc.collect(1) here,
+            # defended as safe because it ran on this thread rather than the
+            # driver's. That defence does not hold - gc.collect() holds the
+            # GIL for its whole traversal regardless of which thread calls
+            # it, so it stalled the driver's callback exactly as if it had
+            # run there directly (measured: 31.8 ms per call, ~32 dropped
+            # packets at a 1 ms acquisition period). See the module
+            # docstring and _apply_runtime_tuning() above: automatic
+            # collection is left enabled instead, which is both cheap (the
+            # frozen startup graph keeps a generation-0 pass scoped to what
+            # this run allocates) and correct (generations 1 and 2 keep
+            # collecting on schedule, so nothing accumulates the way it did
+            # under gc.disable()).
 
             yield item

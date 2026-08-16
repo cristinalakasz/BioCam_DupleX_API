@@ -236,11 +236,14 @@ def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monke
     assert exit_code == 2
 
     # Gate 1, item F: a run that dropped data says so on the console, not
-    # only in the sidecar.
-    console = capsys.readouterr().out
+    # only in the sidecar. MEDIUM 5: the end-of-run summary runs after the
+    # printer has closed and writes to stderr, not stdout - see
+    # record_command's summary_lines block in cli.py.
+    console = capsys.readouterr().err
     assert "QUEUE OVERFLOW" in console and "3" in console
     assert "DRIVER DATA LOSS" in console and "7" in console
     assert "CALLBACK ERRORS: 1" in console
+    assert "also recorded in the sidecar" in console
 
 
 def test_record_command_drains_buffered_packets_on_keyboard_interrupt(tmp_path, monkeypatch):
@@ -464,3 +467,205 @@ def test_a_failing_source_stop_in_the_outer_finally_does_not_mask_the_real_excep
     with pytest.warns(RuntimeWarning, match="source.stop\\(\\) failed"):
         with pytest.raises(OSError, match="disk full"):
             main(["record", "--output-dir", str(tmp_path), "--name", "diskfull"])
+
+
+# --- HIGH 1: the writer must claim its output file before the source starts ---
+
+def test_record_command_enters_the_writer_before_starting_the_source(tmp_path, monkeypatch):
+    """HIGH 1: previously source.start() ran before `with RecordingWriter(...)`,
+    so the driver could already be streaming into a bounded queue with
+    nothing consuming it while the writer's __enter__ performed several
+    filesystem syscalls (mkdir, open, a sidecar write). The writer must now
+    be entered first, and the source started only once that has succeeded."""
+    import biocam.cli as cli_module
+    import biocam.interop.device as device_module
+    import biocam.interop.source as source_module
+    from biocam.data.recording import RecordingWriter
+
+    calls = []
+
+    class FakeDataFormat:
+        FrameRate = 1000.0
+        NWells = 1
+        NChsPerWell = 4
+        ChSampleByteSize = 2
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    class FakeDevice:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        @property
+        def data_format(self):
+            return FakeDataFormat()
+
+    class FakeSource:
+        def __init__(self, device, queue_size=None, listener=None):
+            self.driver_loss_events = 0
+            self.queue_overflows = 0
+            self.callback_errors = 0
+
+        def start(self, packet_timespan_ms=1):
+            calls.append("source_started")
+
+        def stop(self):
+            calls.append("source_stopped")
+
+        def __iter__(self):
+            return iter([])
+
+    class OrderTrackingWriter(RecordingWriter):
+        def __enter__(self):
+            calls.append("writer_entered")
+            return super().__enter__()
+
+    monkeypatch.setattr(device_module, "BioCamDevice", FakeDevice)
+    monkeypatch.setattr(source_module, "DriverPacketSource", FakeSource)
+    monkeypatch.setattr(cli_module, "RecordingWriter", OrderTrackingWriter)
+
+    main(["record", "--output-dir", str(tmp_path), "--name", "order"])
+
+    assert "writer_entered" in calls and "source_started" in calls
+    assert calls.index("writer_entered") < calls.index("source_started")
+
+
+# --- LOW: printer.close() must run even if BioCamDevice() itself raises ---
+
+def test_printer_is_closed_even_if_biocamdevice_construction_raises(tmp_path, monkeypatch):
+    """LOW: a combined `with BioCamDevice() as device, printer:` statement
+    would never call printer.close() if BioCamDevice() itself (construction,
+    not __enter__) raised, since printer's own context-manager protocol
+    would never begin - leaking its daemon thread. record_command now closes
+    printer in an unconditional `finally` instead."""
+    import biocam.cli as cli_module
+    import biocam.interop.device as device_module
+
+    close_calls = []
+    real_close = cli_module._ConsolePrinter.close
+
+    def spying_close(self, timeout=2.0):
+        close_calls.append(True)
+        return real_close(self, timeout)
+
+    monkeypatch.setattr(cli_module._ConsolePrinter, "close", spying_close)
+
+    class ExplodingDevice:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("device construction blew up")
+
+    monkeypatch.setattr(device_module, "BioCamDevice", ExplodingDevice)
+
+    with pytest.raises(RuntimeError, match="device construction blew up"):
+        main(["record", "--output-dir", str(tmp_path), "--name", "explode"])
+
+    assert close_calls == [True]
+
+
+# --- LOW: refuse to run below the Python version POLL_INTERVAL_SEC needs ---
+
+def test_record_command_refuses_to_run_below_the_required_python_version(
+        tmp_path, monkeypatch):
+    """LOW: biocam.interop.source.POLL_INTERVAL_SEC only delivers its
+    intended ~1 ms polling latency on Windows from Python 3.11 onward - on
+    3.10 and earlier, time.sleep() rounds up to the ~15.6 ms system timer.
+    record_command must refuse outright rather than silently recording with
+    ~15x the intended poll latency."""
+    import biocam.cli as cli_module
+
+    monkeypatch.setattr(cli_module.sys, "version_info", (3, 10, 5))
+
+    with pytest.raises(RuntimeError, match="requires Python 3.11"):
+        main(["record", "--output-dir", str(tmp_path)])
+
+
+# --- MEDIUM 4: print() itself failing must be counted, distinct from `dropped` ---
+
+def test_console_printer_counts_print_failures_separately_from_dropped(monkeypatch):
+    """MEDIUM 4: _run() used to catch a print() failure (e.g. a broken
+    stdout) and pass with nothing incremented, so `dropped` read 0 while
+    output was still being lost. print_failures must count that case
+    separately from `dropped` (a full ring, never attempted)."""
+    def raising_print(*args, **kwargs):
+        raise OSError("broken stdout")
+
+    monkeypatch.setattr("biocam.cli.print", raising_print, raising=False)
+
+    printer = _ConsolePrinter()
+    printer.report(RecordingStarted(path="x.raw", total_channels=4, frame_rate_hz=1000.0))
+    printer.close()
+
+    assert printer.print_failures == 1
+    assert printer.dropped == 0
+
+
+# --- HIGH 2/HIGH 3: the GC measurement delta reaches the end-of-run summary ---
+
+def test_record_command_reports_the_gc_measurement_delta_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    """HIGH 2/HIGH 3: cli.py must report the source's start()/stop() gc
+    measurement delta at the end of a run when the source exposes it -
+    turning "we believe pythonnet does not leak cycles" into a number a
+    colleague can report from a real run, instead of an assumption. Printed
+    on stderr (MEDIUM 5), alongside the rest of the end-of-run summary."""
+    import biocam.interop.device as device_module
+    import biocam.interop.source as source_module
+
+    class FakeDataFormat:
+        FrameRate = 1000.0
+        NWells = 1
+        NChsPerWell = 4
+        ChSampleByteSize = 2
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    class FakeDevice:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        @property
+        def data_format(self):
+            return FakeDataFormat()
+
+    class FakeSource:
+        def __init__(self, device, queue_size=None, listener=None):
+            self.driver_loss_events = 0
+            self.queue_overflows = 0
+            self.callback_errors = 0
+            self.gc_counts_at_start = (10, 2, 1)
+            self.gc_counts_at_stop = (15, 3, 1)
+            self.gc_objects_at_start = 1000
+            self.gc_objects_at_stop = 1050
+
+        def start(self, packet_timespan_ms=1):
+            pass
+
+        def stop(self):
+            pass
+
+        def __iter__(self):
+            return iter([])
+
+    monkeypatch.setattr(device_module, "BioCamDevice", FakeDevice)
+    monkeypatch.setattr(source_module, "DriverPacketSource", FakeSource)
+
+    main(["record", "--output-dir", str(tmp_path), "--name", "gcdelta"])
+
+    err = capsys.readouterr().err
+    assert "GC (informational" in err
+    assert "+50" in err  # object total delta: 1050 - 1000
+    # The gc delta is not written anywhere else - it must not be claimed as
+    # part of the sidecar record, only labelled as console/session-only.
+    assert "console/session-only" in err
