@@ -44,9 +44,12 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
-    been written, or when stop_event is set. Duration is measured in recorded
-    frames rather than wall-clock, so it means the same thing for a live
-    instrument and for a replay.
+    been written, when stop_event is set, or when the writer reports
+    disk_low (FIX 3 - checked ahead of every other stop condition, including
+    while draining, since a full disk turns "finish the recording" into
+    "corrupt the recording"). Duration is measured in recorded frames rather
+    than wall-clock, so it means the same thing for a live instrument and for
+    a replay.
 
     `drain`, if True, switches the stop condition from "break as soon as
     stop_event is seen" to "consume the source to exhaustion". This exists
@@ -123,6 +126,17 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
+            if writer.disk_low:
+                # FIX 3: checked first, ahead of drain/stop_event/duration -
+                # stopping cleanly with a complete record beats crashing with
+                # a corrupt one, whether this loop is running normally or
+                # draining after Ctrl+C. The writer already emitted DiskLow
+                # when it noticed (see RecordingWriter._check_disk_space);
+                # this is just record_session acting on it. finalise() below
+                # still runs while free space remains, by design of the
+                # threshold in recording.py.
+                stop_reason = "disk_low"
+                break
             if drain:
                 if time.monotonic() >= deadline:
                     stop_reason = "drain_deadline_exceeded"

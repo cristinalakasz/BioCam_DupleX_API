@@ -7,9 +7,19 @@ frame-major stream and the partial-frame defect cannot occur.
 The sidecar is written twice: once at the start marked in_progress, and again
 on finalise. A killed process therefore leaves a raw file with its acquisition
 parameters and an honest marker that it was never finished.
+
+Every sidecar write is atomic (temp file + os.replace - see _write_sidecar)
+and a failure writing the __exit__ failure sidecar can never mask whatever
+exception is already propagating (see __exit__). The writer also watches free
+disk space and fsyncs periodically, on the consumer thread only - see
+DEFAULT_MIN_FREE_BYTES and DEFAULT_UPKEEP_INTERVAL_FRAMES below.
 """
 
 import json
+import os
+import shutil
+import tempfile
+import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +27,7 @@ from typing import Optional
 
 import numpy as np
 
-from biocam.data.events import GapDetected, RecordingStarted, RecordingStopped
+from biocam.data.events import DiskLow, GapDetected, RecordingStarted, RecordingStopped
 from biocam.data.frames import DTYPE_BY_BYTE_SIZE, to_microvolts
 from biocam.data.integrity import GapTracker
 
@@ -26,6 +36,28 @@ SCHEMA_VERSION = 2
 VERDICT_CLEAN = "clean"
 VERDICT_GAPS = "gaps_detected"
 VERDICT_UNKNOWN = "unknown"
+
+# Free-space floor at which the writer reports itself disk_low (FIX 3). At up
+# to ~152 MB/s (CLAUDE.md), a few hundred MB can still be written between one
+# periodic check and the next (see DEFAULT_UPKEEP_INTERVAL_FRAMES below), and
+# the sidecar itself needs room too (a few KB - negligible next to this, but
+# the threshold must still clear it). 2 GiB gives well over ten seconds of
+# headroom at the full data rate even in the worst case - a check that lands
+# just after crossing the floor - which is far more than record_session needs
+# to notice disk_low and stop cleanly.
+DEFAULT_MIN_FREE_BYTES = 2 * 1024 ** 3  # 2 GiB
+
+# How often (in frames written, not packets) the writer calls
+# shutil.disk_usage() and flushes/fsyncs the raw file (FIX 3 and FIX 4 share
+# one interval, per the task: both are "check something expensive every so
+# often, on the consumer thread, never in the callback"). Frames arrive at up
+# to ~18.5 kHz; doing either of these on every packet would mean tens of
+# thousands of syscalls per second on a path that sits downstream of the
+# time-critical callback. Every 50,000 frames is a couple of seconds at
+# typical frame rates - frequent enough to catch a filling disk or bound the
+# data-loss window on power loss with room to spare, rare enough that the
+# syscall overhead is immaterial.
+DEFAULT_UPKEEP_INTERVAL_FRAMES = 50_000
 
 
 @dataclass(frozen=True)
@@ -48,11 +80,14 @@ class RecordingWriter:
     """Appends packets to a raw file and maintains the integrity record."""
 
     def __init__(self, raw_path, meta_path, params: AcquisitionParameters,
-                 listener=None):
+                 listener=None, min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+                 upkeep_interval_frames: int = DEFAULT_UPKEEP_INTERVAL_FRAMES):
         self._raw_path = Path(raw_path)
         self._meta_path = Path(meta_path)
         self._params = params
         self._listener = listener
+        self._min_free_bytes = min_free_bytes
+        self._upkeep_interval_frames = upkeep_interval_frames
 
         self._file = None
         self._tracker = GapTracker(frame_rate_hz=params.frame_rate_hz)
@@ -65,6 +100,8 @@ class RecordingWriter:
         self._discarded_at_stop = 0
         self._started_utc = None
         self._finalised = False
+        self._disk_low = False
+        self._frames_at_last_upkeep = 0
 
     def __enter__(self):
         self._raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +121,25 @@ class RecordingWriter:
             self._file = None
         if not self._finalised:
             error = exc_type.__name__ if exc_type is not None else None
-            self._write_sidecar(status="failed", stop_reason="error", error=error)
+            # FIX 1: this write itself can fail - the disk that just failed
+            # the caller's write is the same disk this sidecar is written to.
+            # If it does, that failure must never replace whatever exception
+            # is already propagating out of the `with` block (or, on a clean
+            # exit that simply never reached finalise(), become the only
+            # exception raised): the caller needs to see the *original*
+            # problem, not a confusing one about the sidecar. Losing the
+            # failure sidecar entirely is a real loss - it is the only
+            # record of what the writer had observed before things went
+            # wrong - so it is not swallowed silently either, just kept from
+            # masking anything.
+            try:
+                self._write_sidecar(status="failed", stop_reason="error", error=error)
+            except OSError as sidecar_exc:
+                warnings.warn(
+                    f"could not write failure sidecar to {self._meta_path}: "
+                    f"{sidecar_exc}",
+                    RuntimeWarning,
+                )
         return False
 
     def write_packet(self, timestamp: int, counter: int, payload: bytes) -> None:
@@ -118,6 +173,11 @@ class RecordingWriter:
             self._first_timestamp = timestamp
         self._last_timestamp = timestamp
 
+        frames_now = self.n_frames_written
+        if frames_now - self._frames_at_last_upkeep >= self._upkeep_interval_frames:
+            self._frames_at_last_upkeep = frames_now
+            self._periodic_upkeep()
+
     def note_driver_loss(self, count: int = 1) -> None:
         self._driver_loss += count
 
@@ -143,7 +203,16 @@ class RecordingWriter:
 
     def finalise(self, stop_reason: str) -> None:
         if self._file is not None:
+            # FIX 4: flush() only pushes bytes to the OS cache; fsync forces
+            # them to the physical disk. Both run here, on the consumer
+            # thread that calls finalise() - never inside DataReceived - so
+            # this costs nothing against the acquisition budget. Without it,
+            # a power loss or bugcheck right after a multi-hour recording
+            # could lose whatever Windows had not yet committed on its own
+            # schedule, even though the file was already "closed" from the
+            # writer's point of view.
             self._file.flush()
+            os.fsync(self._file.fileno())
         self._write_sidecar(status="complete", stop_reason=stop_reason)
         self._finalised = True
         self._emit(RecordingStopped(
@@ -151,6 +220,32 @@ class RecordingWriter:
             n_frames=self.n_frames_written,
             verdict=self.verdict,
         ))
+
+    def _periodic_upkeep(self) -> None:
+        """Run every DEFAULT_UPKEEP_INTERVAL_FRAMES frames (FIX 3 / FIX 4).
+
+        Both a disk-space check and a flush are relatively expensive
+        (a syscall each) and must not run per-packet at up to ~18.5 kHz, but
+        both also matter enough that waiting until finalise() would defeat
+        the point: a periodic flush shrinks the power-loss exposure window
+        from "the entire run" to "at most one interval", and a periodic disk
+        check is the only way an open-ended (Ctrl+C) recording ever learns
+        the disk is filling at all. Runs on the consumer thread (write_packet
+        is called from record_session's loop), never inside DataReceived.
+        """
+        if self._file is not None:
+            self._file.flush()
+        self._check_disk_space()
+
+    def _check_disk_space(self) -> None:
+        free = shutil.disk_usage(self._raw_path.parent).free
+        if free < self._min_free_bytes and not self._disk_low:
+            self._disk_low = True
+            self._emit(DiskLow(free_bytes=free, required_bytes=self._min_free_bytes))
+
+    @property
+    def disk_low(self) -> bool:
+        return self._disk_low
 
     @property
     def n_frames_written(self) -> int:
@@ -250,7 +345,29 @@ class RecordingWriter:
             },
         })
         self._meta_path.parent.mkdir(parents=True, exist_ok=True)
-        self._meta_path.write_text(json.dumps(record, indent=2))
+        # FIX 2: write to a temp file in the same directory, then os.replace
+        # it into position. write_text() would truncate the target in place -
+        # a crash or full disk part-way through leaves both a corrupt,
+        # unparseable sidecar AND destroys whatever complete sidecar (e.g.
+        # the in_progress one from __enter__) was there before. os.replace is
+        # atomic on both Windows and POSIX, so a reader (or the next write
+        # attempt, on failure) always sees either the previous complete
+        # sidecar or the new one, never a half-written file. Same directory
+        # matters: os.replace is only guaranteed atomic within one
+        # filesystem/volume.
+        text = json.dumps(record, indent=2)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=self._meta_path.parent, prefix=self._meta_path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as tmp_file:
+                tmp_file.write(text)
+            os.replace(tmp_name, self._meta_path)
+        except BaseException:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def read_sidecar(path) -> dict:

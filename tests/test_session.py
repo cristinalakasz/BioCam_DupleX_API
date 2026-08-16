@@ -325,3 +325,33 @@ def test_stop_source_is_not_called_when_a_normal_exception_propagates_without_it
 
     integrity = read_sidecar(meta)["integrity"]
     assert integrity["driver_loss_events"] == 1
+
+
+# --- FIX 3: a running disk-space check stops an open-ended recording ---
+
+def test_session_stops_cleanly_with_reason_disk_low(tmp_path, monkeypatch):
+    """The Ctrl+C (open-ended) path gets no upfront duration-based disk
+    check at all - the writer's own periodic check is what has to catch a
+    filling disk there. record_session must notice writer.disk_low and stop
+    cleanly, with a properly finalised (status: complete) sidecar, rather
+    than running the source dry or crashing."""
+    source, _ = _source(tmp_path, 1000, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+
+    class FakeUsage:
+        free = 10  # far below any threshold
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, min_free_bytes=1_000_000,
+                         upkeep_interval_frames=1) as writer:
+        result = record_session(source, writer)
+
+    assert result.stop_reason == "disk_low"
+    # Stopped almost immediately (first packet trips the check at interval=1)
+    # rather than consuming the full 1000-frame source.
+    assert result.n_frames < 1000
+    record = read_sidecar(meta)
+    assert record["status"] == "complete"
+    assert record["stop_reason"] == "disk_low"

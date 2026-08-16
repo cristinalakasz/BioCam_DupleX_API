@@ -1,9 +1,10 @@
 import json
+import os
 
 import numpy as np
 import pytest
 
-from biocam.data.events import GapDetected, RecordingStarted, RecordingStopped
+from biocam.data.events import DiskLow, GapDetected, RecordingStarted, RecordingStopped
 from biocam.data.recording import (
     SCHEMA_VERSION, AcquisitionParameters, RecordingWriter,
     integrity_verdict, load_recording, read_sidecar,
@@ -314,3 +315,139 @@ def test_committed_fixtures_are_reported_as_unknown():
     from tests.test_fixture_integrity import load_fixture
     _, meta = load_fixture("sample_32ch_2s")
     assert integrity_verdict(meta) == "unknown"
+
+
+# --- FIX 1: a failed __exit__ sidecar write must not mask the real error ---
+
+def test_a_sidecar_write_failure_in_exit_does_not_mask_the_original_exception(
+        tmp_path, monkeypatch):
+    """Simulates a full disk: the __exit__ failure-sidecar write itself
+    raises OSError. The caller must still see the original ValueError, not a
+    confusing OSError about the sidecar - and must not see nothing at all."""
+    raw, meta = _paths(tmp_path)
+
+    with pytest.raises(ValueError, match="boom"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            # Only now make the sidecar path unwritable - __enter__'s
+            # in_progress write must succeed normally.
+            monkeypatch.setattr(
+                "biocam.data.recording.os.replace",
+                lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+            raise ValueError("boom")
+
+
+def test_a_masked_sidecar_write_failure_still_warns(tmp_path, monkeypatch):
+    """Not swallowed silently - a failure worth knowing about is surfaced as
+    a warning rather than becoming (or hiding as) the raised exception."""
+    raw, meta = _paths(tmp_path)
+
+    with pytest.warns(RuntimeWarning, match="could not write failure sidecar"):
+        with pytest.raises(ValueError):
+            with RecordingWriter(raw, meta, PARAMS) as writer:
+                writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+                monkeypatch.setattr(
+                    "biocam.data.recording.os.replace",
+                    lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+                raise ValueError("boom")
+
+
+# --- FIX 2: the sidecar write is atomic ---
+
+def test_an_interrupted_sidecar_write_leaves_the_previous_complete_sidecar_intact(
+        tmp_path, monkeypatch):
+    """A write that fails part-way (simulated via a failing os.replace, the
+    same atomic step a crash or full disk would interrupt) must not touch the
+    sidecar already on disk - the whole point of writing to a temp file
+    first."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+    complete_text = meta.read_text()
+    json.loads(complete_text)  # sanity: it is valid JSON before we begin
+
+    writer2 = RecordingWriter(raw, meta, PARAMS)
+
+    def failing_replace(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("biocam.data.recording.os.replace", failing_replace)
+    with pytest.raises(OSError):
+        writer2._write_sidecar(status="in_progress", stop_reason=None)
+
+    # The previous, complete sidecar is untouched - not truncated, not
+    # replaced with a half-written temp file.
+    assert meta.read_text() == complete_text
+    json.loads(meta.read_text())
+
+    # No stray temp file left behind either.
+    leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
+# --- FIX 3: a running disk-space check, for open-ended recordings too ---
+
+def test_disk_check_trips_and_emits_disk_low(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+    seen = []
+
+    class FakeUsage:
+        free = 10  # far below any threshold
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage",
+                        lambda path: FakeUsage())
+
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         min_free_bytes=1_000_000,
+                         upkeep_interval_frames=1) as writer:
+        assert writer.disk_low is False
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        assert writer.disk_low is True
+        writer.finalise("disk_low")
+
+    disk_low_events = [e for e in seen if isinstance(e, DiskLow)]
+    assert len(disk_low_events) == 1
+    assert disk_low_events[0].free_bytes == 10
+    assert disk_low_events[0].required_bytes == 1_000_000
+
+
+def test_disk_check_does_not_run_on_every_packet(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+    calls = []
+
+    class FakeUsage:
+        free = 999_999_999_999  # always plenty free
+
+    def fake_disk_usage(path):
+        calls.append(path)
+        return FakeUsage()
+
+    monkeypatch.setattr("biocam.data.recording.shutil.disk_usage", fake_disk_usage)
+
+    with RecordingWriter(raw, meta, PARAMS, upkeep_interval_frames=5) as writer:
+        for counter in range(1, 23):  # 22 packets, 1 frame each
+            writer.write_packet(timestamp=counter, counter=counter,
+                                payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    # 22 frames at an interval of 5 -> checks after frame 5, 10, 15, 20:
+    # four calls, not twenty-two.
+    assert len(calls) == 4
+
+
+# --- FIX 4: finalise fsyncs, not just flushes ---
+
+def test_finalise_calls_fsync(tmp_path, monkeypatch):
+    raw, meta = _paths(tmp_path)
+    fsync_calls = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        "biocam.data.recording.os.fsync",
+        lambda fd: fsync_calls.append(fd) or real_fsync(fd))
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert len(fsync_calls) == 1
