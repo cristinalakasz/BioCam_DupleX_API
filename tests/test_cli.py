@@ -169,3 +169,100 @@ def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monke
     assert integrity["callback_errors"] == 1
     assert integrity["verdict"] != "clean"
     assert exit_code == 2
+
+
+def test_record_command_drains_buffered_packets_on_keyboard_interrupt(tmp_path, monkeypatch):
+    """FIX 1 / FIX 2, exercised through the real CLI: a Ctrl+C partway
+    through streaming must not discard whatever was already buffered. The
+    fake source raises KeyboardInterrupt after two packets, simulating the
+    signal landing mid-loop, with three more packets still sitting in its
+    internal buffer - exactly the shape of the bug (up to ~2 s of acquired,
+    buffered signal thrown away). The retry record_command makes on
+    KeyboardInterrupt must drain those three instead of losing them, and
+    source.stop() must have been called before the sidecar was finalised."""
+    import collections
+
+    import numpy as np
+
+    import biocam.interop.device as device_module
+    import biocam.interop.source as source_module
+    from biocam.data.recording import read_sidecar
+    from biocam.data.replay import Packet
+
+    class FakeDataFormat:
+        FrameRate = 1000.0
+        NWells = 1
+        NChsPerWell = 4
+        ChSampleByteSize = 2
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    class FakeDevice:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        @property
+        def data_format(self):
+            return FakeDataFormat()
+
+    class FakeSource:
+        """Stands in for DriverPacketSource across the interrupt/drain
+        retry: the first __iter__ call yields two packets then raises
+        KeyboardInterrupt (simulating Ctrl+C landing mid-stream), leaving
+        three more packets in the internal buffer that only the drain
+        retry's second __iter__ call ever reaches."""
+
+        def __init__(self, device, queue_size=None, listener=None):
+            self.driver_loss_events = 0
+            self.queue_overflows = 0
+            self.callback_errors = 0
+            self._buffer = collections.deque(
+                Packet(timestamp=i, counter=i,
+                       payload=np.arange(4, dtype=np.uint16).tobytes())
+                for i in range(5)
+            )
+            self._interrupted_once = False
+            self.stop_calls = 0
+
+        def pending_count(self):
+            return len(self._buffer)
+
+        def start(self, packet_timespan_ms=1):
+            pass
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def __iter__(self):
+            if not self._interrupted_once:
+                self._interrupted_once = True
+                return self._first_pass()
+            return self._drain_pass()
+
+        def _first_pass(self):
+            yield self._buffer.popleft()
+            yield self._buffer.popleft()
+            raise KeyboardInterrupt
+
+        def _drain_pass(self):
+            while self._buffer:
+                yield self._buffer.popleft()
+
+    monkeypatch.setattr(device_module, "BioCamDevice", FakeDevice)
+    monkeypatch.setattr(source_module, "DriverPacketSource", FakeSource)
+
+    exit_code = main(["record", "--output-dir", str(tmp_path), "--name", "interrupted"])
+
+    meta = read_sidecar(tmp_path / "interrupted_meta.json")
+    # All 5 packets (1 frame each: 4 channels x 2 bytes = 8 bytes) survived.
+    assert meta["n_frames_written"] == 5
+    integrity = meta["integrity"]
+    assert integrity["discarded_at_stop"] == 0
+    assert meta["stop_reason"] == "source_exhausted"
+    assert exit_code == 0

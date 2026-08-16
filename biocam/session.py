@@ -9,8 +9,24 @@ This module is top-level and therefore covered by the no-hardware guard. It
 must never import biocam.interop.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Optional
+
+# Wall-clock ceiling for a "drain to exhaustion" pass (record_session's
+# drain=True mode - see cli.py FIX 1). After Ctrl+C, the normal
+# stop-as-soon-as-the-flag-is-seen behaviour is deliberately bypassed so that
+# whatever is still buffered gets written to the recording instead of
+# discarded uncounted. But the source is still live at that point (streaming
+# has not necessarily been told to stop yet), so draining cannot simply wait
+# for it to run dry - a source that keeps yielding indefinitely would hang
+# the process forever. A few seconds comfortably covers the queue's own
+# design budget (~2 s of buffering at the CLI's default packet rate - see
+# QUEUE_BUFFER_SECONDS in cli.py) plus margin for the time it actually takes
+# to pop and write that many packets. Anything still buffered when it elapses
+# is real, acquired data that is being given up on - it must be counted into
+# discarded_at_stop, never just dropped.
+DRAIN_DEADLINE_SEC = 5.0
 
 
 @dataclass(frozen=True)
@@ -23,13 +39,24 @@ class SessionResult:
 
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
-                   stop_event=None, counters=None) -> SessionResult:
+                   stop_event=None, counters=None, drain: bool = False,
+                   stop_source=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
     been written, or when stop_event is set. Duration is measured in recorded
     frames rather than wall-clock, so it means the same thing for a live
     instrument and for a replay.
+
+    `drain`, if True, switches the stop condition from "break as soon as
+    stop_event is seen" to "consume the source to exhaustion". This exists
+    for the retry call cli.py makes after a KeyboardInterrupt: at that point
+    stop_event is already set (that is *why* draining was requested), so the
+    normal check would just break again on the very first packet and discard
+    everything still buffered - the bug this mode closes. duration_sec and
+    stop_event are not consulted while draining; the only stop conditions are
+    the source running out, or DRAIN_DEADLINE_SEC elapsing (stop_reason
+    becomes "drain_deadline_exceeded" in that case).
 
     `counters`, if given, is the packet source itself (or anything exposing
     the same attributes). Its loss counters are transferred onto the writer
@@ -43,12 +70,51 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     route. The exception still propagates; only the transfer happens before
     it does. getattr with a default lets a source without these attributes
     (the replay source) pass through untouched.
+
+    `stop_source`, if given, is called with no arguments in that same
+    `finally`, after the counter transfer - stopping the driver's stream as
+    early as this function can manage, rather than leaving it to a caller
+    that only regains control once this function (and, in the CLI, the
+    writer's `with` block) has already finished. This is what closes the
+    window described as FIX 2 in cli.py's module docstring: packets that
+    arrive between "we decided to stop" and "the driver was actually told to
+    stop" used to be buffered behind an already-finalised sidecar and never
+    drained. A failing stop_source() is swallowed here rather than left to
+    mask whatever exception (if any) is already propagating through this
+    `finally`, or to skip the counter/finalise steps still to come; cli.py's
+    own, later call to source.stop() surfaces a persistent failure instead.
+
+    Once stop_source has run, whatever is still sitting in `counters`'
+    queue cannot arrive by any other route, so it is counted into
+    discarded_at_stop via `counters.pending_count()` (0 if the method is
+    absent) - except when this call is itself aborting via an exception
+    (including KeyboardInterrupt): in that case a caller may be about to
+    retry with drain=True to recover exactly that buffered data, and
+    counting it here as discarded would double-count it once the drain call
+    also writes it.
+
+    While not draining, the loop also breaks - stop_reason
+    "source_stopped" - as soon as `counters.stopped` reads True (False if
+    the attribute is absent), not only when `stop_event` does. This is what
+    keeps a driver-reported streaming error ending the session promptly:
+    DriverPacketSource.__iter__ deliberately drains past its STOP sentinel
+    now, rather than returning the instant it is popped (see FIX 3 in
+    biocam/interop/source.py), so a source that keeps yielding packets
+    after on_error sets its own stop flag would otherwise never reach
+    StopIteration on its own. Checking `counters.stopped` restores the
+    prompt-termination guarantee that used to be a side effect of the old
+    return-on-STOP behaviour, without reintroducing the defect FIX 3 closed
+    (packets already queued behind the sentinel are still written first,
+    since this check runs after each packet is already handed to the
+    writer, not before).
     """
     frame_limit = None
     if duration_sec is not None:
         frame_limit = int(duration_sec * writer.params.frame_rate_hz)
 
     stop_reason = "source_exhausted"
+    deadline = time.monotonic() + DRAIN_DEADLINE_SEC if drain else None
+    interrupted = False
 
     try:
         for packet in source:
@@ -57,17 +123,42 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
+            if drain:
+                if time.monotonic() >= deadline:
+                    stop_reason = "drain_deadline_exceeded"
+                    break
+                continue
             if stop_event is not None and stop_event.is_set():
                 stop_reason = "user_stopped"
+                break
+            if counters is not None and getattr(counters, "stopped", False):
+                stop_reason = "source_stopped"
                 break
             if frame_limit is not None and writer.n_frames_written >= frame_limit:
                 stop_reason = "duration_reached"
                 break
+    except BaseException:
+        # Any exception aborting the loop early, KeyboardInterrupt included -
+        # see the stop_source/discarded_at_stop reasoning in the docstring
+        # above for why this must be tracked rather than just left to
+        # propagate silently past the counting logic below.
+        interrupted = True
+        raise
     finally:
         if counters is not None:
             writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
             writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
             writer.note_callback_errors(getattr(counters, "callback_errors", 0))
+        if stop_source is not None:
+            try:
+                stop_source()
+            except Exception:
+                pass
+        if not interrupted and counters is not None:
+            get_pending = getattr(counters, "pending_count", None)
+            pending = get_pending() if callable(get_pending) else 0
+            if pending:
+                writer.note_discarded(pending)
 
     writer.finalise(stop_reason)
     return SessionResult(

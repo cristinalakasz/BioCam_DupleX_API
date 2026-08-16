@@ -65,7 +65,7 @@ def convert(raw_path, meta_path, out_path, compression: str = "gzip",
             handle.attrs[key] = value
         handle.attrs["integrity_verdict"] = verdict
         for key in ("n_frames_missing", "driver_loss_events", "queue_overflows",
-                    "callback_errors"):
+                    "callback_errors", "discarded_at_stop"):
             handle.attrs[key] = meta.get("integrity", {}).get(key, -1)
 
     return {

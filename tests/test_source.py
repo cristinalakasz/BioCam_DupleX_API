@@ -171,6 +171,13 @@ def test_stop_after_device_exit_does_not_raise():
     # Python-side cleanup still happened.
     assert source._stop_event.is_set()
     assert source._queue.popleft() is STOP
+    # _streaming must be cleared even though StopDataStreaming was never
+    # reached - otherwise start()'s re-entrancy guard would block every
+    # subsequent start() on this instance forever.
+    assert source._streaming is False
+    device.biocam = biocam  # restore, so a second start() has something to call
+    source.start()
+    assert biocam.start_calls == 2
 
 
 def test_overflow_drops_new_packet_and_keeps_old_ones():
@@ -248,3 +255,64 @@ def test_driver_loss_events_falls_back_to_event_count_when_counter_missing():
 
     assert source.driver_loss_events == 2
     assert source.callback_errors == 0
+
+
+def test_stopped_reflects_the_sources_own_stop_flag_not_a_callers():
+    source, _device, biocam = _make_started_source()
+    assert source.stopped is False
+
+    biocam.DataStreamingError.handlers[0](None, None)  # on_error
+
+    assert source.stopped is True
+
+
+def test_iter_drains_packets_appended_after_stop_sentinel():
+    # FIX 3: on_error enqueues STOP without unsubscribing, so the driver can
+    # keep firing DataReceived afterwards. Those late packets land behind
+    # STOP in the deque; __iter__ must still deliver them instead of
+    # returning the instant it pops the sentinel.
+    source, _device, biocam = _make_started_source()  # queue_size=10
+
+    _fire_data(biocam, 0)
+    _fire_data(biocam, 1)
+    biocam.DataStreamingError.handlers[0](None, None)  # enqueues STOP
+    _fire_data(biocam, 2)  # arrives after STOP - the on_error race
+    _fire_data(biocam, 3)
+
+    assert list(source._queue).count(STOP) == 1
+    assert source._stop_event.is_set()
+
+    consumed = list(source)
+
+    assert [packet.counter for packet in consumed] == [0, 1, 2, 3]
+    assert all(item is not STOP for item in consumed)
+
+
+def test_pending_count_excludes_the_stop_sentinel_and_drains_the_queue():
+    source, _device, biocam = _make_started_source()
+    _fire_data(biocam, 0)
+    _fire_data(biocam, 1)
+    source.stop()  # appends STOP
+
+    assert STOP in source._queue
+    assert source.pending_count() == 2
+    # pending_count() drains as it counts - a second call finds nothing.
+    assert source.pending_count() == 0
+    assert len(source._queue) == 0
+
+
+def test_start_clears_a_buffer_left_over_from_a_prior_cycle():
+    # FIX 4: a consumer that broke out of __iter__ early (e.g. a drain
+    # deadline) can leave straggler packets or a stale STOP behind. A second
+    # start() on the same source must not hand those to the new session.
+    source, device, biocam = _make_started_source()
+    _fire_data(biocam, 0)
+    _fire_data(biocam, 1)
+    source.stop()  # appends STOP; queue is now [pkt0, pkt1, STOP], unread
+
+    assert len(source._queue) == 3
+
+    source.start()
+
+    assert len(source._queue) == 0
+    assert biocam.start_calls == 2

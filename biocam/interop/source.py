@@ -36,14 +36,19 @@ counting it - the reverse of the required behaviour.
 Note also that `on_error` sets the stop flag and enqueues STOP without
 unsubscribing `on_data` (only `stop()` does that). If DataReceived keeps
 firing between an error and the eventual `stop()` call, those packets are
-appended after STOP and are never yielded by `__iter__`, which returns the
-instant it pops STOP. This predates this revision - the sentinel-based
-handoff and the unsubscribe-on-stop ordering both existed before the deque
-change - and is flagged here, unresolved, as a real gap rather than silently
-carried forward: closing it would mean unsubscribing from inside `on_error`,
-i.e. modifying the driver's event subscription list from within a live
-driver-raised callback, which is new interop behaviour this environment
-cannot verify.
+appended after STOP - previously they were never yielded, because `__iter__`
+returned the instant it popped STOP, orphaning anything behind it. `__iter__`
+now treats STOP as a marker to skip, not a signal to return: it keeps
+draining whatever the driver appended after the sentinel, and relies on the
+same termination condition it already used when the sentinel is dropped for
+being full (see `_try_enqueue_stop`) - queue empty *and* `_stop_event` set.
+That pairing always holds when STOP is present, because every caller that
+enqueues STOP (`on_error`, `stop()`) sets `_stop_event` first, so this does
+not weaken termination; it only stops a sentinel from hiding real,
+already-acquired packets behind it. Closing this the other way -
+unsubscribing from inside `on_error` - would mean modifying the driver's
+event subscription list from within a live driver-raised callback, which is
+new interop behaviour this environment cannot verify, so it was not chosen.
 
 A `threading.Event` is still used as the stop flag - `set()`/`is_set()` are
 non-waiting and, being uncontended and short in this single-producer use,
@@ -142,6 +147,25 @@ class DriverPacketSource:
         self._prev_gc_enabled = None
 
     @property
+    def stopped(self) -> bool:
+        """Whether this source's own stop flag is set.
+
+        Distinct from a caller-supplied stop_event (e.g. cli.py's, tied to
+        KeyboardInterrupt): this reflects only `_stop_event`, which this
+        class sets itself - from on_error (a driver-reported streaming
+        error) or from stop(). record_session's normal (non-drain) loop
+        checks this on every packet so a DataStreamingError still ends the
+        session promptly even if the driver keeps firing DataReceived
+        afterwards - the on_error race documented in the module docstring
+        above. Before FIX 3, __iter__ returning the instant it popped STOP
+        gave the consumer loop the same effect as a side effect; making
+        __iter__ drain past STOP instead (so those later packets are not
+        orphaned) removed that side effect, so this property exists to
+        restore it deliberately instead of leaving it to chance.
+        """
+        return self._stop_event.is_set()
+
+    @property
     def driver_loss_events(self) -> int:
         """The driver's cumulative data-loss count when available.
 
@@ -155,6 +179,41 @@ class DriverPacketSource:
         if self._driver_loss_counter is not None:
             return self._driver_loss_counter
         return self._loss_fallback_events
+
+    def pending_count(self) -> int:
+        """Drain the queue and count the real packets found in it.
+
+        A method, not a plain snapshot property, because it consumes the
+        queue - popping one item at a time with `popleft()`, not scanning it
+        with a persistent iterator. That distinction matters: CPython's
+        `deque` invalidates a live iterator (raising `RuntimeError`) if the
+        deque is mutated while that iterator is in progress, and this class
+        cannot rule out a driver thread still being mid-append when this
+        runs - see the "unverified" note on `_unsubscribe`'s effect on an
+        in-flight callback in the clear() comment inside start() below.
+        `popleft()` in a
+        loop has no such iterator to invalidate: each call is the same
+        single atomic operation `on_data` already relies on, so a
+        concurrent append can race the count by at most one item (the same
+        bounded, accepted imprecision as the STOP-overshoot documented in
+        the module docstring) instead of raising.
+
+        Meant to be called once, at the very end of a session's life
+        (record_session's `finally`, after stop_source() has run) to get an
+        honest final count of what is being abandoned - not as a repeatable
+        peek at queue depth, since it empties the queue as a side effect.
+        Used to count what a drain pass abandons at its deadline (FIX 1) and
+        what leaked into the queue in the window before stop() actually took
+        effect (FIX 2).
+        """
+        count = 0
+        while True:
+            try:
+                item = self._queue.popleft()
+            except IndexError:
+                return count
+            if item is not STOP:
+                count += 1
 
     @property
     def callback_errors(self) -> int:
@@ -268,6 +327,42 @@ class DriverPacketSource:
         biocam = self._device.biocam
         self._stop_event.clear()
 
+        # Clear anything left over from a previous start()/stop() cycle - a
+        # stale STOP sentinel, or straggler packets a consumer that broke out
+        # of __iter__ early (e.g. FIX 1's drain giving up at its deadline)
+        # never popped.
+        #
+        # Reached only when _streaming is False (the guard above), which
+        # only happens after a stop() call has returned - and stop() always
+        # calls _unsubscribe() (unconditionally, whenever biocam is not
+        # None) before it returns, never after. So by the time this line
+        # runs, on the Python side, unsubscription has already happened.
+        #
+        # What that buys us is a real but bounded guarantee, not an
+        # absolute one: whether `biocam.DataReceived -= handler` (or the
+        # other two `-=` calls) stops an *already-dispatched, in-flight*
+        # invocation of that handler from completing and appending to
+        # self._queue afterwards is standard .NET multicast-delegate
+        # behaviour (an invocation captures its list at raise time) that
+        # this repo has no documentation for either way - the same class of
+        # gap the module docstring above already calls out as unverified
+        # for on_error's ordering relative to unsubscription. If such a
+        # straggler append lands after this clear() and after
+        # pending_count() has already read the queue empty, it is neither
+        # counted nor recovered: a genuine, if narrow, way this class can
+        # still silently lose a packet. Left as a named lab-verification
+        # item (see the phase report) rather than closed with a lock, for
+        # the same reason the rest of this file avoids locking on_data's
+        # hot path: there is no way to test the real driver's behaviour
+        # here to justify the cost.
+        #
+        # Clearing inside stop() instead of here would be strictly worse:
+        # on_error can still be mid-append when stop() runs (no unsubscribe
+        # has happened yet at that point), so stop() clearing the queue
+        # could race a *known-live* producer, not just a hypothetical
+        # straggler - the exact defect this class exists to avoid.
+        self._queue.clear()
+
         # Detach any handlers left over from a previous start() - including
         # one that failed after subscribing - before subscribing again.
         # MainForm.cs:143-148 does the same: unsubscribe immediately before
@@ -370,17 +465,25 @@ class DriverPacketSource:
                     # If it failed or raised, leave _streaming True so a
                     # retried stop() calls StopDataStreaming() again instead
                     # of silently skipping it.
-                # If biocam is None, BioCamDevice.__exit__ has already
-                # cleared our reference to it (it calls
-                # ReleaseBioCamControl and sets biocam = None; it does not
-                # call StopDataStreaming or detach handlers itself), so
-                # there is nothing left here to call StopDataStreaming() on.
-                # Fall through to the Python-side cleanup below instead of
-                # raising AttributeError. Whether the driver still
-                # considers itself streaming, and whether the handlers
-                # subscribed to the now-unreachable biocam object are still
-                # live on the .NET side, is unverified - see the lab
-                # follow-up note in the Gate 1 report.
+                else:
+                    # biocam is None: BioCamDevice.__exit__ has already
+                    # cleared our reference to it (it calls
+                    # ReleaseBioCamControl and sets biocam = None; it does
+                    # not call StopDataStreaming or detach handlers itself),
+                    # so there is nothing left here to call
+                    # StopDataStreaming() on, and nothing to retry either -
+                    # unlike the stopped_ok=False branch above, a future
+                    # stop() call would find biocam still None and be no
+                    # more able to call it. _streaming must still be
+                    # cleared here, or start()'s re-entrancy guard blocks
+                    # every subsequent start() on this instance permanently.
+                    # Whether the driver still considers itself streaming,
+                    # and whether the handlers subscribed to the now-
+                    # unreachable biocam object are still live on the .NET
+                    # side, is unverified - see the lab follow-up note in
+                    # the Gate 1 report - but that is a driver-side question
+                    # this Python flag cannot answer either way.
+                    self._streaming = False
             if biocam is not None:
                 self._unsubscribe(biocam)
             self._stop_event.set()
@@ -406,7 +509,13 @@ class DriverPacketSource:
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             if item is STOP:
-                return
+                # Skip, don't return - see FIX 3 in the module docstring.
+                # Anything the driver appended after this sentinel (the
+                # on_error race) is drained below instead of being orphaned;
+                # termination still happens, via the IndexError branch above,
+                # once the queue is genuinely empty and _stop_event is set -
+                # which it always is by the time STOP was enqueued.
+                continue
             depth = len(self._queue)
             if depth >= threshold and not self._pressure_reported:
                 self._pressure_reported = True

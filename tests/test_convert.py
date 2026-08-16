@@ -68,6 +68,20 @@ def test_convert_reports_what_it_did(tmp_path):
     assert report["verdict"] == "clean"
 
 
+def test_discarded_at_stop_is_carried_into_hdf5_attributes(tmp_path):
+    raw, meta = tmp_path / "r.raw", tmp_path / "r_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(1, 1, np.arange(8, dtype=np.uint16).tobytes())
+        writer.note_discarded(9)
+        writer.finalise("drain_deadline_exceeded")
+
+    out = tmp_path / "r.h5"
+    convert(raw, meta, out)
+    with h5py.File(out, "r") as handle:
+        assert handle.attrs["discarded_at_stop"] == 9
+        assert handle.attrs["integrity_verdict"] != "clean"
+
+
 def test_verify_accepts_a_good_conversion(tmp_path):
     raw, meta = _recording(tmp_path)
     out = tmp_path / "r.h5"

@@ -7,6 +7,35 @@
 This module must NOT import biocam.interop at module scope. Doing so would pull
 clr into any process that imports the CLI, and the suite would stop running on a
 machine without the 3Brain DLLs. The import happens inside record_command().
+
+record_command's stop handling closes two data-loss defects, both about
+packets that were genuinely acquired (buffered in the source's queue) and
+then thrown away instead of being written or counted:
+
+FIX 1 - Ctrl+C used to retry record_session with the stop flag already set,
+which broke out after writing a single packet and left everything else still
+buffered (up to ~2 s worth - see QUEUE_BUFFER_SECONDS below) silently
+discarded, with the sidecar still reporting "clean". The retry now passes
+drain=True, which makes record_session consume the source to exhaustion -
+writing every packet still buffered - bounded by session.DRAIN_DEADLINE_SEC
+so a source that never stops yielding cannot hang the process; whatever is
+still unread when that deadline elapses is counted into discarded_at_stop
+rather than dropped.
+
+FIX 2 - source.stop() used to sit in a `finally` outside the `with
+RecordingWriter` block, so the sidecar was finalised while streaming was
+still active: packets arriving in that window were buffered and never
+drained, uncounted, and could still leave the sidecar reading "clean". Both
+calls to record_session now pass stop_source=source.stop, which record_session
+invokes - before it calls writer.finalise() - as soon as its loop ends, for
+any reason. That stops new packets from arriving as early as this code can
+manage; anything still sitting in the queue at that point is counted into
+discarded_at_stop instead of being silently abandoned. The `finally: source.
+stop()` below is a safety net for exit paths where stop_source never got a
+chance to run, not the primary fix - by the time either record_session call
+above returns or raises, stop() has normally already happened, and it is
+idempotent (see its own docstring), so this second call is ordinarily a
+no-op.
 """
 
 import argparse
@@ -130,19 +159,31 @@ def record_command(args) -> int:
                 try:
                     result = record_session(source, writer,
                                             duration_sec=args.duration,
-                                            stop_event=stop, counters=source)
+                                            stop_event=stop, counters=source,
+                                            stop_source=source.stop)
                 except KeyboardInterrupt:
                     stop.set()
-                    # counters is intentionally omitted on this retry.
-                    # record_session's `finally` already transferred it from
-                    # `source` onto `writer` before this KeyboardInterrupt
-                    # reached us - that guarantee is what closes this path
-                    # against the same bug for every exit, not just a clean
-                    # one. Passing counters=source again here would add the
-                    # same cumulative totals from `source` a second time on
-                    # top of a writer that already has them.
-                    result = record_session(source, writer, stop_event=stop)
+                    # The first call's `finally` already ran stop_source
+                    # (source.stop()) before this KeyboardInterrupt reached
+                    # us - see FIX 2 in the module docstring - so streaming
+                    # is already stopped and the buffer can no longer grow.
+                    # This retry drains what is now a finite backlog instead
+                    # of discarding it on the spot - see FIX 1. counters is
+                    # passed again (drain_deadline_exceeded is the only way
+                    # this call can find anything still pending, and that is
+                    # exactly what needs counting); stop_source is passed
+                    # too so this call is correct even run on its own.
+                    result = record_session(source, writer, drain=True,
+                                            counters=source,
+                                            stop_source=source.stop)
         finally:
+            # A safety net, not the primary fix: by the time either call to
+            # record_session above returns or raises, stop_source has
+            # already run. stop() is idempotent (see its own docstring) so
+            # this second call is normally a no-op; it only does real work
+            # if something prevented the stop_source call from ever
+            # happening (e.g. an exception before RecordingWriter.__enter__
+            # even ran).
             source.stop()
 
     if source.callback_errors:

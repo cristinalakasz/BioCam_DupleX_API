@@ -107,6 +107,18 @@ def test_callback_errors_are_counted_and_reach_the_sidecar(tmp_path):
     assert integrity["verdict"] == "gaps_detected"
 
 
+def test_discarded_at_stop_is_counted_and_never_reports_clean(tmp_path):
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.note_discarded(4)
+        writer.finalise("drain_deadline_exceeded")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == 4
+    assert integrity["verdict"] == "gaps_detected"
+
+
 def test_counter_anomaly_alone_is_non_clean_and_lands_in_sidecar(tmp_path):
     """A counter moving backwards is not a gap and not a clean run - we do not
     know what happened, so the verdict must not claim either."""

@@ -1,11 +1,13 @@
+import collections
 import threading
+import time
 
 import numpy as np
 import pytest
 
 from biocam.data.recording import AcquisitionParameters, RecordingWriter, read_sidecar
 from biocam.data.replay import Packet, ReplayPacketSource
-from biocam.session import SessionResult, record_session
+from biocam.session import DRAIN_DEADLINE_SEC, SessionResult, record_session
 
 PARAMS = AcquisitionParameters(
     frame_rate_hz=1000.0, total_channels=4, ch_sample_byte_size=2, bit_depth=12,
@@ -139,3 +141,187 @@ def test_counters_reach_the_sidecar_even_when_the_source_raises(tmp_path):
     assert integrity["queue_overflows"] == 3
     assert integrity["callback_errors"] == 1
     assert integrity["verdict"] != "clean"
+
+
+class _FakeDrainSource:
+    """Stands in for DriverPacketSource for drain-mode tests: exposes the
+    counters + pending_count() surface record_session's `finally` reads
+    (pending_count is a method on the real class too - see its docstring in
+    biocam/interop/source.py - because it drains rather than peeks), and
+    pops from an internal buffer one at a time like the real deque-backed
+    __iter__ - so what is left in the buffer when a test walks away
+    (deadline exceeded) is exactly what pending_count() should report."""
+
+    def __init__(self, n_packets, pop_delay=0.0):
+        self._buffer = collections.deque(
+            Packet(timestamp=i, counter=i,
+                   payload=np.arange(4, dtype=np.uint16).tobytes())
+            for i in range(n_packets)
+        )
+        self.driver_loss_events = 0
+        self.queue_overflows = 0
+        self.callback_errors = 0
+        self._pop_delay = pop_delay
+        self.stop_calls = 0
+        self.stopped = False
+
+    def pending_count(self) -> int:
+        return len(self._buffer)
+
+    def stop(self):
+        self.stop_calls += 1
+
+    def __iter__(self):
+        while self._buffer:
+            if self._pop_delay:
+                time.sleep(self._pop_delay)
+            yield self._buffer.popleft()
+
+
+def test_drain_writes_everything_still_buffered_instead_of_discarding_it(tmp_path):
+    """FIX 1: a drain pass over a source that runs dry well within the
+    deadline must write every packet it holds, not just the first one seen
+    after the stop flag was set."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeDrainSource(n_packets=5)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, drain=True, counters=source,
+                                stop_source=source.stop)
+
+    assert result.stop_reason == "source_exhausted"
+    assert result.n_frames == 5
+    assert source.pending_count() == 0
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == 0
+    assert result.verdict == "clean"
+    assert source.stop_calls == 1
+
+
+def test_a_drain_that_exceeds_the_deadline_counts_what_it_abandons(tmp_path, monkeypatch):
+    """FIX 1: a source that keeps yielding must not hang record_session
+    forever - the drain gives up at DRAIN_DEADLINE_SEC, and whatever is
+    still sitting in the source's buffer at that point is counted into
+    discarded_at_stop rather than silently dropped."""
+    monkeypatch.setattr("biocam.session.DRAIN_DEADLINE_SEC", 0.05)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    # Far more packets than can be popped inside a 0.05 s deadline at a
+    # 0.02 s delay per pop (roughly two or three get through).
+    source = _FakeDrainSource(n_packets=1000, pop_delay=0.02)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, drain=True, counters=source,
+                                stop_source=source.stop)
+
+    assert result.stop_reason == "drain_deadline_exceeded"
+    written = result.n_frames
+    abandoned = source.pending_count()
+    assert written > 0
+    assert abandoned > 0
+    assert written + abandoned == 1000
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == abandoned
+    assert result.verdict != "clean"
+
+
+def test_sidecar_with_nonzero_discarded_at_stop_never_reports_clean(tmp_path):
+    """A recording that discarded acquired data at stop time must never read
+    'clean', even with no gaps, driver loss, overflow or callback errors."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1,
+                            payload=np.arange(4, dtype=np.uint16).tobytes())
+        writer.note_discarded(3)
+        writer.finalise("drain_deadline_exceeded")
+
+    record = read_sidecar(meta)
+    assert record["integrity"]["discarded_at_stop"] == 3
+    assert record["integrity"]["verdict"] != "clean"
+
+
+class _FakeErroringSource:
+    """A source whose own `stopped` flag flips True partway through, the way
+    DriverPacketSource.stopped does after on_error - and which, like the
+    real __iter__ post-FIX-3, keeps yielding packets after that point
+    instead of raising StopIteration on its own."""
+
+    def __init__(self, n_packets, stop_after):
+        self._packets = [
+            Packet(timestamp=i, counter=i,
+                   payload=np.arange(4, dtype=np.uint16).tobytes())
+            for i in range(n_packets)
+        ]
+        self._stop_after = stop_after
+        self.stopped = False
+        self.driver_loss_events = 0
+        self.queue_overflows = 0
+        self.callback_errors = 0
+
+    def __iter__(self):
+        for index, packet in enumerate(self._packets):
+            yield packet
+            if index + 1 == self._stop_after:
+                self.stopped = True
+
+
+def test_a_stopped_source_ends_the_session_promptly_even_if_it_keeps_yielding(tmp_path):
+    """FIX 3 makes __iter__ drain past its STOP sentinel instead of
+    returning immediately, which removes the side effect that used to end
+    record_session's loop promptly on a driver error. counters.stopped
+    restores that: the loop must not keep consuming everything a source
+    that has already flagged itself stopped still happens to yield."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeErroringSource(n_packets=20, stop_after=3)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, counters=source)
+
+    assert result.stop_reason == "source_stopped"
+    # `stopped` flips inside the generator's post-yield code for packet
+    # index 2, which only runs once the loop asks for packet index 3 - the
+    # same one-packet-late visibility test_stops_when_the_stop_event_is_set
+    # documents for stop_event above. That packet (the 4th) is already
+    # pulled and written by the time the flag is visible; stopping promptly
+    # must not throw away what was already handed to the writer, so 4
+    # frames, not 3, is correct here.
+    assert result.n_frames == 4
+    assert source.stopped is True
+    # Only 4 of the 20 packets the source could still yield were ever
+    # pulled - the whole point of checking `stopped` promptly.
+
+
+def test_stop_source_runs_before_finalise_on_a_normal_completion(tmp_path):
+    """FIX 2: stop_source must run - and whatever it leaves pending must be
+    counted - before the sidecar is finalised, not after, even when the run
+    ends normally (no Ctrl+C involved)."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source, _ = _source(tmp_path, 20, frames_per_packet=10)
+    calls = []
+
+    def stop_source():
+        calls.append("stopped")
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, stop_source=stop_source)
+
+    assert calls == ["stopped"]
+    assert result.stop_reason == "source_exhausted"
+    assert read_sidecar(meta)["status"] == "complete"
+
+
+def test_stop_source_is_not_called_when_a_normal_exception_propagates_without_it_masking_the_error(tmp_path):
+    """A failing stop_source must not replace whatever exception is already
+    propagating, nor prevent the counter transfer and cleanup from running."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _ExplodingSource(driver_loss_events=1, queue_overflows=0, callback_errors=0)
+
+    def failing_stop_source():
+        raise RuntimeError("stop failed too")
+
+    with pytest.raises(RuntimeError, match="driver connection lost"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            record_session(source, writer, counters=source,
+                           stop_source=failing_stop_source)
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["driver_loss_events"] == 1

@@ -62,6 +62,7 @@ class RecordingWriter:
         self._driver_loss = 0
         self._queue_overflows = 0
         self._callback_errors = 0
+        self._discarded_at_stop = 0
         self._started_utc = None
         self._finalised = False
 
@@ -126,6 +127,20 @@ class RecordingWriter:
     def note_callback_errors(self, count: int = 1) -> None:
         self._callback_errors += count
 
+    def note_discarded(self, count: int = 1) -> None:
+        """Record packets that were acquired but never made it into the file.
+
+        Distinct from queue_overflows (a live callback dropping a packet
+        because the queue was full) and driver_loss (the driver's own
+        cumulative loss counter): this is data that genuinely reached the
+        Python side - buffered, not lost in transit - and was then thrown
+        away by the stop path instead of being written: a drain that gave up
+        at its deadline (session.DRAIN_DEADLINE_SEC), or whatever leaked into
+        the queue in the window between deciding to stop and the stream
+        actually stopping. See FIX 1 / FIX 2 in cli.py's module docstring.
+        """
+        self._discarded_at_stop += count
+
     def finalise(self, stop_reason: str) -> None:
         if self._file is not None:
             self._file.flush()
@@ -155,8 +170,14 @@ class RecordingWriter:
 
     @property
     def verdict(self) -> str:
+        # discarded_at_stop joins the same "not clean" bucket as the other
+        # counters below (none of which are literal frame-counter gaps
+        # either): a recording that discarded acquired data at stop time
+        # must never report clean, and this codebase has no verdict more
+        # specific than gaps_detected for "integrity was compromised, but
+        # not by a counter gap".
         if (self._tracker.gaps or self._driver_loss or self._queue_overflows
-                or self._callback_errors):
+                or self._callback_errors or self._discarded_at_stop):
             return VERDICT_GAPS
         if self._tracker.counter_anomalies:
             # A counter anomaly is not a gap: GapTracker deliberately declines
@@ -224,6 +245,7 @@ class RecordingWriter:
                 "driver_loss_events": self._driver_loss,
                 "queue_overflows": self._queue_overflows,
                 "callback_errors": self._callback_errors,
+                "discarded_at_stop": self._discarded_at_stop,
                 "counter_anomalies": self._tracker.counter_anomalies,
             },
         })
