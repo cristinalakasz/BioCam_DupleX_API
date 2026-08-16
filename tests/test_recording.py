@@ -625,6 +625,48 @@ def test_gaps_truncated_defaults_to_zero_on_an_ordinary_run(tmp_path):
     assert read_sidecar(meta)["integrity"]["gaps_truncated"] == 0
 
 
+# --- LOW: the failure-sidecar write caps its gap list harder than the
+# normal (max_retained_gaps) cap, since __exit__'s failure path runs at
+# exactly the moment memory pressure is most likely already the problem ---
+
+def test_failure_sidecar_caps_the_gap_list_harder_than_max_retained_gaps(tmp_path):
+    """failure_sidecar_max_gaps (much smaller than max_retained_gaps here,
+    to keep the test fast) must only affect the failed-run sidecar - the
+    tracker itself, and therefore the verdict and any GapDetected events
+    already emitted, are untouched. Gaps cut from the retained list by this
+    extra cap must still be counted in gaps_truncated, not silently
+    dropped from what the sidecar reports."""
+    raw, meta = _paths(tmp_path)
+
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=10,
+                             failure_sidecar_max_gaps=3) as writer:
+            _write_n_one_packet_gaps(writer, 9)  # 9 gaps, all retained (cap is 10)
+            raise ValueError("boom")
+
+    record = read_sidecar(meta)
+    assert record["status"] == "failed"
+    integrity = record["integrity"]
+    assert len(integrity["gaps"]) == 3  # failure_sidecar_max_gaps, not max_retained_gaps
+    assert integrity["gaps_truncated"] == 6  # the other 6 of the 9 retained gaps
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_normal_finalise_is_not_affected_by_the_failure_sidecar_cap(tmp_path):
+    """failure_sidecar_max_gaps must only apply to __exit__'s failure-path
+    write - a normal finalise() (status: complete) keeps every gap up to
+    max_retained_gaps, unaffected by the smaller failure-only cap."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=10,
+                         failure_sidecar_max_gaps=3) as writer:
+        _write_n_one_packet_gaps(writer, 9)
+        writer.finalise("duration_reached")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert len(integrity["gaps"]) == 9
+    assert integrity["gaps_truncated"] == 0
+
+
 # --- FIX 4: finalise fsyncs, not just flushes ---
 
 def test_finalise_calls_fsync(tmp_path, monkeypatch):

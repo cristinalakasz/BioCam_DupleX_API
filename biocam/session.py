@@ -125,6 +125,38 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     and counting or writing it here would double-count it once the drain
     call also writes it.
 
+    MEDIUM 1/2/3 (Gate 1 final pass) apply to this same finally-block drain:
+
+    - MEDIUM 1: it now checks `writer.disk_low` on every packet written,
+      exactly like the main loop above - a full disk turns "finish the
+      recording" into "corrupt the recording" here just as much as it does
+      anywhere else on this path, and this drain used to keep writing for
+      up to the full DRAIN_DEADLINE_SEC regardless.
+    - MEDIUM 2: each `writer.write_packet()` call in this drain is now
+      guarded, because it is the one remaining unguarded write on this
+      path - most plausibly to raise is an OSError from the same full disk
+      that just set `writer.disk_low`. Left unguarded, that exception would
+      propagate straight out of this `finally`, skipping `pending_count()`,
+      `note_discarded()`, and `finalise()` below: `RecordingWriter.__exit__`
+      would then write status="failed", stop_reason="error", erasing the
+      accurate "disk_low" reason and leaving the rest of the backlog
+      uncounted. Swallowing the exception here means whatever remains
+      unwritten simply falls through to `pending_count()` below and is
+      counted as abandoned, the same as any other backlog this drain does
+      not finish.
+    - MEDIUM 3: the loop is only entered once `counters.stopped` reads True
+      (False, and the loop is skipped, if the attribute is absent or still
+      False). `for packet in counters` re-enters the source's own
+      `__iter__`, which sleeps and re-checks its stop flag on an empty
+      queue rather than returning - so the DRAIN_DEADLINE_SEC deadline
+      below, checked only inside the loop body between yields, is never
+      reached if the source never yields at all. `stop_source` is optional
+      and the CLI always supplies it (so `counters.stopped` is normally
+      already True by the time this code runs - stop_source() ran just
+      above), making this latent rather than live today; refusing to enter
+      an unconfirmed-stopped source's drain is what keeps it that way if a
+      future caller ever omits stop_source.
+
     While not draining, the loop also breaks - stop_reason
     "source_stopped" - as soon as `counters.stopped` reads True (False if
     the attribute is absent), not only when `stop_event` does. This is what
@@ -249,7 +281,12 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 pass
         if not interrupted and counters is not None:
             get_pending = getattr(counters, "pending_count", None)
-            if not drain and callable(get_pending):
+            # MEDIUM 3: only enter the drain loop once the source confirms
+            # it has actually stopped - see the docstring above. A source
+            # that never yields would otherwise let this loop wait forever,
+            # since the deadline below is only checked between yields.
+            if (not drain and callable(get_pending)
+                    and getattr(counters, "stopped", False)):
                 # CRITICAL 1: pending_count() pops and discards, so it must
                 # never be the first thing that touches this backlog. By
                 # this point stop_source() has already run (above), so the
@@ -257,14 +294,32 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 # writer, exactly as the drain=True loop above does, before
                 # deciding what (if anything) is genuinely abandoned.
                 drain_deadline = time.monotonic() + DRAIN_DEADLINE_SEC
-                for packet in counters:
-                    writer.write_packet(
-                        timestamp=packet.timestamp,
-                        counter=packet.counter,
-                        payload=packet.payload,
-                    )
-                    if time.monotonic() >= drain_deadline:
-                        break
+                try:
+                    for packet in counters:
+                        writer.write_packet(
+                            timestamp=packet.timestamp,
+                            counter=packet.counter,
+                            payload=packet.payload,
+                        )
+                        if writer.disk_low:
+                            # MEDIUM 1: same reasoning as the main loop -
+                            # a full disk must stop this drain too, not
+                            # just the primary one.
+                            break
+                        if time.monotonic() >= drain_deadline:
+                            break
+                except Exception:
+                    # MEDIUM 2: most plausibly an OSError from the same
+                    # full disk that just tripped writer.disk_low above.
+                    # Left unguarded, this would propagate past
+                    # pending_count()/note_discarded()/finalise() below,
+                    # so RecordingWriter.__exit__ would write
+                    # status="failed", stop_reason="error" - erasing the
+                    # accurate reason this run actually stopped for.
+                    # Swallowing it here lets whatever remains unwritten
+                    # fall through to pending_count() below, counted as
+                    # abandoned like any other undrained backlog.
+                    pass
             pending = get_pending() if callable(get_pending) else 0
             if pending:
                 writer.note_discarded(pending)

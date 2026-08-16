@@ -122,7 +122,41 @@ just what changed.
 **Eight hardware questions are tracked as GitHub issues #11–#18**, each with a
 runnable procedure, what failure looks like, and what to report back. Two can be
 answered without an instrument: #17 needs only the DLLs, and the payload-copy
-benchmark runs on any machine with the SDK.
+benchmark runs on any machine with the SDK — see §6 for its result.
+
+---
+
+## 6. The payload-copy benchmark result
+
+An earlier draft of this document mentioned that a payload-copy benchmark
+exists but did not record what it measured. That omission caused a reviewer
+to report, as a Critical, that the copy strategy used in the acquisition
+callback (`bytes(payload)`, in `biocam/interop/source.py`'s `on_data`) was
+unmeasured. It is not — the benchmark had simply never had its result written
+down anywhere durable, so it kept getting re-litigated. A measurement that is
+not written down is, for review purposes, indistinguishable from one that was
+never taken.
+
+**Result:** `bytes(payload)` at **13.6 µs mean / 12.3 µs median**, against
+`Marshal.Copy` into a pre-allocated buffer at **553 µs mean**, both per
+152,000-byte payload (the ~1 ms reference packet size at the full BioCAM
+DupleX config) with content verified byte-for-byte before timing. The budget
+is 1000 µs per packet at a 1 ms acquisition period — `bytes(payload)` clears
+it with roughly two orders of magnitude to spare; `Marshal.Copy` alone would
+already consume more than half of it.
+
+Reproducible with `python -m biocam.interop.benchmark`. It needs the 3Brain
+DLLs on disk (`BioCam_DupleX_API/API/`) but **no instrument** — it constructs
+a .NET `byte[]` in-process and times copying out of it, so it can (and
+should) be re-run on any machine with the SDK, including one that has never
+seen a BioCAM.
+
+This figure is from a development machine, not the lab machine, and reflects
+a synthetic payload copied in isolation, not the full acquisition callback
+under real driver load, real GC pressure, and whatever else is running on the
+lab machine at the time. The lab must still confirm this measurement holds up
+under real, sustained acquisition — a two-orders-of-magnitude margin is
+reassuring, not a substitute for that confirmation.
 
 **#17 is the cheapest and highest-value:** if pythonnet does not fill
 `BioCamPool.Activate`'s optional parameter, the very first .NET call of every

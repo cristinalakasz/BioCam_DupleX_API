@@ -56,3 +56,12 @@ def test_packet_is_immutable(tmp_path):
     packet = Packet(timestamp=1, counter=2, payload=b"x")
     with pytest.raises(dataclasses.FrozenInstanceError):
         packet.counter = 3
+
+
+def test_packet_has_no_per_instance_dict():
+    # LOW: slots=True removes the per-instance __dict__ a plain dataclass
+    # otherwise carries - one Packet is allocated per callback on the
+    # driver's own thread, so this is free there.
+    packet = Packet(timestamp=1, counter=2, payload=b"x")
+    assert not hasattr(packet, "__dict__")
+    assert Packet.__slots__ == ("timestamp", "counter", "payload")

@@ -23,8 +23,14 @@ def load_assemblies(dll_dir=None) -> None:
 
     dll_dir = Path(dll_dir or DEFAULT_DLL_DIR)
     path_str = str(dll_dir)
-    if path_str not in os.environ["PATH"].split(os.pathsep):
-        os.environ["PATH"] = path_str + os.pathsep + os.environ["PATH"]
+    # LOW: os.environ["PATH"] raises KeyError if PATH is unset in this
+    # process's environment (e.g. a stripped-down launcher or test
+    # harness) - unlikely on a normal Windows session, but not impossible,
+    # and there is no reason this function should crash on it when
+    # os.environ.get("PATH", "") makes the empty case just work.
+    current_path = os.environ.get("PATH", "")
+    if path_str not in current_path.split(os.pathsep):
+        os.environ["PATH"] = path_str + os.pathsep + current_path
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
@@ -69,19 +75,55 @@ class BioCamDevice:
         # default is, so `False` here is a guess, not a verified value -
         # chosen only because "do not support invalid-serial BioCAMs"
         # reads as the more conservative default for a flag named
-        # supportBioCamInvalidSerial. Flag for the lab: confirm which path
-        # is taken, and if the fallback runs, confirm False matches
-        # 3Brain's real default.
+        # supportBioCamInvalidSerial.
+        #
+        # MEDIUM 5: asking the lab "confirm which path is taken" without
+        # ever reporting anything left nobody able to answer it.
+        # BioCamPool.SupportBioCamWithInvalidSerial (XML:2514, "Gets
+        # whether the BioCAM pool should support BioCAM with non valid
+        # serial") reads back exactly what Activate() set, so print the
+        # branch taken and that property's value right after the call - a
+        # single run then answers issue #17 outright instead of leaving it
+        # open. `except TypeError` stays narrow on purpose: if the
+        # no-argument form raised something other than a non-binding
+        # TypeError (e.g. it partially ran before raising), a second call
+        # to Activate() below could re-run work the first call already
+        # did - unverified here, since neither Activate() overload's
+        # partial-failure behaviour is documented in this repo.
         try:
             BioCamPool.Activate()
+            print(
+                "BioCamDevice: Activate() succeeded with no arguments "
+                "(pythonnet supplied the C# default). "
+                "SupportBioCamWithInvalidSerial="
+                f"{BioCamPool.SupportBioCamWithInvalidSerial!r}"
+            )
         except TypeError:
             BioCamPool.Activate(False)
+            print(
+                "BioCamDevice: Activate() raised TypeError with no "
+                "arguments (pythonnet did not supply the C# default); "
+                "fell back to Activate(False). "
+                "SupportBioCamWithInvalidSerial="
+                f"{BioCamPool.SupportBioCamWithInvalidSerial!r}"
+            )
 
         deadline = time.time() + self._timeout_sec
+        # MEDIUM 4: found_slot_index is a plain local, not self._slot_index,
+        # until TakeBioCamControl below has actually returned a live
+        # handle. Identifying a free slot index is not the same as holding
+        # it - the sample only releases a slot it holds. Setting
+        # self._slot_index this early meant a TakeBioCamControl failure
+        # (or the checks that follow it) still ran __exit__ as if a slot
+        # had been taken: it would call ReleaseBioCamControl on a slot
+        # never claimed, and a failure from that release call would
+        # replace the carefully-worded "close BrainWave" message below
+        # with whatever ReleaseBioCamControl raises instead.
+        found_slot_index = -1
         while time.time() < deadline:
             free = list(BioCamPool.GetSlotIndexesFreeBioCam())
             if free:
-                self._slot_index = free[0]
+                found_slot_index = free[0]
                 break
             time.sleep(0.5)
         else:
@@ -97,12 +139,16 @@ class BioCamDevice:
         # stays claimed until the process dies, and the next person on the
         # instrument finds it held by nothing.
         try:
-            self.biocam = BioCamPool.TakeBioCamControl(self._slot_index)
+            self.biocam = BioCamPool.TakeBioCamControl(found_slot_index)
             if self.biocam is None:
                 raise RuntimeError(
                     "TakeBioCamControl returned nothing. Close BrainWave or "
                     "any other 3Brain software and try again."
                 )
+            # MEDIUM 4: only now, with a live handle in hand, does
+            # __exit__'s ReleaseBioCamControl(self._slot_index) become
+            # correct to call - so this is the earliest point this is set.
+            self._slot_index = found_slot_index
             if not self.biocam.IsConnected:
                 raise RuntimeError("BioCAM reports it is not connected.")
             if not self.biocam.MeaPlate.IsConnected:
@@ -130,4 +176,15 @@ class BioCamDevice:
 
     @property
     def data_format(self):
+        if self.biocam is None:
+            # LOW: without this check, the attribute access below raises a
+            # plain "'NoneType' object has no attribute 'DataFormat'" -
+            # the same class of opaque AttributeError source.start() was
+            # already fixed to name explicitly (device.biocam is None
+            # because __enter__ never completed, or __exit__ already ran).
+            raise RuntimeError(
+                "BioCamDevice.data_format accessed with biocam is None; a "
+                "BioCamDevice must be successfully __enter__()'d (claiming "
+                "the device) before reading its data format."
+            )
         return self.biocam.DataFormat

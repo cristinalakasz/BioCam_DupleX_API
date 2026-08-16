@@ -17,8 +17,19 @@ from biocam.data.integrity import COUNTER_MODULUS
 from biocam.data.recording import AcquisitionParameters
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Packet:
+    """One packet's worth of acquired data.
+
+    LOW: `slots=True` (added to `dataclass` in 3.10, so requires nothing
+    beyond the MIN_PYTHON floor in biocam/preflight.py) removes the
+    per-instance `__dict__` a plain dataclass otherwise carries. One Packet
+    is allocated per callback on the driver's own thread (see
+    biocam/interop/source.py's on_data), so the saving is free there and
+    costs nothing anywhere else - a frozen dataclass never gains attributes
+    dynamically, so nothing here relied on `__dict__` existing.
+    """
+
     timestamp: int
     counter: int
     payload: bytes

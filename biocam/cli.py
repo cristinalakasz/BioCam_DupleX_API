@@ -41,11 +41,28 @@ no-op only in the sense that there is nothing left to stop, not because
 calling it twice is guaranteed harmless; it can still raise, and that raise
 is guarded (see the `finally` below) so it can never mask whatever exception,
 if any, is already propagating out of this function.
+
+HIGH 1 (Gate 1 final pass) - source.start() used to run before `with
+RecordingWriter(...)`, so the driver was already streaming into a bounded
+queue with nothing consuming it while the writer's own __enter__ performed
+several filesystem syscalls (mkdir, open, a sidecar write via mkstemp/write/
+os.replace). On a synced or antivirus-scanned volume, os.replace() alone can
+take longer than the queue's own ~2 s budget (QUEUE_BUFFER_SECONDS below),
+producing overflows at t=0 on an otherwise healthy run - loss caused entirely
+by setup ordering, before a single second of real acquisition has happened.
+record_command now enters `with RecordingWriter(...)` first and calls
+source.start() only once that has succeeded, inside it. This is also better
+on failure: a writer that cannot open its output file should never be able
+to claim the stream in the first place - previously a RecordingWriter
+failure after a successful source.start() left the driver streaming into a
+queue that would now never be drained at all until the outer `finally`'s
+source.stop() ran.
 """
 
 import argparse
 import queue
 import shutil
+import sys
 import threading
 import time
 import warnings
@@ -95,6 +112,19 @@ MIN_QUEUE_PACKETS = 8
 # here means the CLI never opens the device for a value the driver was never
 # going to accept.
 MAX_PACKET_MS = 250
+
+# LOW: biocam/interop/source.py's POLL_INTERVAL_SEC = 0.001 only actually
+# delivers ~1 ms sleeps on Python 3.11+, where time.sleep()'s underlying
+# implementation on Windows was changed to use a higher-resolution timer. On
+# 3.10 and earlier, time.sleep() rounds up to the ~15.6 ms system timer
+# resolution - silently restoring, on an older interpreter, almost exactly
+# the latency POLL_INTERVAL_SEC exists to remove, with no error or warning
+# to say so. biocam/preflight.py's MIN_PYTHON is (3, 12), already above this
+# floor, but preflight is opt-in (`python -m biocam.preflight`) and nothing
+# previously stopped `python -m biocam.cli record` itself from running on an
+# older interpreter and quietly recording with 15x the intended poll
+# latency. record_command now refuses to start in that case.
+MIN_PYTHON_FOR_POLL_PRECISION = (3, 11)
 
 
 def _bytes_per_packet(params: AcquisitionParameters, packet_ms: int) -> float:
@@ -230,12 +260,25 @@ class _ConsolePrinter:
     deque(maxlen=...)), a full ring drops the *new* event and counts it
     rather than blocking report() or silently evicting something already
     queued. Losing console output is acceptable; losing it without saying
-    so is not - see `dropped`.
+    so is not - see `dropped` and, for the other way output can be lost,
+    `print_failures`.
     """
 
     def __init__(self, maxsize: int = 1000):
         self._queue = queue.Queue(maxsize=maxsize)
         self._dropped = 0
+        # MEDIUM 4: a full ring (`dropped`, above) is one way console output
+        # is lost; a print() call that itself raises - a broken stdout, or
+        # describe() meeting an event type it does not recognise - is
+        # another. _run() used to catch that and pass with no counter
+        # incremented at all, so `dropped` read 0 while output was still
+        # being lost - silently contradicting this class's own docstring,
+        # which says losing output without saying so is unacceptable.
+        # print_failures counts that second case separately from `dropped`,
+        # since they mean different things: `dropped` is "never attempted
+        # because the ring was full", print_failures is "attempted and
+        # print() itself failed".
+        self._print_failures = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="biocam-printer", daemon=True)
@@ -265,10 +308,11 @@ class _ConsolePrinter:
                 # A broken stdout (or an event type describe() does not
                 # recognise) must not kill the printer thread - later
                 # events should still get a chance. Mirrors
-                # RecordingWriter._emit()'s own listener-exception handling
-                # (MEDIUM 4): a console failure is not a reason to lose
-                # anything else.
-                pass
+                # RecordingWriter._emit()'s own listener-exception handling:
+                # a console failure is not a reason to lose anything else.
+                # MEDIUM 4: unlike that handling, this failure must still be
+                # counted - see print_failures above.
+                self._print_failures += 1
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop the daemon thread once the ring is drained (or `timeout`
@@ -281,12 +325,62 @@ class _ConsolePrinter:
     def dropped(self) -> int:
         return self._dropped
 
+    @property
+    def print_failures(self) -> int:
+        """Count of enqueued events print() itself failed on (MEDIUM 4) -
+        distinct from `dropped` (events never attempted because the ring
+        was full)."""
+        return self._print_failures
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
+
+
+# finding 9 (Gate 1 final pass): the five _3Brain.Common DataFormat members
+# _parameters_from() reads below. None appears in
+# API/3Brain.BioCamDriver.xml - verified, zero occurrences, while FrameRate
+# and NWells (also read there) each have exactly one - so all five are
+# presumed inherited from _3Brain.Common, which ships no XML in this repo
+# (see CLAUDE.md). Order matches _parameters_from().
+_DATA_FORMAT_PROBE_MEMBERS = (
+    "BitDepth", "ADCCountsToValue", "Offset", "MinDigitalValue",
+    "MaxDigitalValue",
+)
+
+
+def _probe_data_format(data_format) -> list:
+    """Read each undocumented DataFormat member individually and report it.
+
+    finding 9: _parameters_from() below reads all five of these members in
+    one block, immediately after the device is claimed and before a single
+    packet has arrived. Because none of the five is documented in this repo
+    (see _DATA_FORMAT_PROBE_MEMBERS above), an AttributeError on any one of
+    them used to abort the whole session there - and a plain AttributeError
+    names only the first member it happened to hit, leaving nothing to say
+    about the other four, with the colleague 600 km away and nothing to
+    report but a traceback.
+
+    This probe reads every member individually so one failure cannot hide
+    whether the others resolve, and returns one line per member
+    unconditionally - not only the ones that fail - because issue #11 asks
+    the colleague to compare these exact values against the known-good June
+    recording, so the values themselves need to be visible on an ordinary,
+    successful run too, not just a broken one. A dead session should return
+    a diagnosis, not a stack trace.
+    """
+    lines = []
+    for name in _DATA_FORMAT_PROBE_MEMBERS:
+        try:
+            value = getattr(data_format, name)
+        except Exception as exc:
+            lines.append(f"  {name}: FAILED - {exc!r}")
+        else:
+            lines.append(f"  {name}: {value!r}")
+    return lines
 
 
 def _parameters_from(data_format) -> AcquisitionParameters:
@@ -306,6 +400,20 @@ def record_command(args) -> int:
     from biocam.interop.device import BioCamDevice
     from biocam.interop.source import DriverPacketSource
 
+    # LOW: refuse to run below the Python version POLL_INTERVAL_SEC's ~1 ms
+    # latency actually requires - see MIN_PYTHON_FOR_POLL_PRECISION above.
+    if sys.version_info < MIN_PYTHON_FOR_POLL_PRECISION:
+        required = ".".join(str(p) for p in MIN_PYTHON_FOR_POLL_PRECISION)
+        actual = ".".join(str(p) for p in sys.version_info[:3])
+        raise RuntimeError(
+            f"biocam record requires Python {required}+ (found {actual}): "
+            "biocam.interop.source.POLL_INTERVAL_SEC (1 ms) only delivers "
+            "that resolution on Windows from Python 3.11 onward - on 3.10 "
+            "and earlier, time.sleep() rounds up to the ~15.6 ms system "
+            "timer, silently restoring the latency POLL_INTERVAL_SEC exists "
+            "to remove."
+        )
+
     base = args.name or time.strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir)
     raw_path = out_dir / f"{base}.raw"
@@ -314,118 +422,214 @@ def record_command(args) -> int:
     stop = threading.Event()
     # Critical: printing must never happen on the consumer thread - see
     # _ConsolePrinter's docstring. report() only enqueues; printer's own
-    # daemon thread is the only thing that calls print(). Combined into the
-    # same `with` as BioCamDevice so printer.close() runs unconditionally
-    # on every exit from the block below (normal return, the early
-    # disk-space return, or an exception propagating out) without adding a
-    # further level of nesting to the block itself.
+    # daemon thread is the only thing that calls print().
+    #
+    # LOW: printer.close() runs in the `finally` below, not via a
+    # `with BioCamDevice() as device, printer:` combined statement. The
+    # combined form does not guarantee cleanup here: if `BioCamDevice()`
+    # itself (the constructor call, before __enter__ is even reached) were
+    # to raise, printer's own __enter__/__exit__ would never run at all,
+    # leaking its daemon thread with nothing left to stop it. A plain
+    # try/finally around the whole body closes printer unconditionally
+    # regardless of where or how the body fails.
     printer = _ConsolePrinter()
     report = printer.report
 
-    with BioCamDevice() as device, printer:
-        params = _parameters_from(device.data_format)
+    try:
+        with BioCamDevice() as device:
+            # finding 9: probe every undocumented DataFormat member
+            # individually, before _parameters_from() reads the same five
+            # in one uninterruptible block - see _probe_data_format's
+            # docstring. Printed directly, not through printer's bounded
+            # ring: streaming has not started (source.start() has not been
+            # called yet), so nothing here can compete with the callback -
+            # the same reasoning that makes the end-of-run summary further
+            # down safe to print directly once acquisition has stopped.
+            data_format = device.data_format
+            print(
+                "DataFormat probe (finding 9 - members with no XML in "
+                "this repo; compare against the known-good June recording "
+                "per issue #11):",
+                file=sys.stderr,
+            )
+            for line in _probe_data_format(data_format):
+                print(line, file=sys.stderr)
+            params = _parameters_from(data_format)
 
-        if args.duration is not None:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            rate = bytes_per_second(params.total_channels,
-                                    params.ch_sample_byte_size,
-                                    params.frame_rate_hz)
-            space = check_disk_space(out_dir, args.duration, rate)
-            if not space.ok:
-                free = shutil.disk_usage(out_dir).free
-                report(DiskLow(free_bytes=free,
-                               required_bytes=int(args.duration * rate)))
-                return 1
+            if args.duration is not None:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                rate = bytes_per_second(params.total_channels,
+                                        params.ch_sample_byte_size,
+                                        params.frame_rate_hz)
+                space = check_disk_space(out_dir, args.duration, rate)
+                if not space.ok:
+                    free = shutil.disk_usage(out_dir).free
+                    report(DiskLow(free_bytes=free,
+                                   required_bytes=int(args.duration * rate)))
+                    return 1
 
-        queue_size = _queue_size_for(
-            args.packet_ms, _bytes_per_packet(params, args.packet_ms))
-        source = DriverPacketSource(device, queue_size=queue_size, listener=report)
-        # Gate 1, item A: start() now lives inside the try whose finally
-        # calls source.stop(). Previously start() ran outside this try
-        # entirely, so a failure here - or one from the recording writer
-        # below - would leave source.stop() uncalled: nothing else in the
-        # process would restore the switch interval or re-enable GC (see
-        # the equivalent fix inside source.start() itself, in
-        # biocam/interop/source.py). HIGH 3: stop() has no docstring and is
-        # deliberately not idempotent after a failure - see the module
-        # docstring's FIX 2 paragraph - so calling it here even when
-        # start() itself is what failed is safe (it is guarded below, so a
-        # failure cannot mask start()'s own exception), not a guaranteed
-        # no-op.
-        try:
-            source.start(packet_timespan_ms=args.packet_ms)
+            queue_size = _queue_size_for(
+                args.packet_ms, _bytes_per_packet(params, args.packet_ms))
+            source = DriverPacketSource(device, queue_size=queue_size, listener=report)
+
+            # HIGH 1: the writer is entered before the source is started -
+            # see the module docstring. RecordingWriter.__enter__ performs
+            # several filesystem syscalls (mkdir, open, a sidecar write via
+            # mkstemp/write/os.replace); running source.start() ahead of
+            # this used to let the driver stream into a bounded queue with
+            # nothing consuming it while those syscalls ran. It also means
+            # a writer that cannot open its output file can no longer claim
+            # the stream in the first place.
             with RecordingWriter(raw_path, meta_path, params,
                                  listener=report) as writer:
+                # Gate 1, item A: start() lives inside the try whose finally
+                # calls source.stop(). A failure here - or from
+                # record_session below - would otherwise leave source.stop()
+                # uncalled: nothing else in the process would restore the
+                # switch interval or unfreeze gc (see the equivalent fix
+                # inside source.start() itself, in
+                # biocam/interop/source.py). HIGH 3: stop() has no docstring
+                # and is deliberately not idempotent after a failure - see
+                # the module docstring's FIX 2 paragraph - so calling it
+                # here even when start() itself is what failed is safe (it
+                # is guarded below, so a failure cannot mask start()'s own
+                # exception), not a guaranteed no-op.
                 try:
-                    result = record_session(source, writer,
-                                            duration_sec=args.duration,
-                                            stop_event=stop, counters=source,
-                                            stop_source=source.stop)
-                except KeyboardInterrupt:
-                    stop.set()
-                    # The first call's `finally` already ran stop_source
-                    # (source.stop()) before this KeyboardInterrupt reached
-                    # us - see FIX 2 in the module docstring - so streaming
-                    # is already stopped and the buffer can no longer grow.
-                    # This retry drains what is now a finite backlog instead
-                    # of discarding it on the spot - see FIX 1. counters is
-                    # passed again (drain_deadline_exceeded is the only way
-                    # this call can find anything still pending, and that is
-                    # exactly what needs counting); stop_source is passed
-                    # too so this call is correct even run on its own.
-                    result = record_session(source, writer, drain=True,
-                                            counters=source,
-                                            stop_source=source.stop)
-        finally:
-            # A safety net, not the primary fix: by the time either call to
-            # record_session above returns or raises, stop_source has
-            # already run, so this second call is usually a no-op; it only
-            # does real work if something prevented the stop_source call
-            # from ever happening (e.g. an exception before
-            # RecordingWriter.__enter__ even ran).
-            #
-            # HIGH 3: stop() has no docstring, and it deliberately leaves
-            # its internal _streaming flag True when StopDataStreaming
-            # fails, precisely so a retry calls it again instead of
-            # silently skipping it - so it is not idempotent in general,
-            # and this call can raise. Left unguarded, that raise would
-            # replace whatever exception is already propagating through
-            # this `finally` - e.g. the OSError from a full disk that the
-            # `with RecordingWriter` block above is unwinding from - with a
-            # confusing, unrelated one about the stream failing to stop.
-            # Same treatment as the sidecar write's own masking fix in
-            # RecordingWriter.__exit__: report it as a warning, never let
-            # it mask the original failure or (on a clean exit) become the
-            # only thing raised.
-            try:
-                source.stop()
-            except Exception as exc:
-                warnings.warn(
-                    f"source.stop() failed during cleanup: {exc}",
-                    RuntimeWarning,
-                )
+                    source.start(packet_timespan_ms=args.packet_ms)
+                    try:
+                        result = record_session(source, writer,
+                                                duration_sec=args.duration,
+                                                stop_event=stop, counters=source,
+                                                stop_source=source.stop)
+                    except KeyboardInterrupt:
+                        stop.set()
+                        # The first call's `finally` already ran stop_source
+                        # (source.stop()) before this KeyboardInterrupt
+                        # reached us - see FIX 2 in the module docstring -
+                        # so streaming is already stopped and the buffer can
+                        # no longer grow. This retry drains what is now a
+                        # finite backlog instead of discarding it on the
+                        # spot - see FIX 1. counters is passed again
+                        # (drain_deadline_exceeded is the only way this call
+                        # can find anything still pending, and that is
+                        # exactly what needs counting); stop_source is
+                        # passed too so this call is correct even run on its
+                        # own.
+                        result = record_session(source, writer, drain=True,
+                                                counters=source,
+                                                stop_source=source.stop)
+                finally:
+                    # A safety net, not the primary fix: by the time either
+                    # call to record_session above returns or raises,
+                    # stop_source has already run, so this second call is
+                    # usually a no-op; it only does real work if something
+                    # prevented the stop_source call from ever happening
+                    # (e.g. source.start() itself raised).
+                    #
+                    # HIGH 3: stop() has no docstring, and it deliberately
+                    # leaves its internal _streaming flag True when
+                    # StopDataStreaming fails, precisely so a retry calls it
+                    # again instead of silently skipping it - so it is not
+                    # idempotent in general, and this call can raise. Left
+                    # unguarded, that raise would replace whatever exception
+                    # is already propagating through this `finally` - e.g.
+                    # the OSError from a full disk that the `with
+                    # RecordingWriter` block above is unwinding from - with
+                    # a confusing, unrelated one about the stream failing to
+                    # stop. Same treatment as the sidecar write's own
+                    # masking fix in RecordingWriter.__exit__: report it as
+                    # a warning, never let it mask the original failure or
+                    # (on a clean exit) become the only thing raised.
+                    try:
+                        source.stop()
+                    except Exception as exc:
+                        warnings.warn(
+                            f"source.stop() failed during cleanup: {exc}",
+                            RuntimeWarning,
+                        )
+    finally:
+        printer.close()
 
-    # Printer thread: report anything the console ring dropped. This only
-    # reaches events lost from the *screen* - nothing here implies data was
-    # lost from the recording itself (that is queue_overflows/
-    # driver_loss_events/callback_errors below, and the sidecar).
-    if printer.dropped:
-        print(f"CONSOLE OUTPUT DROPPED: {printer.dropped} event(s) - "
-              "printing lagged behind acquisition and the console ring "
-              "was full; nothing was lost from the recording itself, only "
-              "from what reached the screen")
-
-    # Gate 1, item F: queue_overflows and driver_loss_events get the same
-    # end-of-run visibility callback_errors already had - a run that dropped
-    # data says so on the console, not only in the sidecar (which is the
-    # only place it showed up before this, read only after the run is over).
+    # MEDIUM 4/MEDIUM 5: everything below is an end-of-run summary written
+    # to stderr, after printer.close() - i.e. after the recording itself is
+    # already finished, sidecar and all. It bypasses the bounded ring/daemon
+    # thread that exists specifically to keep print() off the consumer
+    # thread during acquisition (see _ConsolePrinter's docstring); that
+    # protection is no longer needed once acquisition has stopped, but
+    # print() can still block here for the same reasons it always can
+    # (QuickEdit, a full pipe, a slow log collector).
+    #
+    # Two groups, not one, and they are not interchangeable: queue_overflows/
+    # driver_loss_events/callback_errors are genuinely part of the sidecar's
+    # integrity block (RecordingWriter._write_sidecar), so a blocked or
+    # unread console here is a lost convenience, never a lost record, for
+    # those specifically. printer.dropped/print_failures and the gc delta
+    # below are not written anywhere else - they describe this process's own
+    # console/session, not the recording - so claiming they are "also in the
+    # sidecar" would be exactly the kind of confidently wrong statement this
+    # codebase exists to avoid making.
+    sidecar_lines = []
     if source.queue_overflows:
-        print(describe(QueueOverflow(total=source.queue_overflows)))
+        sidecar_lines.append(describe(QueueOverflow(total=source.queue_overflows)))
     if source.driver_loss_events:
-        print(describe(DriverDataLoss(total=source.driver_loss_events)))
+        sidecar_lines.append(describe(DriverDataLoss(total=source.driver_loss_events)))
     if source.callback_errors:
-        print(f"CALLBACK ERRORS: {source.callback_errors} exceptions raised "
-              "inside a driver callback")
+        sidecar_lines.append(
+            f"CALLBACK ERRORS: {source.callback_errors} exceptions raised "
+            "inside a driver callback")
+
+    session_only_lines = []
+    if printer.dropped:
+        session_only_lines.append(
+            f"CONSOLE OUTPUT DROPPED: {printer.dropped} event(s) - printing "
+            "lagged behind acquisition and the console ring was full; "
+            "nothing was lost from the recording itself, only from what "
+            "reached the screen")
+    if printer.print_failures:
+        # MEDIUM 4: the other way console output is lost - print() itself
+        # raised (e.g. a broken stdout), not just a full ring.
+        session_only_lines.append(
+            f"CONSOLE PRINT FAILURES: {printer.print_failures} event(s) "
+            "could not be printed (e.g. a broken stdout); nothing was lost "
+            "from the recording itself, only from what reached the screen")
+
+    # HIGH 2/HIGH 3: a real number in place of "we believe pythonnet does
+    # not leak cycles" - see biocam/interop/source.py's module docstring.
+    # getattr with a default, same reasoning as elsewhere on this path (e.g.
+    # record_session's `counters` handling): a source without these
+    # attributes (a test double, or any future non-driver source) must pass
+    # through untouched rather than raise. Printed whenever a start()/stop()
+    # cycle actually completed (both snapshots present and not None);
+    # absent is not reported as a delta of zero, since that would
+    # misrepresent "never measured" as "measured, no change".
+    gc_counts_at_start = getattr(source, "gc_counts_at_start", None)
+    gc_counts_at_stop = getattr(source, "gc_counts_at_stop", None)
+    gc_objects_at_start = getattr(source, "gc_objects_at_start", None)
+    gc_objects_at_stop = getattr(source, "gc_objects_at_stop", None)
+    if (gc_counts_at_start is not None and gc_counts_at_stop is not None
+            and gc_objects_at_start is not None and gc_objects_at_stop is not None):
+        counts_delta = tuple(
+            after - before for after, before in
+            zip(gc_counts_at_stop, gc_counts_at_start))
+        objects_delta = gc_objects_at_stop - gc_objects_at_start
+        session_only_lines.append(
+            "GC (informational, not a pass/fail check): tracked object "
+            f"total changed by {objects_delta:+d} "
+            f"({gc_objects_at_start} -> {gc_objects_at_stop}); "
+            f"per-generation allocation counts changed by {counts_delta} "
+            f"(from {gc_counts_at_start} to {gc_counts_at_stop})")
+
+    if sidecar_lines or session_only_lines:
+        print("End-of-run summary:", file=sys.stderr)
+        if sidecar_lines:
+            print("  (also recorded in the sidecar)", file=sys.stderr)
+            for line in sidecar_lines:
+                print(f"  {line}", file=sys.stderr)
+        if session_only_lines:
+            print("  (console/session-only - not part of the sidecar)",
+                  file=sys.stderr)
+            for line in session_only_lines:
+                print(f"  {line}", file=sys.stderr)
 
     return 0 if result.verdict == "clean" else 2
 
