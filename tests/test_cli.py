@@ -334,3 +334,69 @@ def test_record_command_drains_buffered_packets_on_keyboard_interrupt(tmp_path, 
     assert integrity["discarded_at_stop"] == 0
     assert meta["stop_reason"] == "source_exhausted"
     assert exit_code == 0
+
+
+def test_a_failing_source_stop_in_the_outer_finally_does_not_mask_the_real_exception(
+        tmp_path, monkeypatch):
+    """HIGH 3: source.stop() has no docstring and is deliberately not
+    idempotent after a failure - a retry (the outer `finally: source.stop()`
+    safety net) can raise. Left unguarded, that raise would replace whatever
+    exception is already propagating - here, an OSError simulating a full
+    disk during acquisition - with a confusing, unrelated one about the
+    stream failing to stop. The real failure must still be what the caller
+    sees; the stop failure must be reported, not silently lost either."""
+    import biocam.interop.device as device_module
+    import biocam.interop.source as source_module
+
+    class FakeDataFormat:
+        FrameRate = 1000.0
+        NWells = 1
+        NChsPerWell = 4
+        ChSampleByteSize = 2
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    class FakeDevice:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        @property
+        def data_format(self):
+            return FakeDataFormat()
+
+    class FakeSource:
+        """Raises a plain OSError partway through streaming (simulating a
+        full disk), and fails every call to stop() too - the scenario
+        Critical review flagged: an unguarded second source.stop() call in
+        cli.py's outer `finally` would otherwise mask the OSError."""
+
+        def __init__(self, device, queue_size=None, listener=None):
+            self.driver_loss_events = 0
+            self.queue_overflows = 0
+            self.callback_errors = 0
+
+        def pending_count(self):
+            return 0
+
+        def start(self, packet_timespan_ms=1):
+            pass
+
+        def stop(self):
+            raise RuntimeError("StopDataStreaming failed.")
+
+        def __iter__(self):
+            raise OSError("disk full")
+            yield  # pragma: no cover - makes this a generator function
+
+    monkeypatch.setattr(device_module, "BioCamDevice", FakeDevice)
+    monkeypatch.setattr(source_module, "DriverPacketSource", FakeSource)
+
+    with pytest.warns(RuntimeWarning, match="source.stop\\(\\) failed"):
+        with pytest.raises(OSError, match="disk full"):
+            main(["record", "--output-dir", str(tmp_path), "--name", "diskfull"])

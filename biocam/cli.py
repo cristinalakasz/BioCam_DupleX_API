@@ -33,15 +33,21 @@ manage; anything still sitting in the queue at that point is counted into
 discarded_at_stop instead of being silently abandoned. The `finally: source.
 stop()` below is a safety net for exit paths where stop_source never got a
 chance to run, not the primary fix - by the time either record_session call
-above returns or raises, stop() has normally already happened, and it is
-idempotent (see its own docstring), so this second call is ordinarily a
-no-op.
+above returns or raises, stop() has normally already happened. HIGH 3: stop()
+has no docstring and is deliberately *not* idempotent after a failure - it
+leaves its internal _streaming flag True so a retry calls StopDataStreaming()
+again rather than silently skipping it - so this second call is ordinarily a
+no-op only in the sense that there is nothing left to stop, not because
+calling it twice is guaranteed harmless; it can still raise, and that raise
+is guarded (see the `finally` below) so it can never mask whatever exception,
+if any, is already propagating out of this function.
 """
 
 import argparse
 import shutil
 import threading
 import time
+import warnings
 from pathlib import Path
 
 from biocam.data.events import DiskLow, DriverDataLoss, QueueOverflow, describe
@@ -113,16 +119,36 @@ def _queue_size_for(packet_ms: int, bytes_per_packet: float) -> int:
         periods, where a fixed packet-count floor would otherwise let the
         buffered duration (and worst-case memory) grow without bound (Gate 1,
         item D).
-      - MIN_QUEUE_PACKETS as a floor under both, so a very long packet
-        period still buffers a few packets rather than being sized to
-        (near-)zero.
+      - MIN_QUEUE_PACKETS as a floor under `by_duration` only, so a very
+        long packet period still buffers a few packets rather than being
+        sized to (near-)zero.
+
+    MEDIUM 7: the floor is applied to `by_duration` before the byte ceiling
+    is imposed, not after - `max(MIN_QUEUE_PACKETS, min(by_duration,
+    by_bytes))` (the previous form) applied the floor outside the byte
+    bound, so a byte ceiling smaller than MIN_QUEUE_PACKETS worth of
+    packets would have been overridden by the floor instead of capping the
+    result. Computing `min(max(MIN_QUEUE_PACKETS, by_duration), by_bytes)`
+    instead makes by_bytes a hard ceiling that always wins. This is latent
+    within the documented 1-250 ms --packet-ms range at this device's data
+    format - MAX_QUEUE_BYTES (512 MiB) never shrinks by_bytes below
+    MIN_QUEUE_PACKETS anywhere in that range (see
+    test_queue_size_never_exceeds_the_byte_ceiling_across_1_to_250ms in
+    tests/test_cli.py) - but the ceiling must be provably hard, not merely
+    true in practice for the range currently exercised.
+
+    bytes_per_packet <= 0 (queue sizing runs before any real packet has
+    been measured, so this is only reachable with a synthetic 0) disables
+    the byte ceiling entirely rather than imposing a degenerate 0-byte one:
+    there is no real per-packet size to bound against, so only the floored
+    `by_duration` applies.
     """
     by_duration = int(QUEUE_BUFFER_SECONDS * 1000 / packet_ms)
+    floored = max(MIN_QUEUE_PACKETS, by_duration)
     if bytes_per_packet > 0:
         by_bytes = int(MAX_QUEUE_BYTES / bytes_per_packet)
-    else:
-        by_bytes = by_duration
-    return max(MIN_QUEUE_PACKETS, min(by_duration, by_bytes))
+        return min(floored, by_bytes)
+    return floored
 
 
 def _packet_ms(value: str) -> int:
@@ -226,10 +252,12 @@ def record_command(args) -> int:
         # below - would leave source.stop() uncalled: nothing else in the
         # process would restore the switch interval or re-enable GC (see
         # the equivalent fix inside source.start() itself, in
-        # biocam/interop/source.py). source.stop() is idempotent (see its
-        # own docstring), so calling it here even when start() itself is
-        # what failed is safe and a no-op beyond what start()'s own
-        # failure path already cleaned up.
+        # biocam/interop/source.py). HIGH 3: stop() has no docstring and is
+        # deliberately not idempotent after a failure - see the module
+        # docstring's FIX 2 paragraph - so calling it here even when
+        # start() itself is what failed is safe (it is guarded below, so a
+        # failure cannot mask start()'s own exception), not a guaranteed
+        # no-op.
         try:
             source.start(packet_timespan_ms=args.packet_ms)
             with RecordingWriter(raw_path, meta_path, params,
@@ -257,12 +285,31 @@ def record_command(args) -> int:
         finally:
             # A safety net, not the primary fix: by the time either call to
             # record_session above returns or raises, stop_source has
-            # already run. stop() is idempotent (see its own docstring) so
-            # this second call is normally a no-op; it only does real work
-            # if something prevented the stop_source call from ever
-            # happening (e.g. an exception before RecordingWriter.__enter__
-            # even ran).
-            source.stop()
+            # already run, so this second call is usually a no-op; it only
+            # does real work if something prevented the stop_source call
+            # from ever happening (e.g. an exception before
+            # RecordingWriter.__enter__ even ran).
+            #
+            # HIGH 3: stop() has no docstring, and it deliberately leaves
+            # its internal _streaming flag True when StopDataStreaming
+            # fails, precisely so a retry calls it again instead of
+            # silently skipping it - so it is not idempotent in general,
+            # and this call can raise. Left unguarded, that raise would
+            # replace whatever exception is already propagating through
+            # this `finally` - e.g. the OSError from a full disk that the
+            # `with RecordingWriter` block above is unwinding from - with a
+            # confusing, unrelated one about the stream failing to stop.
+            # Same treatment as the sidecar write's own masking fix in
+            # RecordingWriter.__exit__: report it as a warning, never let
+            # it mask the original failure or (on a clean exit) become the
+            # only thing raised.
+            try:
+                source.stop()
+            except Exception as exc:
+                warnings.warn(
+                    f"source.stop() failed during cleanup: {exc}",
+                    RuntimeWarning,
+                )
 
     # Gate 1, item F: queue_overflows and driver_loss_events get the same
     # end-of-run visibility callback_errors already had - a run that dropped

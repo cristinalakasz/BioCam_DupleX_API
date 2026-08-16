@@ -256,6 +256,60 @@ def test_events_are_emitted_to_the_listener(tmp_path):
     assert seen[-1].verdict == "gaps_detected"
 
 
+# --- MEDIUM 4: a listener exception must not abort the recording ---
+
+def test_a_listener_that_raises_does_not_abort_write_packet(tmp_path):
+    """print() raises OSError on a broken stdout; describe() raises
+    TypeError for an event type it does not recognise. Either must be
+    counted and swallowed, not allowed to propagate out of write_packet()
+    and lose the rest of the recording."""
+    raw, meta = _paths(tmp_path)
+
+    def exploding_listener(event):
+        raise OSError("broken stdout")
+
+    with RecordingWriter(raw, meta, PARAMS, listener=exploding_listener) as writer:
+        # __enter__ already emitted RecordingStarted, which the listener
+        # blew up on - one error already, and the write below must still
+        # succeed despite it.
+        assert writer.listener_errors == 1
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.write_packet(timestamp=2, counter=2, payload=_frame([5, 6, 7, 8]))
+        writer.finalise("duration_reached")
+        # finalise() emits RecordingStopped - one more error.
+        assert writer.listener_errors == 2
+
+    # The recording itself is unaffected - both packets made it to disk.
+    assert raw.read_bytes() == _frame([1, 2, 3, 4, 5, 6, 7, 8])
+    assert read_sidecar(meta)["status"] == "complete"
+
+
+def test_a_listener_that_raises_does_not_abort_finalise(tmp_path):
+    raw, meta = _paths(tmp_path)
+    calls = []
+
+    def flaky_listener(event):
+        calls.append(event)
+        if len(calls) > 1:  # let RecordingStarted through, fail afterwards
+            raise TypeError("unrecognised event")
+
+    with RecordingWriter(raw, meta, PARAMS, listener=flaky_listener) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+        assert writer.listener_errors >= 1
+
+    assert read_sidecar(meta)["status"] == "complete"
+
+
+def test_listener_errors_default_to_zero_when_the_listener_behaves(tmp_path):
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+    assert writer.listener_errors == 0
+
+
 def test_verdict_unknown_when_the_sidecar_predates_schema_2():
     assert integrity_verdict({"total_channels": 4096}) == "unknown"
 

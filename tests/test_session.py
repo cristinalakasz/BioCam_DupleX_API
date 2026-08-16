@@ -205,7 +205,18 @@ def test_a_drain_that_exceeds_the_deadline_counts_what_it_abandons(tmp_path, mon
     """FIX 1: a source that keeps yielding must not hang record_session
     forever - the drain gives up at DRAIN_DEADLINE_SEC, and whatever is
     still sitting in the source's buffer at that point is counted into
-    discarded_at_stop rather than silently dropped."""
+    discarded_at_stop rather than silently dropped.
+
+    _FakeDrainSource never sets `stopped` True on its own (stop() only
+    increments stop_calls, and stop_source() is not called until after this
+    drain's own loop has already exited) - unlike the real CLI's
+    KeyboardInterrupt retry, where the preceding non-drain call's
+    stop_source() already sets it before this drain call even starts. So
+    per MEDIUM 6, this reports the more specific
+    "drain_deadline_exceeded_unconfirmed_stop", not plain
+    "drain_deadline_exceeded" - see
+    test_a_drain_that_exceeds_the_deadline_with_a_confirmed_stop_reports_the_plain_reason
+    below for that case."""
     monkeypatch.setattr("biocam.session.DRAIN_DEADLINE_SEC", 0.05)
     raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
     # Far more packets than can be popped inside a 0.05 s deadline at a
@@ -216,7 +227,7 @@ def test_a_drain_that_exceeds_the_deadline_counts_what_it_abandons(tmp_path, mon
         result = record_session(source, writer, drain=True, counters=source,
                                 stop_source=source.stop)
 
-    assert result.stop_reason == "drain_deadline_exceeded"
+    assert result.stop_reason == "drain_deadline_exceeded_unconfirmed_stop"
     written = result.n_frames
     abandoned = source.pending_count()
     assert written > 0
@@ -225,6 +236,130 @@ def test_a_drain_that_exceeds_the_deadline_counts_what_it_abandons(tmp_path, mon
     integrity = read_sidecar(meta)["integrity"]
     assert integrity["discarded_at_stop"] == abandoned
     assert result.verdict != "clean"
+
+
+def test_a_drain_that_exceeds_the_deadline_with_a_confirmed_stop_reports_the_plain_reason(
+        tmp_path, monkeypatch):
+    """MEDIUM 6: the shape a real drain call normally has - the source's own
+    `stopped` flag already True before the drain loop starts, because the
+    preceding non-drain call's stop_source() already set it (see cli.py's
+    KeyboardInterrupt retry) - must still report the plain
+    "drain_deadline_exceeded", not the "...unconfirmed_stop" variant that
+    exists to flag the opposite, more concerning case."""
+    monkeypatch.setattr("biocam.session.DRAIN_DEADLINE_SEC", 0.05)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeDrainSource(n_packets=1000, pop_delay=0.02)
+    source.stopped = True
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, drain=True, counters=source,
+                                stop_source=source.stop)
+
+    assert result.stop_reason == "drain_deadline_exceeded"
+
+
+def test_a_backlog_still_buffered_when_duration_is_reached_is_drained_not_discarded(tmp_path):
+    """CRITICAL 1: pending_count() pops and discards, so record_session's
+    `finally` used to throw away whatever was still buffered - real,
+    already-acquired, immediately-drainable data - the moment a normal
+    (non-drain) stop condition landed mid-burst, counting it into
+    discarded_at_stop and forcing a false gaps_detected verdict. This is
+    what essentially every successful timed run looked like in practice
+    (the consumer sleeps when the queue empties and so runs in bursts; the
+    frame limit essentially never lands exactly on a burst's last packet).
+    The backlog must be drained into the writer first - only what survives
+    a short deadline counts as genuinely abandoned."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    # frame_rate_hz=1000 in PARAMS, 1 frame per packet (see _FakeDrainSource) -
+    # 0.05 s of duration is a 50-frame/50-packet limit, well short of the
+    # 100 packets buffered, so the main loop breaks on duration_reached with
+    # 50 packets still sitting in the source's buffer.
+    source = _FakeDrainSource(n_packets=100)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, duration_sec=0.05,
+                                counters=source, stop_source=source.stop)
+
+    assert result.stop_reason == "duration_reached"
+    assert result.n_frames == 100  # all 100 packets, not just the first 50
+    assert source.pending_count() == 0
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == 0
+    assert result.verdict == "clean"
+    assert source.stop_calls == 1
+
+
+def test_a_backlog_that_outlives_the_finally_drain_deadline_is_counted_abandoned(
+        tmp_path, monkeypatch):
+    """CRITICAL 1's drain is itself bounded, the same way the drain=True
+    path is: a backlog that does not finish arriving before
+    DRAIN_DEADLINE_SEC elapses is genuinely abandoned and must still be
+    counted, not silently dropped nor waited on forever."""
+    monkeypatch.setattr("biocam.session.DRAIN_DEADLINE_SEC", 0.05)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    # duration_sec=0.01 s at PARAMS' 1 kHz frame rate is a 10-frame limit -
+    # the main loop breaks on duration_reached after 10 of the 1000
+    # packets, leaving 990 buffered. The finally-block drain then pops a
+    # few more (0.02 s/pop) before DRAIN_DEADLINE_SEC cuts it off.
+    source = _FakeDrainSource(n_packets=1000, pop_delay=0.02)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, duration_sec=0.01,
+                                counters=source, stop_source=source.stop)
+
+    assert result.stop_reason == "duration_reached"
+    written = result.n_frames
+    abandoned = source.pending_count()
+    assert written > 10  # more than the main loop alone wrote
+    assert abandoned > 0
+    assert written + abandoned == 1000
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["discarded_at_stop"] == abandoned
+    assert result.verdict != "clean"
+
+
+class _FakeCumulativeCountsSource:
+    """A source whose loss/overflow/error counters are cumulative totals,
+    like the real DriverPacketSource - used to prove record_session's
+    `finally` does not double them when called twice against one writer,
+    the way cli.py's KeyboardInterrupt retry does (CRITICAL 2)."""
+
+    def __init__(self, n_packets, driver_loss_events=0, queue_overflows=0,
+                callback_errors=0):
+        self._packets = [
+            Packet(timestamp=i, counter=i,
+                  payload=np.arange(4, dtype=np.uint16).tobytes())
+            for i in range(n_packets)
+        ]
+        self.driver_loss_events = driver_loss_events
+        self.queue_overflows = queue_overflows
+        self.callback_errors = callback_errors
+
+    def __iter__(self):
+        return iter(self._packets)
+
+
+def test_two_record_session_calls_against_one_writer_do_not_double_the_loss_counters(
+        tmp_path):
+    """CRITICAL 2: note_driver_loss/note_queue_overflow/note_callback_errors
+    receive the source's cumulative totals on every call - record_session's
+    `finally` runs on every call, and cli.py calls record_session twice
+    against the same writer on the KeyboardInterrupt path (the normal call,
+    then the drain=True retry). If these were still `+=` accumulators
+    instead of setters, a source reporting 7 driver-loss events would write
+    14 to the sidecar, not 7."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeCumulativeCountsSource(
+        4, driver_loss_events=7, queue_overflows=3, callback_errors=1)
+
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(source, writer, counters=source)
+        record_session(source, writer, counters=source)
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["driver_loss_events"] == 7
+    assert integrity["queue_overflows"] == 3
+    assert integrity["callback_errors"] == 1
 
 
 def test_sidecar_with_nonzero_discarded_at_stop_never_reports_clean(tmp_path):

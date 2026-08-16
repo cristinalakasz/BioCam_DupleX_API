@@ -11,8 +11,14 @@ parameters and an honest marker that it was never finished.
 Every sidecar write is atomic (temp file + os.replace - see _write_sidecar)
 and a failure writing the __exit__ failure sidecar can never mask whatever
 exception is already propagating (see __exit__). The writer also watches free
-disk space and fsyncs periodically, on the consumer thread only - see
-DEFAULT_MIN_FREE_BYTES and DEFAULT_UPKEEP_INTERVAL_FRAMES below.
+disk space periodically, on the consumer thread only - see
+DEFAULT_MIN_FREE_BYTES and DEFAULT_UPKEEP_INTERVAL_FRAMES below. It fsyncs the
+raw file exactly once, in finalise() - MEDIUM 5: earlier drafts of this
+docstring (and of _periodic_upkeep's) claimed the periodic upkeep pass also
+fsyncs and so bounds the power-loss exposure window to one interval. It does
+not: _periodic_upkeep only flushes, which is a much weaker guarantee (see
+_periodic_upkeep below), so that window is "the entire run" until finalise()
+runs, not "at most one interval".
 """
 
 import json
@@ -50,10 +56,12 @@ VERDICT_UNKNOWN = "unknown"
 DEFAULT_MIN_FREE_BYTES = 2 * 1024 ** 3  # 2 GiB
 
 # How often (in frames written, not packets) the writer calls
-# shutil.disk_usage() and flushes/fsyncs the raw file (FIX 3 and FIX 4 share
-# one interval, per the task: both are "check something expensive every so
-# often, on the consumer thread, never in the callback"). Frames arrive at up
-# to ~18.5 kHz; doing either of these on every packet would mean tens of
+# shutil.disk_usage() and flushes the raw file (FIX 3 and FIX 4 share one
+# interval, per the task: both are "check something expensive every so
+# often, on the consumer thread, never in the callback"). MEDIUM 5: this is
+# a flush, not an fsync - it pushes bytes to the OS cache, not to disk; only
+# finalise() fsyncs (once, at the end of the run). Frames arrive at up to
+# ~18.5 kHz; doing either of these on every packet would mean tens of
 # thousands of syscalls per second on a path that sits downstream of the
 # time-critical callback. Every 50,000 frames is a couple of seconds at
 # typical frame rates - frequent enough to catch a filling disk or bound the
@@ -132,6 +140,10 @@ class RecordingWriter:
         self._gaps_emitted = 0
         self._gaps_since_summary = 0
         self._frames_missing_since_summary = 0
+        # MEDIUM 4: exceptions raised by the listener itself, e.g. print()
+        # on a broken stdout (OSError) or describe() meeting an event type
+        # it does not recognise (TypeError). See _emit() below.
+        self._listener_errors = 0
 
     def __enter__(self):
         self._raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,13 +217,39 @@ class RecordingWriter:
             self._periodic_upkeep()
 
     def note_driver_loss(self, count: int = 1) -> None:
-        self._driver_loss += count
+        """Record the driver's cumulative data-loss count.
+
+        CRITICAL 2: this used to be `+=`, but `count` is always the
+        source's own *cumulative* total (see session.py:
+        `writer.note_driver_loss(getattr(counters, "driver_loss_events",
+        0))`), not an increment - so `+=` doubled it every extra time
+        record_session's `finally` ran against the same writer. cli.py's
+        KeyboardInterrupt path does exactly that: the normal call, then the
+        drain=True retry, both against the same RecordingWriter. Assigning
+        instead of accumulating makes repeated calls with the same
+        cumulative value idempotent, matching what the value actually
+        means. The method name and signature are unchanged - other code
+        calls this expecting "record what the source reports now".
+        """
+        self._driver_loss = count
 
     def note_queue_overflow(self, count: int = 1) -> None:
-        self._queue_overflows += count
+        """Record the cumulative count of packets dropped by our own queue.
+
+        See note_driver_loss() above - same CRITICAL 2 fix, same reasoning:
+        `count` is a cumulative total, so this assigns rather than
+        accumulates.
+        """
+        self._queue_overflows = count
 
     def note_callback_errors(self, count: int = 1) -> None:
-        self._callback_errors += count
+        """Record the cumulative count of exceptions raised in a callback.
+
+        See note_driver_loss() above - same CRITICAL 2 fix, same reasoning:
+        `count` is a cumulative total, so this assigns rather than
+        accumulates.
+        """
+        self._callback_errors = count
 
     def note_discarded(self, count: int = 1) -> None:
         """Record packets that were acquired but never made it into the file.
@@ -289,13 +327,36 @@ class RecordingWriter:
         """Run every DEFAULT_UPKEEP_INTERVAL_FRAMES frames (FIX 3 / FIX 4).
 
         Both a disk-space check and a flush are relatively expensive
-        (a syscall each) and must not run per-packet at up to ~18.5 kHz, but
-        both also matter enough that waiting until finalise() would defeat
-        the point: a periodic flush shrinks the power-loss exposure window
-        from "the entire run" to "at most one interval", and a periodic disk
-        check is the only way an open-ended (Ctrl+C) recording ever learns
-        the disk is filling at all. Runs on the consumer thread (write_packet
-        is called from record_session's loop), never inside DataReceived.
+        (a syscall each) and must not run per-packet at up to ~18.5 kHz.
+        The disk check matters enough that waiting until finalise() would
+        defeat the point: it is the only way an open-ended (Ctrl+C)
+        recording ever learns the disk is filling at all.
+
+        MEDIUM 5: the flush is honest about what it is not. Earlier drafts
+        of this docstring claimed it "shrinks the power-loss exposure
+        window from the entire run to at most one interval" - that would be
+        true of an fsync, but flush() only pushes bytes from Python's
+        buffered-writer object to the OS page cache, not to the physical
+        disk; only os.fsync() (called once, in finalise()) does that, so
+        the real exposure window is the whole run, not one interval. Worse,
+        this call is close to a no-op even on its own terms: `open(...,
+        "wb")`'s default buffer is 8 KiB, and acquisition payloads
+        (multiple channels x samples per packet) routinely exceed that, so
+        each write_packet() call already flushes the previous buffered
+        remainder to the OS on its own - there is rarely anything left
+        buffered for this call to push. It is kept anyway, harmless and
+        cheap, in case a run with very small acquisition parameters ever
+        does leave something in the buffer between upkeep intervals - but
+        it must not be read as a durability guarantee. Fsyncing here
+        instead was considered and rejected for this Gate 1 pass: it would
+        add a real disk-bound stall on the consumer thread every
+        DEFAULT_UPKEEP_INTERVAL_FRAMES frames, and a consumer that stalls
+        is exactly what fills the queue and starts dropping packets in the
+        callback (see CLAUDE.md's callback rule) - a cost/latency trade
+        that has not been measured against real lab hardware and should not
+        be made silently as a side effect of fixing a docstring. Runs on
+        the consumer thread (write_packet is called from record_session's
+        loop), never inside DataReceived.
         """
         if self._file is not None:
             self._file.flush()
@@ -310,6 +371,14 @@ class RecordingWriter:
     @property
     def disk_low(self) -> bool:
         return self._disk_low
+
+    @property
+    def listener_errors(self) -> int:
+        """Count of exceptions the listener raised (MEDIUM 4). Not part of
+        the sidecar's integrity block - a console/UI failure is not itself
+        evidence about the recording's data - but exposed so a caller can
+        still notice and report it."""
+        return self._listener_errors
 
     @property
     def n_frames_written(self) -> int:
@@ -351,8 +420,24 @@ class RecordingWriter:
         return VERDICT_CLEAN
 
     def _emit(self, event) -> None:
+        """Hand an event to the listener, if any, without letting it abort
+        the recording (MEDIUM 4).
+
+        The listener runs arbitrary caller code on the consumer thread:
+        cli.py's default listener calls print(), which raises OSError on a
+        broken stdout, and describe() raises TypeError for an event type it
+        does not recognise - a live risk the moment a ninth event type is
+        added here without a matching describe() branch. Losing the
+        console (or any other listener) is not a reason to lose the
+        experiment, so a listener failure is counted and swallowed, not
+        allowed to propagate out of write_packet()/finalise() and abort the
+        recording.
+        """
         if self._listener is not None:
-            self._listener(event)
+            try:
+                self._listener(event)
+            except Exception:
+                self._listener_errors += 1
 
     def emit(self, event) -> None:
         """Public counterpart to _emit(), for callers outside this class.

@@ -103,13 +103,27 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     own, later call to source.stop() surfaces a persistent failure instead.
 
     Once stop_source has run, whatever is still sitting in `counters`'
-    queue cannot arrive by any other route, so it is counted into
+    queue cannot arrive by any other route. CRITICAL 1: `pending_count()`
+    does not peek - it pops and discards - so it must never be called
+    before that backlog has had a chance to be written. On a normal
+    (non-drain) exit this used to call it directly, throwing away real,
+    already-acquired, immediately-drainable data every time the frame limit
+    landed mid-burst (the consumer sleeps when the queue is empty, so it
+    runs in bursts, and the limit essentially never lands exactly on the
+    last packet of one) - forcing a false gaps_detected verdict on
+    essentially every successful timed run. Instead, while not already
+    draining, whatever `counters` still holds is drained into the writer
+    first, against the same DRAIN_DEADLINE_SEC bound the Ctrl+C drain path
+    uses (stop_source has already run by this point, so the backlog is
+    finite and no longer growing); only what is still unwritten when that
+    deadline elapses - or, while already draining, whatever the drain loop
+    above gave up on at its own deadline - is counted into
     discarded_at_stop via `counters.pending_count()` (0 if the method is
-    absent) - except when this call is itself aborting via an exception
-    (including KeyboardInterrupt): in that case a caller may be about to
-    retry with drain=True to recover exactly that buffered data, and
-    counting it here as discarded would double-count it once the drain call
-    also writes it.
+    absent). This is skipped entirely when this call is itself aborting via
+    an exception (including KeyboardInterrupt): in that case a caller may be
+    about to retry with drain=True to recover exactly that buffered data,
+    and counting or writing it here would double-count it once the drain
+    call also writes it.
 
     While not draining, the loop also breaks - stop_reason
     "source_stopped" - as soon as `counters.stopped` reads True (False if
@@ -180,7 +194,27 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 break
             if drain:
                 if time.monotonic() >= deadline:
-                    stop_reason = "drain_deadline_exceeded"
+                    # MEDIUM 6: previously the only two ways out of a drain
+                    # were exhaustion and this deadline, so a source whose
+                    # own stop was never confirmed (`stopped` still False -
+                    # e.g. stop() failing while the driver keeps producing)
+                    # looked identical in the sidecar to the routine case of
+                    # simply draining a large, genuinely bounded backlog
+                    # past DRAIN_DEADLINE_SEC: both just read
+                    # "drain_deadline_exceeded". `stopped` is normally
+                    # already True by the time a drain call starts (the
+                    # preceding non-drain call's own stop_source() sets it
+                    # before returning/raising - see cli.py's
+                    # KeyboardInterrupt retry), so this only fires the
+                    # distinct reason when that confirmation never
+                    # happened - it cannot, by itself, prove the driver
+                    # actually stopped producing (Layer 1, unverifiable
+                    # here), only that this drain never observed the signal
+                    # that it had.
+                    stopped = (getattr(counters, "stopped", False)
+                              if counters is not None else False)
+                    stop_reason = ("drain_deadline_exceeded" if stopped
+                                  else "drain_deadline_exceeded_unconfirmed_stop")
                     break
                 continue
             if stop_event is not None and stop_event.is_set():
@@ -215,6 +249,22 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 pass
         if not interrupted and counters is not None:
             get_pending = getattr(counters, "pending_count", None)
+            if not drain and callable(get_pending):
+                # CRITICAL 1: pending_count() pops and discards, so it must
+                # never be the first thing that touches this backlog. By
+                # this point stop_source() has already run (above), so the
+                # queue is finite and no longer growing - drain it into the
+                # writer, exactly as the drain=True loop above does, before
+                # deciding what (if anything) is genuinely abandoned.
+                drain_deadline = time.monotonic() + DRAIN_DEADLINE_SEC
+                for packet in counters:
+                    writer.write_packet(
+                        timestamp=packet.timestamp,
+                        counter=packet.counter,
+                        payload=packet.payload,
+                    )
+                    if time.monotonic() >= drain_deadline:
+                        break
             pending = get_pending() if callable(get_pending) else 0
             if pending:
                 writer.note_discarded(pending)
