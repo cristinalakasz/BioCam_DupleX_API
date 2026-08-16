@@ -66,13 +66,18 @@ behaviour) - the exception is caught and counted rather than allowed to cross
 back into the .NET dispatcher, whose behavior on a Python exception is
 undocumented and cannot be tested here.
 
-`on_data`, `on_loss`, and `on_error` each run on their own driver-raised
-thread (`DataReceived`, `DataLossAsync` - documented as asynchronous - and
-`DataStreamingError` respectively), so each handler increments its own
-private error counter rather than sharing one: `+=` on a shared attribute is
-load-add-store, not atomic, and increments from two threads can be lost.
-`callback_errors` sums the three when read, which is safe because summing
-ints is not a read-modify-write of any of the counters themselves.
+`on_data`, `on_loss`, and `on_error` are assumed here to each run on their
+own driver-raised thread. The XML documents this explicitly only for
+`DataLossAsync` (as asynchronous); it says nothing about the threading model
+of `DataReceived` or `DataStreamingError`, so treating those two as running
+on separate threads as well is our own inference, not documented behaviour -
+untested here and worth confirming in the lab. Using a separate counter per
+handler is correct regardless of whether that inference holds: even if two
+of the three turned out to share a thread, `+=` on a shared attribute would
+still not be atomic (load-add-store), so keeping the counters apart costs
+nothing and loses nothing either way. `callback_errors` sums the three when
+read, which is safe because summing ints is not a read-modify-write of any
+of the counters themselves.
 
 `start()` also tightens `sys.setswitchinterval` and disables cyclic garbage
 collection for the duration of the stream, restoring both, unconditionally,
@@ -369,8 +374,6 @@ class DriverPacketSource:
         # subscribing rather than assuming a clean slate.
         self._unsubscribe(biocam)
 
-        self._apply_runtime_tuning()
-
         def on_data(_sender, args):
             try:
                 header = args.Header  # read once - saves a marshaling
@@ -421,11 +424,29 @@ class DriverPacketSource:
         self._loss_handler = on_loss
         self._error_handler = on_error
 
-        biocam.DataReceived += self._handler
-        biocam.DataLossAsync += self._loss_handler
-        biocam.DataStreamingError += self._error_handler
-
+        # Gate 1, item A: runtime tuning and all three event subscriptions
+        # now happen inside this try, not before it. Previously
+        # `biocam.DataReceived += ...` etc. and `_apply_runtime_tuning()`
+        # ran ahead of the try block below, even though that block's own
+        # comment claimed to guard against a failed start leaving handlers
+        # subscribed - so an exception raised while attaching a handler (or
+        # while tuning) escaped uncaught: GC stayed disabled, the switch
+        # interval stayed tightened, and any handler that had already
+        # attached stayed subscribed for the rest of the process. Nothing
+        # else in the process was positioned to undo it either - cli.py used
+        # to call start() outside its own try/finally that calls stop() (see
+        # Gate 1, item A there). Moving both inside the guarded region means
+        # any partial failure - tuning, any one of the three subscriptions,
+        # or StartDataStreaming itself - unsubscribes whatever did attach
+        # and restores both runtime settings before the exception
+        # propagates.
         try:
+            self._apply_runtime_tuning()
+
+            biocam.DataReceived += self._handler
+            biocam.DataLossAsync += self._loss_handler
+            biocam.DataStreamingError += self._error_handler
+
             started = biocam.StartDataStreaming(
                 dataPacketTimeSpanMs=packet_timespan_ms,
                 optimizeDataPacketLatency=True,
@@ -433,7 +454,7 @@ class DriverPacketSource:
             if not started:
                 raise RuntimeError("StartDataStreaming failed.")
         except Exception:
-            # A failed start must not leave three live handlers subscribed:
+            # A failed start must not leave any live handlers subscribed:
             # that leaks a Python closure into the driver for the rest of
             # the process, and a second start() call would leak another set
             # on top of it. Nor should it leave the switch interval/GC

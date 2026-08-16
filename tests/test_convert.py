@@ -82,6 +82,26 @@ def test_discarded_at_stop_is_carried_into_hdf5_attributes(tmp_path):
         assert handle.attrs["integrity_verdict"] != "clean"
 
 
+def test_gaps_truncated_is_carried_into_hdf5_attributes(tmp_path):
+    """Gate 1, item H: gaps_truncated must reach the HDF5 attributes the
+    same way discarded_at_stop already does, so a run whose gap list hit its
+    retention cap is not silently understated in the converted file either."""
+    raw, meta = tmp_path / "r.raw", tmp_path / "r_meta.json"
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=1) as writer:
+        counter = 1
+        writer.write_packet(1, counter, np.arange(4, dtype=np.uint16).tobytes())
+        for _ in range(3):
+            counter += 2
+            writer.write_packet(counter, counter, np.arange(4, dtype=np.uint16).tobytes())
+        writer.finalise("duration_reached")
+
+    out = tmp_path / "r.h5"
+    convert(raw, meta, out)
+    with h5py.File(out, "r") as handle:
+        assert handle.attrs["gaps_truncated"] == 2
+        assert handle.attrs["integrity_verdict"] != "clean"
+
+
 def test_verify_accepts_a_good_conversion(tmp_path):
     raw, meta = _recording(tmp_path)
     out = tmp_path / "r.h5"

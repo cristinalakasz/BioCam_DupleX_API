@@ -4,7 +4,9 @@ import os
 import numpy as np
 import pytest
 
-from biocam.data.events import DiskLow, GapDetected, RecordingStarted, RecordingStopped
+from biocam.data.events import (
+    DiskLow, GapDetected, GapSummary, RecordingStarted, RecordingStopped,
+)
 from biocam.data.recording import (
     SCHEMA_VERSION, AcquisitionParameters, RecordingWriter,
     integrity_verdict, load_recording, read_sidecar,
@@ -434,6 +436,98 @@ def test_disk_check_does_not_run_on_every_packet(tmp_path, monkeypatch):
     # 22 frames at an interval of 5 -> checks after frame 5, 10, 15, 20:
     # four calls, not twenty-two.
     assert len(calls) == 4
+
+
+# --- Gate 1, item G: throttled gap emission ---
+
+def _write_n_one_packet_gaps(writer, n):
+    counter = 1
+    writer.write_packet(timestamp=1, counter=counter, payload=_frame([1, 2, 3, 4]))
+    for _ in range(n):
+        counter += 2  # delta 2 -> exactly one packet (one frame) lost each time
+        writer.write_packet(timestamp=counter, counter=counter, payload=_frame([1, 2, 3, 4]))
+
+
+def test_gap_emission_is_throttled_after_the_full_count(tmp_path):
+    """cli.py prints on the consumer thread - the same thread that is the
+    only thing draining the queue - so one GapDetected per gap under
+    sustained loss would print at the same rate the loss is happening. The
+    first gap_emit_full_count gaps must still be emitted individually;
+    after that, gaps are batched into GapSummary events instead, with a
+    trailing partial summary flushed at finalise()."""
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         gap_emit_full_count=2, gap_summary_interval=3) as writer:
+        _write_n_one_packet_gaps(writer, 9)
+        writer.finalise("duration_reached")
+
+    gap_events = [e for e in seen if isinstance(e, GapDetected)]
+    summary_events = [e for e in seen if isinstance(e, GapSummary)]
+    assert len(gap_events) == 2  # gap_emit_full_count, emitted in full
+    # 9 gaps total: 2 in full, 7 remaining -> two summaries of 3 plus one
+    # trailing summary of 1 (flushed by finalise()).
+    assert [s.n_gaps for s in summary_events] == [3, 3, 1]
+    assert sum(s.n_gaps for s in summary_events) == 7
+
+    # The sidecar keeps every gap regardless of what reached the listener.
+    integrity = read_sidecar(meta)["integrity"]
+    assert len(integrity["gaps"]) == 9
+    assert integrity["gaps_truncated"] == 0
+
+
+def test_gap_summary_is_not_emitted_when_nothing_exceeds_the_full_count(tmp_path):
+    raw, meta = _paths(tmp_path)
+    seen = []
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append,
+                         gap_emit_full_count=5, gap_summary_interval=3) as writer:
+        _write_n_one_packet_gaps(writer, 2)
+        writer.finalise("duration_reached")
+
+    assert len([e for e in seen if isinstance(e, GapDetected)]) == 2
+    assert not [e for e in seen if isinstance(e, GapSummary)]
+
+
+# --- Gate 1, item H: the retained gap list is capped ---
+
+def test_gaps_truncated_appears_in_the_sidecar_when_the_cap_is_exceeded(tmp_path):
+    """Once the retained gap list hits its cap, further gaps are still
+    counted (gaps_truncated) rather than silently understating how much was
+    lost."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=2) as writer:
+        _write_n_one_packet_gaps(writer, 5)
+        writer.finalise("duration_reached")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert len(integrity["gaps"]) == 2
+    assert integrity["gaps_truncated"] == 3
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_verdict_reports_gaps_detected_even_when_all_gaps_are_truncated(tmp_path):
+    """A gap that happened but was not retained (item H) must still flip
+    the verdict away from clean - RecordingWriter.verdict must account for
+    gaps_truncated, not just an empty retained list (item I's has_gaps)."""
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS, max_retained_gaps=0) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.write_packet(timestamp=2, counter=3, payload=_frame([5, 6, 7, 8]))  # 1 lost
+        writer.finalise("duration_reached")
+
+    integrity = read_sidecar(meta)["integrity"]
+    assert integrity["gaps"] == []
+    assert integrity["gaps_truncated"] == 1
+    assert integrity["verdict"] == "gaps_detected"
+
+
+def test_gaps_truncated_defaults_to_zero_on_an_ordinary_run(tmp_path):
+    raw, meta = _paths(tmp_path)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+        writer.finalise("duration_reached")
+
+    assert read_sidecar(meta)["integrity"]["gaps_truncated"] == 0
 
 
 # --- FIX 4: finalise fsyncs, not just flushes ---

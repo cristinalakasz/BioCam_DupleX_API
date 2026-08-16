@@ -5,9 +5,12 @@ import time
 import numpy as np
 import pytest
 
+from biocam.data.events import DriverDataLoss, QueueOverflow
 from biocam.data.recording import AcquisitionParameters, RecordingWriter, read_sidecar
 from biocam.data.replay import Packet, ReplayPacketSource
-from biocam.session import DRAIN_DEADLINE_SEC, SessionResult, record_session
+from biocam.session import (
+    COUNTER_CHECK_INTERVAL_PACKETS, DRAIN_DEADLINE_SEC, SessionResult, record_session,
+)
 
 PARAMS = AcquisitionParameters(
     frame_rate_hz=1000.0, total_channels=4, ch_sample_byte_size=2, bit_depth=12,
@@ -237,6 +240,85 @@ def test_sidecar_with_nonzero_discarded_at_stop_never_reports_clean(tmp_path):
     record = read_sidecar(meta)
     assert record["integrity"]["discarded_at_stop"] == 3
     assert record["integrity"]["verdict"] != "clean"
+
+
+class _FakeCounterSource:
+    """A source whose queue_overflows / driver_loss_events change partway
+    through iteration, the way the real DriverPacketSource's counters move
+    on the driver's own callback thread(s) while record_session's loop
+    consumes packets on the consumer thread."""
+
+    def __init__(self, n_packets, overflow_at=None, loss_at=None):
+        self._packets = [
+            Packet(timestamp=i, counter=i,
+                   payload=np.arange(4, dtype=np.uint16).tobytes())
+            for i in range(n_packets)
+        ]
+        self.queue_overflows = 0
+        self.driver_loss_events = 0
+        self.callback_errors = 0
+        self._overflow_at = overflow_at
+        self._loss_at = loss_at
+
+    def __iter__(self):
+        for index, packet in enumerate(self._packets):
+            if self._overflow_at is not None and index == self._overflow_at:
+                self.queue_overflows = 5
+            if self._loss_at is not None and index == self._loss_at:
+                self.driver_loss_events = 3
+            yield packet
+
+
+def test_queue_overflow_and_driver_data_loss_are_emitted_when_counters_move(tmp_path):
+    """Gate 1, item F: before this, nothing ever constructed QueueOverflow
+    or DriverDataLoss - the only record of dropped data was the sidecar,
+    read after the run was over. record_session must notice the source's
+    counters moving during the run and emit through the writer's listener,
+    the same one GapDetected/DiskLow already use."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    n_packets = COUNTER_CHECK_INTERVAL_PACKETS * 2 + 5
+    source = _FakeCounterSource(n_packets, overflow_at=10, loss_at=20)
+    seen = []
+
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append) as writer:
+        record_session(source, writer, counters=source)
+
+    overflow_events = [e for e in seen if isinstance(e, QueueOverflow)]
+    loss_events = [e for e in seen if isinstance(e, DriverDataLoss)]
+    assert overflow_events and overflow_events[-1].total == 5
+    assert loss_events and loss_events[-1].total == 3
+    # Each counter only moved once, so exactly one event each - the check is
+    # throttled to every COUNTER_CHECK_INTERVAL_PACKETS packets (plus one
+    # trailing flush), not run - and not emitted - on every packet.
+    assert len(overflow_events) == 1
+    assert len(loss_events) == 1
+
+
+def test_counter_move_below_the_check_interval_still_surfaces_via_trailing_flush(tmp_path):
+    """A run shorter than COUNTER_CHECK_INTERVAL_PACKETS never hits the
+    periodic check inside the loop - the trailing check in the `finally`
+    must still catch a counter that moved."""
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeCounterSource(5, overflow_at=2)
+    seen = []
+
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append) as writer:
+        record_session(source, writer, counters=source)
+
+    overflow_events = [e for e in seen if isinstance(e, QueueOverflow)]
+    assert len(overflow_events) == 1
+    assert overflow_events[0].total == 5
+
+
+def test_no_counter_events_emitted_when_nothing_moves(tmp_path):
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    source = _FakeCounterSource(5)
+    seen = []
+
+    with RecordingWriter(raw, meta, PARAMS, listener=seen.append) as writer:
+        record_session(source, writer, counters=source)
+
+    assert not [e for e in seen if isinstance(e, (QueueOverflow, DriverDataLoss))]
 
 
 class _FakeErroringSource:

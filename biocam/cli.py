@@ -44,7 +44,7 @@ import threading
 import time
 from pathlib import Path
 
-from biocam.data.events import DiskLow, describe
+from biocam.data.events import DiskLow, DriverDataLoss, QueueOverflow, describe
 from biocam.data.recording import AcquisitionParameters, RecordingWriter
 from biocam.preflight import bytes_per_second, check_disk_space
 from biocam.session import record_session
@@ -54,38 +54,100 @@ from biocam.session import record_session
 # only comes out to 2000 packets at the 1 ms default. Sizing the queue with a
 # fixed packet count instead of this formula would silently redefine "two
 # seconds" at any other --packet-ms: 10 ms packets would need only ~200 of
-# them for two seconds, while a fixed 2000-packet queue at 10 ms packets would
-# ask for roughly 3 GB. MIN_QUEUE_SIZE keeps a long packet period (few
-# packets, but a burst can still arrive) from being sized down to something
-# that overflows immediately.
+# them for two seconds.
 QUEUE_BUFFER_SECONDS = 2.0
-MIN_QUEUE_SIZE = 100
+
+# Gate 1, item D: MAX_QUEUE_BYTES replaces a fixed packet-count floor
+# (formerly MIN_QUEUE_SIZE = 100) that dominated _queue_size_for() above
+# roughly a 20 ms packet period. Because the queue is sized in *packets* but
+# a packet's byte size grows with packet_ms, a fixed packet floor makes the
+# buffered *duration* - and worst-case memory - grow with packet_ms instead
+# of staying bounded: 100 packets at 250 ms (the documented ceiling - see
+# MAX_PACKET_MS below) is roughly 25 s of the full BioCAM DupleX config
+# (4096 channels, 2 bytes/sample, ~18.5 kHz), about 3.8 GB - the exact
+# multi-gigabyte outcome QUEUE_BUFFER_SECONDS's own reasoning above argues
+# against, and it is reached only once the writer is already falling behind,
+# which is the worst possible moment to be committing 3.8 GB. 512 MiB is
+# generous headroom for a writer that is briefly slow, while being nowhere
+# near "claims all available memory" territory.
+MAX_QUEUE_BYTES = 512 * 1024 ** 2  # 512 MiB
+
+# Packet-count floor, independent of MAX_QUEUE_BYTES: even at the longest
+# documented packet period (250 ms), the queue should still hold a handful
+# of packets rather than being sized down to almost nothing. 8 packets at
+# 250 ms is already what QUEUE_BUFFER_SECONDS's duration formula gives on its
+# own (2.0 s / 0.25 s = 8), so this floor is a safety net for callers outside
+# the documented range, not a value that changes behaviour within it.
+MIN_QUEUE_PACKETS = 8
+
+# Documented Acquisition Time Period range - 3Brain BioCamDriverAPI v2.6
+# Introduction, page 7: "The API can be set to operate with a custom
+# Acquisition Time Period (ATP ...) between 1ms and 250ms." Anything above
+# this is accepted by argparse's own int parsing but rejected by the driver
+# only after StartDataStreaming has already claimed the device - refusing it
+# here means the CLI never opens the device for a value the driver was never
+# going to accept.
+MAX_PACKET_MS = 250
 
 
-def _queue_size_for(packet_ms: int) -> int:
-    """Queue capacity for roughly QUEUE_BUFFER_SECONDS of packets at the
-    chosen acquisition period, with a floor."""
-    return max(MIN_QUEUE_SIZE, int(QUEUE_BUFFER_SECONDS * 1000 / packet_ms))
+def _bytes_per_packet(params: AcquisitionParameters, packet_ms: int) -> float:
+    """Expected payload size of one packet at the chosen acquisition period.
+
+    Queue sizing happens before source.start(), so no real packet has been
+    measured yet - this is the size the driver is expected to deliver:
+    frame_rate_hz * packet_ms / 1000 frames per packet, each bytes_per_frame
+    bytes.
+    """
+    return params.bytes_per_frame * params.frame_rate_hz * packet_ms / 1000.0
+
+
+def _queue_size_for(packet_ms: int, bytes_per_packet: float) -> int:
+    """Queue capacity in packets, bounded by both duration and bytes.
+
+    Two independent ceilings, plus a floor:
+      - `by_duration`: roughly QUEUE_BUFFER_SECONDS of packets at the chosen
+        acquisition period - what governs at short packet periods, where
+        each packet is small.
+      - `by_bytes`: as many packets as fit under MAX_QUEUE_BYTES at the
+        chosen packet size - what has to govern instead at long packet
+        periods, where a fixed packet-count floor would otherwise let the
+        buffered duration (and worst-case memory) grow without bound (Gate 1,
+        item D).
+      - MIN_QUEUE_PACKETS as a floor under both, so a very long packet
+        period still buffers a few packets rather than being sized to
+        (near-)zero.
+    """
+    by_duration = int(QUEUE_BUFFER_SECONDS * 1000 / packet_ms)
+    if bytes_per_packet > 0:
+        by_bytes = int(MAX_QUEUE_BYTES / bytes_per_packet)
+    else:
+        by_bytes = by_duration
+    return max(MIN_QUEUE_PACKETS, min(by_duration, by_bytes))
 
 
 def _packet_ms(value: str) -> int:
-    """argparse type for --packet-ms: a positive integer.
+    """argparse type for --packet-ms: an integer in the documented range.
 
-    argparse's own `type=int` accepts 0 and negative values - 0 would divide
-    by zero in _queue_size_for(), and a negative value would silently floor
-    to MIN_QUEUE_SIZE instead of being rejected. Catching that here means the
-    CLI refuses before the device is even opened, with a message that names
-    the valid range, instead of dying inside queue sizing or accepting
-    nonsense.
+    argparse's own `type=int` accepts 0, negative values, and anything above
+    the driver's documented ceiling. 0 would divide by zero in
+    _queue_size_for(), a negative value would silently floor to
+    MIN_QUEUE_PACKETS instead of being rejected, and a value above
+    MAX_PACKET_MS would claim the device via BioCamDevice() and only then
+    fail inside StartDataStreaming - defeating the point of validating here.
+    Catching all of it in this type function means the CLI refuses before
+    the device is even opened, with a message that names the valid range.
     """
     try:
         parsed = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"--packet-ms must be a positive integer (>= 1), got {value!r}")
-    if parsed < 1:
+            f"--packet-ms must be an integer between 1 and {MAX_PACKET_MS}, "
+            f"got {value!r}")
+    if parsed < 1 or parsed > MAX_PACKET_MS:
         raise argparse.ArgumentTypeError(
-            f"--packet-ms must be a positive integer (>= 1), got {parsed}")
+            f"--packet-ms must be between 1 and {MAX_PACKET_MS} ms "
+            "(3Brain BioCamDriverAPI v2.6 Introduction, page 7), "
+            f"got {parsed}")
     return parsed
 
 
@@ -99,8 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--name", type=str, default=None,
                         help="base name for the output files")
     record.add_argument("--output-dir", type=str, default="recordings")
-    record.add_argument("--packet-ms", type=_packet_ms, default=1,
-                        help="acquisition period in milliseconds (positive integer, >= 1)")
+    record.add_argument(
+        "--packet-ms", type=_packet_ms, default=2,
+        help="acquisition period in milliseconds (integer, 1-250; default 2, "
+             "matching 3Brain's own SampleApp_BioCamCL default "
+             "(MainForm.Designer.cs) rather than the most aggressive "
+             "documented setting - doubles the callback budget at no cost, "
+             "reversible once issue #12 measures real callback latency)")
 
     convert = sub.add_parser("convert", help="convert a recording to HDF5")
     convert.add_argument("raw")
@@ -150,10 +217,21 @@ def record_command(args) -> int:
                                required_bytes=int(args.duration * rate)))
                 return 1
 
-        source = DriverPacketSource(device, queue_size=_queue_size_for(args.packet_ms),
-                                    listener=report)
-        source.start(packet_timespan_ms=args.packet_ms)
+        queue_size = _queue_size_for(
+            args.packet_ms, _bytes_per_packet(params, args.packet_ms))
+        source = DriverPacketSource(device, queue_size=queue_size, listener=report)
+        # Gate 1, item A: start() now lives inside the try whose finally
+        # calls source.stop(). Previously start() ran outside this try
+        # entirely, so a failure here - or one from the recording writer
+        # below - would leave source.stop() uncalled: nothing else in the
+        # process would restore the switch interval or re-enable GC (see
+        # the equivalent fix inside source.start() itself, in
+        # biocam/interop/source.py). source.stop() is idempotent (see its
+        # own docstring), so calling it here even when start() itself is
+        # what failed is safe and a no-op beyond what start()'s own
+        # failure path already cleaned up.
         try:
+            source.start(packet_timespan_ms=args.packet_ms)
             with RecordingWriter(raw_path, meta_path, params,
                                  listener=report) as writer:
                 try:
@@ -186,6 +264,14 @@ def record_command(args) -> int:
             # even ran).
             source.stop()
 
+    # Gate 1, item F: queue_overflows and driver_loss_events get the same
+    # end-of-run visibility callback_errors already had - a run that dropped
+    # data says so on the console, not only in the sidecar (which is the
+    # only place it showed up before this, read only after the run is over).
+    if source.queue_overflows:
+        print(describe(QueueOverflow(total=source.queue_overflows)))
+    if source.driver_loss_events:
+        print(describe(DriverDataLoss(total=source.driver_loss_events)))
     if source.callback_errors:
         print(f"CALLBACK ERRORS: {source.callback_errors} exceptions raised "
               "inside a driver callback")

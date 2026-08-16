@@ -1,18 +1,63 @@
 import pytest
 
-from biocam.cli import _queue_size_for, build_parser, main
+from biocam.cli import (
+    MAX_PACKET_MS, MAX_QUEUE_BYTES, MIN_QUEUE_PACKETS,
+    _bytes_per_packet, _queue_size_for, build_parser, main,
+)
+from biocam.data.recording import AcquisitionParameters
+
+# The full BioCAM DupleX config (4096 channels, 2 bytes/sample, ~18.5 kHz -
+# the same figures used elsewhere in this codebase, e.g. recording.py's
+# "~152 MB/s" and events.py's RecordingStarted example) - the highest data
+# rate the queue byte ceiling has to hold up against.
+FULL_DEVICE_PARAMS = AcquisitionParameters(
+    frame_rate_hz=18557.720703125, total_channels=4096, ch_sample_byte_size=2,
+    bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+    min_digital_value=0, max_digital_value=4095,
+)
 
 
 def test_queue_size_at_the_1ms_default_matches_the_spec_figure():
-    assert _queue_size_for(1) == 2000
+    bpp = _bytes_per_packet(FULL_DEVICE_PARAMS, 1)
+    assert _queue_size_for(1, bpp) == 2000
 
 
 def test_queue_size_scales_down_for_a_longer_packet_period():
-    assert _queue_size_for(10) == 200
+    bpp = _bytes_per_packet(FULL_DEVICE_PARAMS, 10)
+    assert _queue_size_for(10, bpp) == 200
 
 
 def test_queue_size_has_a_floor_for_a_very_long_packet_period():
-    assert _queue_size_for(5000) == 100
+    # bytes_per_packet=0 disables the byte ceiling (falls back to
+    # by_duration), isolating MIN_QUEUE_PACKETS as the only thing that can
+    # still be governing at an (out-of-range) very long packet period.
+    assert _queue_size_for(5000, 0) == MIN_QUEUE_PACKETS
+
+
+def test_queue_size_never_exceeds_the_byte_ceiling_across_1_to_250ms():
+    """Gate 1, item D: across the full documented --packet-ms range, at the
+    highest data rate this codebase reasons about, the queue must never be
+    allowed to buffer more than MAX_QUEUE_BYTES - the exact multi-gigabyte
+    outcome the old fixed packet-count floor (MIN_QUEUE_SIZE = 100) caused
+    at long packet periods."""
+    for packet_ms in range(1, MAX_PACKET_MS + 1):
+        bpp = _bytes_per_packet(FULL_DEVICE_PARAMS, packet_ms)
+        size = _queue_size_for(packet_ms, bpp)
+        assert size * bpp <= MAX_QUEUE_BYTES, (
+            f"packet_ms={packet_ms}: {size} packets x {bpp:.0f} bytes "
+            f"exceeds MAX_QUEUE_BYTES")
+        assert size >= MIN_QUEUE_PACKETS
+
+
+def test_queue_size_at_250ms_no_longer_reaches_multi_gigabyte_territory():
+    """The concrete regression this item closes: 250 ms used to floor at
+    MIN_QUEUE_SIZE = 100 packets, which at the full-device packet size is
+    roughly 3.8 GB. The new floor must not reproduce that."""
+    bpp = _bytes_per_packet(FULL_DEVICE_PARAMS, 250)
+    size = _queue_size_for(250, bpp)
+    buffered_bytes = size * bpp
+    assert buffered_bytes < MAX_QUEUE_BYTES
+    assert buffered_bytes < 3.8 * 1024 ** 3
 
 
 def test_parser_accepts_a_duration():
@@ -42,8 +87,10 @@ def test_parser_accepts_a_positive_packet_ms():
 
 
 def test_parser_has_a_packet_ms_default():
+    # Gate 1, item E: 2 ms, matching 3Brain's own SampleApp_BioCamCL default
+    # (MainForm.Designer.cs), not the most aggressive documented setting.
     args = build_parser().parse_args(["record"])
-    assert args.packet_ms == 1
+    assert args.packet_ms == 2
 
 
 def test_parser_rejects_a_zero_packet_ms():
@@ -63,6 +110,20 @@ def test_parser_rejects_a_negative_packet_ms():
 def test_parser_rejects_a_non_integer_packet_ms():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["record", "--packet-ms", "abc"])
+
+
+def test_parser_accepts_the_documented_ceiling_of_250ms():
+    args = build_parser().parse_args(["record", "--packet-ms", "250"])
+    assert args.packet_ms == 250
+
+
+def test_parser_rejects_a_packet_ms_above_the_documented_ceiling():
+    """Gate 1, item C: the driver's documented range is 1-250 ms (3Brain
+    BioCamDriverAPI v2.6 Introduction, page 7). 251 must be refused before
+    the device is ever opened, not accepted here and then fail inside
+    StartDataStreaming after the device has already been claimed."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--packet-ms", "251"])
 
 
 def test_importing_the_cli_does_not_load_interop():
@@ -95,7 +156,7 @@ def test_unknown_command_returns_an_error_code():
         main(["nonsense"])
 
 
-def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monkeypatch):
+def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monkeypatch, capsys):
     """No test previously exercised record_command at all - which is how the
     ordering bug went unnoticed: the CLI used to call note_driver_loss() and
     note_queue_overflow() only after writer.finalise() had already written
@@ -169,6 +230,13 @@ def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monke
     assert integrity["callback_errors"] == 1
     assert integrity["verdict"] != "clean"
     assert exit_code == 2
+
+    # Gate 1, item F: a run that dropped data says so on the console, not
+    # only in the sidecar.
+    console = capsys.readouterr().out
+    assert "QUEUE OVERFLOW" in console and "3" in console
+    assert "DRIVER DATA LOSS" in console and "7" in console
+    assert "CALLBACK ERRORS: 1" in console
 
 
 def test_record_command_drains_buffered_packets_on_keyboard_interrupt(tmp_path, monkeypatch):

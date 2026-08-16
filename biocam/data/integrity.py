@@ -15,6 +15,20 @@ from typing import List, Optional
 
 COUNTER_MODULUS = 65536
 COUNTER_ANOMALY_THRESHOLD = COUNTER_MODULUS // 2
+
+# Gate 1, item H: caps how many Gap objects GapTracker retains in memory.
+# Under persistent loss, one Gap is recorded per packet - roughly 14 million
+# objects over four hours at a 1 ms packet period - and serialising a list
+# that size at finalise() (json.dumps of that many dicts) would risk a
+# MemoryError raised straight into the failure path, right when the run
+# most needs an honest sidecar. 100,000 retained gaps is already far more
+# detail than any operator will read, and small enough (a Gap is three
+# scalar fields) that the retained list stays a rounding error in memory and
+# fast to serialise. Anything beyond the cap is not lost information: it is
+# still counted (gaps_truncated) and still contributes to n_frames_missing
+# and to any GapDetected/GapSummary emitted to a listener (see
+# RecordingWriter) - only the *retained list* is bounded.
+MAX_RETAINED_GAPS = 100_000
 # Deltas exceeding this threshold likely represent out-of-order packets, device
 # resets, or anomalous steps rather than genuine loss. A delta > 32768 means
 # more than half the counter space was traversed in a single jump — implausible
@@ -57,16 +71,25 @@ class GapTracker:
     them.
     """
 
-    def __init__(self, frame_rate_hz: float):
+    def __init__(self, frame_rate_hz: float,
+                 max_retained_gaps: int = MAX_RETAINED_GAPS):
         self._frame_rate_hz = frame_rate_hz
         self._previous_counter: Optional[int] = None
         self._gaps: List[Gap] = []
+        self._max_retained_gaps = max_retained_gaps
+        self._gaps_truncated = 0
         self._n_frames_missing = 0
         self._counter_anomalies = 0
 
     def observe(self, counter: int, frames_in_packet: int,
                 frames_written: int) -> Optional[Gap]:
-        """Record a packet. Returns a Gap if packets were lost before it."""
+        """Record a packet. Returns a Gap if packets were lost before it.
+
+        The returned Gap is always the real one detected, even once the
+        retained list is full - only what gets appended to self._gaps is
+        capped (item H); the caller (RecordingWriter) still sees, and can
+        still emit, every gap as it happens.
+        """
         previous = self._previous_counter
         self._previous_counter = counter
         if previous is None:
@@ -87,13 +110,42 @@ class GapTracker:
             missing_frames=missing_frames,
             duration_ms=missing_frames / self._frame_rate_hz * 1000.0,
         )
-        self._gaps.append(gap)
+        if len(self._gaps) < self._max_retained_gaps:
+            self._gaps.append(gap)
+        else:
+            self._gaps_truncated += 1
         self._n_frames_missing += missing_frames
         return gap
 
     @property
     def gaps(self) -> List[Gap]:
         return list(self._gaps)
+
+    @property
+    def has_gaps(self) -> bool:
+        """Whether any gap has been observed - O(1), unlike `bool(gaps)`.
+
+        Must also account for gaps_truncated: a gap that was detected but
+        not retained in the list (because the cap was already full) is
+        still a real gap that happened, so this must not read False just
+        because the retained list itself is empty in some hypothetical
+        max_retained_gaps=0 configuration.
+        """
+        return bool(self._gaps) or self._gaps_truncated > 0
+
+    @property
+    def n_gaps(self) -> int:
+        """Total gaps observed, retained or not - O(1), unlike `len(gaps)`."""
+        return len(self._gaps) + self._gaps_truncated
+
+    @property
+    def gaps_truncated(self) -> int:
+        """Gaps detected after the retained list reached its cap.
+
+        Real, counted loss that did not make it into `gaps` - see
+        MAX_RETAINED_GAPS above. Always 0 while len(gaps) < max_retained_gaps.
+        """
+        return self._gaps_truncated
 
     @property
     def n_frames_missing(self) -> int:

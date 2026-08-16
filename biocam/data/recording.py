@@ -27,9 +27,11 @@ from typing import Optional
 
 import numpy as np
 
-from biocam.data.events import DiskLow, GapDetected, RecordingStarted, RecordingStopped
+from biocam.data.events import (
+    DiskLow, GapDetected, GapSummary, RecordingStarted, RecordingStopped,
+)
 from biocam.data.frames import DTYPE_BY_BYTE_SIZE, to_microvolts
-from biocam.data.integrity import GapTracker
+from biocam.data.integrity import MAX_RETAINED_GAPS, GapTracker
 
 SCHEMA_VERSION = 2
 
@@ -59,6 +61,22 @@ DEFAULT_MIN_FREE_BYTES = 2 * 1024 ** 3  # 2 GiB
 # syscall overhead is immaterial.
 DEFAULT_UPKEEP_INTERVAL_FRAMES = 50_000
 
+# Gate 1, item G: how many GapDetected events RecordingWriter emits to its
+# listener in full before switching to throttled GapSummary events. cli.py's
+# listener prints on the consumer thread - the same thread that is the only
+# thing draining the queue - so one print per lost packet under sustained
+# loss risks stalling the drain that is the only thing keeping the queue
+# from overflowing further, which causes more loss, which causes more
+# printing. The first GAP_EMIT_FULL_COUNT are still emitted individually
+# (an operator watching the console sees exactly what happened as it
+# starts), after which GAP_SUMMARY_INTERVAL more gaps accumulate silently
+# before one GapSummary reports the count and missing-frame total since the
+# last summary. None of this touches what is *recorded*: GapTracker keeps
+# (up to its own cap - see MAX_RETAINED_GAPS in integrity.py) every gap
+# regardless of what reaches a listener.
+GAP_EMIT_FULL_COUNT = 20
+GAP_SUMMARY_INTERVAL = 50
+
 
 @dataclass(frozen=True)
 class AcquisitionParameters:
@@ -81,16 +99,22 @@ class RecordingWriter:
 
     def __init__(self, raw_path, meta_path, params: AcquisitionParameters,
                  listener=None, min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
-                 upkeep_interval_frames: int = DEFAULT_UPKEEP_INTERVAL_FRAMES):
+                 upkeep_interval_frames: int = DEFAULT_UPKEEP_INTERVAL_FRAMES,
+                 max_retained_gaps: int = MAX_RETAINED_GAPS,
+                 gap_emit_full_count: int = GAP_EMIT_FULL_COUNT,
+                 gap_summary_interval: int = GAP_SUMMARY_INTERVAL):
         self._raw_path = Path(raw_path)
         self._meta_path = Path(meta_path)
         self._params = params
         self._listener = listener
         self._min_free_bytes = min_free_bytes
         self._upkeep_interval_frames = upkeep_interval_frames
+        self._gap_emit_full_count = gap_emit_full_count
+        self._gap_summary_interval = gap_summary_interval
 
         self._file = None
-        self._tracker = GapTracker(frame_rate_hz=params.frame_rate_hz)
+        self._tracker = GapTracker(frame_rate_hz=params.frame_rate_hz,
+                                   max_retained_gaps=max_retained_gaps)
         self._bytes_written = 0
         self._first_timestamp: Optional[int] = None
         self._last_timestamp: Optional[int] = None
@@ -102,6 +126,12 @@ class RecordingWriter:
         self._finalised = False
         self._disk_low = False
         self._frames_at_last_upkeep = 0
+        # Gate 1, item G: how many gaps have been emitted (in full or
+        # counted toward a pending summary) so far this run, and the
+        # accumulator for the summary not yet flushed.
+        self._gaps_emitted = 0
+        self._gaps_since_summary = 0
+        self._frames_missing_since_summary = 0
 
     def __enter__(self):
         self._raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,11 +190,7 @@ class RecordingWriter:
             frames_written=frames_written_before,
         )
         if gap is not None:
-            self._emit(GapDetected(
-                after_frame=gap.after_frame,
-                missing_frames=gap.missing_frames,
-                duration_ms=gap.duration_ms,
-            ))
+            self._emit_gap(gap)
 
         self._file.write(payload)
         self._bytes_written += len(payload)
@@ -202,6 +228,11 @@ class RecordingWriter:
         self._discarded_at_stop += count
 
     def finalise(self, stop_reason: str) -> None:
+        # Flush any gaps counted toward a pending summary but not yet
+        # emitted - otherwise a run that stops partway through an interval
+        # would leave that trailing handful unreported to the listener
+        # (the sidecar already has them regardless, via the tracker).
+        self._flush_pending_gap_summary()
         if self._file is not None:
             # FIX 4: flush() only pushes bytes to the OS cache; fsync forces
             # them to the physical disk. Both run here, on the consumer
@@ -220,6 +251,39 @@ class RecordingWriter:
             n_frames=self.n_frames_written,
             verdict=self.verdict,
         ))
+
+    def _emit_gap(self, gap) -> None:
+        """Emit a just-detected gap, throttled (Gate 1, item G).
+
+        The first `_gap_emit_full_count` gaps of a run are emitted in full,
+        one GapDetected each. After that, gaps are accumulated silently and
+        flushed as one GapSummary per `_gap_summary_interval` gaps (plus a
+        final partial flush in finalise() - see _flush_pending_gap_summary).
+        This only affects what reaches the listener: GapTracker has already
+        recorded the gap (subject to its own retention cap - item H) before
+        this method is called.
+        """
+        self._gaps_emitted += 1
+        if self._gaps_emitted <= self._gap_emit_full_count:
+            self._emit(GapDetected(
+                after_frame=gap.after_frame,
+                missing_frames=gap.missing_frames,
+                duration_ms=gap.duration_ms,
+            ))
+            return
+        self._gaps_since_summary += 1
+        self._frames_missing_since_summary += gap.missing_frames
+        if self._gaps_since_summary >= self._gap_summary_interval:
+            self._flush_pending_gap_summary()
+
+    def _flush_pending_gap_summary(self) -> None:
+        if self._gaps_since_summary:
+            self._emit(GapSummary(
+                n_gaps=self._gaps_since_summary,
+                missing_frames=self._frames_missing_since_summary,
+            ))
+            self._gaps_since_summary = 0
+            self._frames_missing_since_summary = 0
 
     def _periodic_upkeep(self) -> None:
         """Run every DEFAULT_UPKEEP_INTERVAL_FRAMES frames (FIX 3 / FIX 4).
@@ -271,7 +335,7 @@ class RecordingWriter:
         # must never report clean, and this codebase has no verdict more
         # specific than gaps_detected for "integrity was compromised, but
         # not by a counter gap".
-        if (self._tracker.gaps or self._driver_loss or self._queue_overflows
+        if (self._tracker.has_gaps or self._driver_loss or self._queue_overflows
                 or self._callback_errors or self._discarded_at_stop):
             return VERDICT_GAPS
         if self._tracker.counter_anomalies:
@@ -289,6 +353,18 @@ class RecordingWriter:
     def _emit(self, event) -> None:
         if self._listener is not None:
             self._listener(event)
+
+    def emit(self, event) -> None:
+        """Public counterpart to _emit(), for callers outside this class.
+
+        Gate 1, item F: record_session (biocam/session.py) watches the
+        packet source's own counters - queue_overflows, driver_loss_events -
+        on the consumer thread and needs to surface QueueOverflow /
+        DriverDataLoss through the same listener this writer already emits
+        RecordingStarted/GapDetected/DiskLow/RecordingStopped to, rather
+        than plumbing a second, separate listener through record_session.
+        """
+        self._emit(event)
 
     def _verdict_for_status(self, status: str) -> str:
         """The verdict to write into a sidecar with the given status.
@@ -337,6 +413,7 @@ class RecordingWriter:
                 "last_timestamp": self._last_timestamp,
                 "n_frames_missing": self._tracker.n_frames_missing,
                 "gaps": [asdict(g) for g in self._tracker.gaps],
+                "gaps_truncated": self._tracker.gaps_truncated,
                 "driver_loss_events": self._driver_loss,
                 "queue_overflows": self._queue_overflows,
                 "callback_errors": self._callback_errors,

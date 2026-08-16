@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from biocam.data.events import DriverDataLoss, QueueOverflow
+
 # Wall-clock ceiling for a "drain to exhaustion" pass (record_session's
 # drain=True mode - see cli.py FIX 1). After Ctrl+C, the normal
 # stop-as-soon-as-the-flag-is-seen behaviour is deliberately bypassed so that
@@ -27,6 +29,19 @@ from typing import Optional
 # is real, acquired data that is being given up on - it must be counted into
 # discarded_at_stop, never just dropped.
 DRAIN_DEADLINE_SEC = 5.0
+
+# Gate 1, item F: how often (in packets consumed, not time) record_session
+# checks the source's queue_overflows / driver_loss_events counters for a
+# change and emits QueueOverflow / DriverDataLoss if so. Both counters only
+# ever move on the driver's own callback thread(s) - never here - so this
+# loop only reads them; checking (and potentially emitting to a listener
+# that prints) on every single packet would put per-packet listener work on
+# the consumer thread under sustained loss, which is exactly the drain that
+# must not stall. Checking every N packets instead keeps that off the hot
+# path while still surfacing loss well within a session's lifetime; a
+# trailing check in the `finally` below catches whatever moved since the
+# last check, however many packets short of N that was.
+COUNTER_CHECK_INTERVAL_PACKETS = 200
 
 
 @dataclass(frozen=True)
@@ -119,6 +134,28 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     deadline = time.monotonic() + DRAIN_DEADLINE_SEC if drain else None
     interrupted = False
 
+    # Gate 1, item F: cached copies of the two counters, compared against
+    # their live values every COUNTER_CHECK_INTERVAL_PACKETS packets (and
+    # once more in the `finally` below) so a move gets a QueueOverflow /
+    # DriverDataLoss emitted through the writer's listener - the only place
+    # this was visible before was the sidecar, read only after the run ends.
+    last_queue_overflows = getattr(counters, "queue_overflows", 0) if counters is not None else 0
+    last_driver_loss = getattr(counters, "driver_loss_events", 0) if counters is not None else 0
+    packets_since_counter_check = 0
+
+    def _check_counters() -> None:
+        nonlocal last_queue_overflows, last_driver_loss
+        if counters is None:
+            return
+        current_overflows = getattr(counters, "queue_overflows", last_queue_overflows)
+        if current_overflows != last_queue_overflows:
+            writer.emit(QueueOverflow(total=current_overflows))
+            last_queue_overflows = current_overflows
+        current_loss = getattr(counters, "driver_loss_events", last_driver_loss)
+        if current_loss != last_driver_loss:
+            writer.emit(DriverDataLoss(total=current_loss))
+            last_driver_loss = current_loss
+
     try:
         for packet in source:
             writer.write_packet(
@@ -126,6 +163,10 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
+            packets_since_counter_check += 1
+            if packets_since_counter_check >= COUNTER_CHECK_INTERVAL_PACKETS:
+                packets_since_counter_check = 0
+                _check_counters()
             if writer.disk_low:
                 # FIX 3: checked first, ahead of drain/stop_event/duration -
                 # stopping cleanly with a complete record beats crashing with
@@ -159,6 +200,10 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
         interrupted = True
         raise
     finally:
+        # Trailing check: whatever moved since the last periodic check
+        # (however many packets short of COUNTER_CHECK_INTERVAL_PACKETS that
+        # was) still gets reported before the session ends.
+        _check_counters()
         if counters is not None:
             writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
             writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))

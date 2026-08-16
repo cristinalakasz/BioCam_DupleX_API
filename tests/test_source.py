@@ -301,6 +301,42 @@ def test_pending_count_excludes_the_stop_sentinel_and_drains_the_queue():
     assert len(source._queue) == 0
 
 
+class _FailingSubscribeEvent(_FakeEvent):
+    """Raises on +=, simulating a driver-side failure to attach a handler."""
+
+    def __iadd__(self, handler):
+        raise RuntimeError("subscribe failed")
+
+
+def test_failed_subscription_leaves_no_handler_attached_and_restores_tuning():
+    # Gate 1, item A: DataReceived subscribes successfully (it is a plain
+    # _FakeEvent, appended before the failure), then DataLossAsync's
+    # __iadd__ raises. Before the fix, both the subscription loop and
+    # _apply_runtime_tuning() ran ahead of the guarding try/except, so this
+    # failure would have escaped with DataReceived still subscribed and GC
+    # left disabled for the rest of the process.
+    biocam = _FakeBioCam()
+    biocam.DataLossAsync = _FailingSubscribeEvent()
+    device = _FakeDevice(biocam)
+    source = DriverPacketSource(device, queue_size=10)
+
+    prev_interval = sys.getswitchinterval()
+    prev_gc_enabled = gc.isenabled()
+
+    with pytest.raises(RuntimeError, match="subscribe failed"):
+        source.start()
+
+    # DataReceived attached before the failure, and must be detached again
+    # by the cleanup path - not left subscribed.
+    assert not biocam.DataReceived.handlers
+    # StartDataStreaming was never reached.
+    assert biocam.start_calls == 0
+    # Runtime tuning applied before the failing subscription must be undone.
+    assert sys.getswitchinterval() == pytest.approx(prev_interval)
+    assert gc.isenabled() is prev_gc_enabled
+    assert source._streaming is False
+
+
 def test_start_clears_a_buffer_left_over_from_a_prior_cycle():
     # FIX 4: a consumer that broke out of __iter__ early (e.g. a drain
     # deadline) can leave straggler packets or a stale STOP behind. A second

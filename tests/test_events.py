@@ -1,5 +1,5 @@
 from biocam.data.events import (
-    DiskLow, DriverDataLoss, GapDetected, QueueOverflow, QueuePressure,
+    DiskLow, DriverDataLoss, GapDetected, GapSummary, QueueOverflow, QueuePressure,
     RecordingStarted, RecordingStopped, describe,
 )
 
@@ -26,10 +26,17 @@ def test_describe_stopped_reports_reason_and_verdict():
     assert "100" in text
 
 
+def test_describe_gap_summary_names_the_numbers():
+    text = describe(GapSummary(n_gaps=42, missing_frames=371))
+    assert "42" in text
+    assert "371" in text
+
+
 def test_describe_handles_every_event_type():
     events = [
         RecordingStarted(path="a.raw", total_channels=4096, frame_rate_hz=18557.72),
         GapDetected(after_frame=1, missing_frames=2, duration_ms=0.1),
+        GapSummary(n_gaps=3, missing_frames=30),
         QueuePressure(depth=90, capacity=100),
         QueueOverflow(total=1),
         DriverDataLoss(total=1),
