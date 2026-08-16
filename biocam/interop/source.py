@@ -3,16 +3,22 @@
 The callback does four things and returns: read the header, copy the payload,
 put it on a bounded queue, return. Nothing else. No file I/O, no printing, no
 allocation beyond the copy, and no operation that can block: `put_nowait`
-only, never `put`. A `threading.Event` is used as a stop flag - a check, not
-a wait - so it never blocks the driver's event thread either.
+only, never `put`. A `threading.Event` is used as a stop flag - `set()` and
+`is_set()` are non-waiting, not lock-free: `Event.set()` takes the internal
+condition lock and `queue.Queue.put_nowait` takes the queue's mutex, both
+uncontended and short in this single-producer use, so they do not block the
+driver's event thread in practice.
 
 If the queue is full the packet is dropped and counted. Blocking the callback
 would stall the driver and lose more than the packet being saved. If the
-callback itself raises - the driver's docs allow a null payload for a chunk
-where nothing was retrieved, and `bytes(None)` is a `TypeError` - the
-exception is caught and counted rather than allowed to cross back into the
-.NET dispatcher, whose behavior on a Python exception is undocumented and
-cannot be tested here.
+callback itself raises - `bytes(None)` is a `TypeError`, and the XML documents
+a null payload as possible on `BioCamUsbBase.ProcessPayload`'s `data`
+parameter for a chunk where nothing was retrieved (it says nothing about
+`DataPacketReceivedEventArgs.Payload` itself, so treating that event args
+payload as nullable too is our own defensive inference, not documented
+behaviour) - the exception is caught and counted rather than allowed to cross
+back into the .NET dispatcher, whose behavior on a Python exception is
+undocumented and cannot be tested here.
 """
 
 import queue
@@ -76,6 +82,11 @@ class DriverPacketSource:
                 pass
 
     def start(self, packet_timespan_ms: int = 1) -> None:
+        if self._streaming:
+            raise RuntimeError(
+                "DriverPacketSource.start() called while already streaming; "
+                "call stop() first."
+            )
         biocam = self._device.biocam
         self._stop_event.clear()
 
@@ -150,13 +161,36 @@ class DriverPacketSource:
     def stop(self) -> None:
         biocam = self._device.biocam
         stopped_ok = True
+        stop_error = None
         if self._streaming:
-            stopped_ok = biocam.StopDataStreaming()
-            if stopped_ok:
-                self._streaming = False
-            # If it failed, leave _streaming True so a retried stop() calls
-            # StopDataStreaming() again instead of silently skipping it.
-        self._unsubscribe(biocam)
+            if biocam is not None:
+                try:
+                    stopped_ok = biocam.StopDataStreaming()
+                except Exception as exc:
+                    # Propagate the original exception after cleanup below,
+                    # rather than swallowing it or replacing it with the
+                    # generic "failed" error used for a falsy return: a
+                    # caller should be able to tell an exception from a
+                    # refusal.
+                    stopped_ok = False
+                    stop_error = exc
+                if stopped_ok:
+                    self._streaming = False
+                # If it failed or raised, leave _streaming True so a
+                # retried stop() calls StopDataStreaming() again instead of
+                # silently skipping it.
+            # If biocam is None, BioCamDevice.__exit__ has already cleared
+            # our reference to it (it calls ReleaseBioCamControl and sets
+            # biocam = None; it does not call StopDataStreaming or detach
+            # handlers itself), so there is nothing left here to call
+            # StopDataStreaming() on. Fall through to the Python-side
+            # cleanup below instead of raising AttributeError. Whether the
+            # driver still considers itself streaming, and whether the
+            # handlers subscribed to the now-unreachable biocam object are
+            # still live on the .NET side, is unverified - see the lab
+            # follow-up note in the Gate 1 report.
+        if biocam is not None:
+            self._unsubscribe(biocam)
         self._stop_event.set()
         try:
             self._queue.put_nowait(STOP)
@@ -165,6 +199,8 @@ class DriverPacketSource:
             # empty-queue poll, so the sentinel is a fast path, not the
             # only way out.
             pass
+        if stop_error is not None:
+            raise stop_error
         if not stopped_ok:
             raise RuntimeError("StopDataStreaming failed.")
 
