@@ -24,23 +24,17 @@ WARMUP = 3
 
 
 def _load_runtime():
-    import pythonnet
-    pythonnet.load("netfx")
-    import clr
-    # device.py's load_assemblies() checks path.is_file() before
-    # clr.AddReference() so a missing DLL fails with a clear
-    # FileNotFoundError naming the path, rather than whatever opaque error
-    # clr.AddReference() itself raises for a path that does not exist. This
-    # benchmark loads both 3Brain assemblies too (it needs 3Brain.Common
-    # loaded for 3Brain.BioCamDriver to resolve, even though it uses no
-    # 3Brain type directly - only System.Array/System.Byte/Marshal.Copy) and
-    # had no such check, so a missing DLL here failed less clearly than the
-    # same mistake in device.py. Same check, same reasoning.
-    for name in ("3Brain.Common", "3Brain.BioCamDriver"):
-        path = DLL_DIR / f"{name}.dll"
-        if not path.is_file():
-            raise FileNotFoundError(f"assembly not found: {path}")
-        clr.AddReference(str(path))
+    # LOW: this used to reimplement load_assemblies() from scratch, minus
+    # its PATH/sys.path setup (see device.py) - a divergence with no
+    # reason to exist, since this benchmark loads the exact same two
+    # assemblies for the exact same reason (3Brain.Common must be present
+    # for 3Brain.BioCamDriver to resolve, even though only
+    # System.Array/System.Byte/Marshal.Copy are used directly below).
+    # Calling the real thing means a future change to load_assemblies()
+    # (e.g. a fix to how the DLL directory is put on PATH) cannot silently
+    # stop applying here.
+    from biocam.interop.device import load_assemblies
+    load_assemblies(DLL_DIR)
 
 
 def _expected_pattern():

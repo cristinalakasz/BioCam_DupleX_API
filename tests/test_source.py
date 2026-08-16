@@ -463,6 +463,95 @@ def test_start_resets_counters_left_over_from_a_prior_session():
     assert source.callback_errors == 0
 
 
+def test_start_clears_maybe_streaming_when_driver_returns_false():
+    # HIGH 2: a `False` return from StartDataStreaming is the driver's own
+    # statement that nothing engaged - the weakest possible case for "may
+    # have engaged". _maybe_streaming must be cleared before start() raises,
+    # or stop() would call StopDataStreaming on a device that never started
+    # and then raise on its own falsy return.
+    biocam = _FakeBioCam()
+    biocam.StartDataStreaming = lambda **kwargs: False
+    device = _FakeDevice(biocam)
+    source = DriverPacketSource(device, queue_size=10)
+
+    with pytest.raises(RuntimeError, match="StartDataStreaming failed"):
+        source.start()
+
+    assert source._streaming is False
+    assert source._maybe_streaming is False
+
+    # A retried stop() must find nothing to do - StopDataStreaming is never
+    # called on a device the driver already said never started.
+    source.stop()
+    assert biocam.stop_calls == 0
+
+
+def test_start_reset_block_clears_a_stale_maybe_streaming_flag():
+    # MEDIUM 3/HIGH 2: a start() that raised after engaging leaves
+    # _maybe_streaming True (see the post-engage test below) so stop() can
+    # still attempt StopDataStreaming. If that source is never stopped and
+    # is instead start()ed again directly, and the *second* attempt fails
+    # before it reaches its own `_maybe_streaming = True` line (e.g. a
+    # failed handler subscription, before StartDataStreaming is ever
+    # called), the reset block at the top of start() must have already
+    # cleared the stale True from the first attempt - or the second
+    # failure would wrongly inherit "may have engaged" from a cycle that
+    # has nothing to do with it. Setting _maybe_streaming = True again
+    # right before every StartDataStreaming call (including a successful
+    # one) is correct and expected; what must not happen is a stale True
+    # surviving into a start() that never got that far.
+    biocam = _FakeBioCam()
+
+    def raise_after_engaging(**kwargs):
+        biocam.start_calls += 1
+        raise RuntimeError("AssertCanStartStreaming failed after engaging")
+
+    biocam.StartDataStreaming = raise_after_engaging
+    device = _FakeDevice(biocam)
+    source = DriverPacketSource(device, queue_size=10)
+
+    with pytest.raises(RuntimeError, match="after engaging"):
+        source.start()
+    assert source._maybe_streaming is True
+
+    # A second start(), on the same un-stopped source, fails before
+    # StartDataStreaming is ever reached this time - so if the reset block
+    # did its job, this attempt never sets _maybe_streaming True at all.
+    biocam.DataLossAsync = _FailingSubscribeEvent()
+    with pytest.raises(RuntimeError, match="subscribe failed"):
+        source.start()
+
+    assert biocam.start_calls == 1  # StartDataStreaming was never reached
+    assert source._maybe_streaming is False
+
+
+def test_stop_unsubscribes_even_when_stopdatastreaming_raises_baseexception():
+    # HIGH 1: a plain `except Exception` would let a BaseException that is
+    # not an Exception (e.g. KeyboardInterrupt - a second Ctrl+C arriving
+    # while StopDataStreaming is in flight, since cli.py calls stop() FROM
+    # a KeyboardInterrupt handler) skip cleanup entirely. Using
+    # SystemExit here as a stand-in BaseException that is not an Exception,
+    # to avoid actually raising KeyboardInterrupt inside a test runner.
+    prev_interval = sys.getswitchinterval()
+    source, _device, biocam = _make_started_source()
+    biocam.stop_raises = SystemExit("second ctrl-c")
+
+    with pytest.raises(SystemExit, match="second ctrl-c"):
+        source.stop()
+
+    # Cleanup (unsubscribe, stop flag, sentinel, runtime tuning restore)
+    # must still have run despite the BaseException.
+    assert not biocam.DataReceived.handlers
+    assert not biocam.DataLossAsync.handlers
+    assert not biocam.DataStreamingError.handlers
+    assert source._stop_event.is_set()
+    assert source._queue.popleft() is STOP
+    assert sys.getswitchinterval() == pytest.approx(prev_interval)
+    # The refusal/exception case leaves both flags as-is so a retry tries
+    # StopDataStreaming again rather than silently skipping it.
+    assert source._streaming is True
+
+
 def test_stop_still_attempts_stopdatastreaming_after_a_start_that_raised_post_engage():
     # issue #18: simulates AssertCanStartStreaming (or anything else inside
     # the guarded try) raising *after* the hardware may already have been

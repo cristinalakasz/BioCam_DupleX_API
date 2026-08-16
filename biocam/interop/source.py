@@ -493,6 +493,13 @@ class DriverPacketSource:
         self._loss_errors = 0
         self._error_errors = 0
         self._pressure_reported = False
+        # HIGH 2/MEDIUM 3: a stale True from a previous cycle must not
+        # survive into this one. stop() always clears _maybe_streaming on
+        # every path it can reach (see stop() below), but reset it here too
+        # as a second guarantee - one that does not depend on stop() having
+        # been called at all (e.g. a caller that starts a fresh source
+        # object without ever stopping a previous one).
+        self._maybe_streaming = False
 
         # Clear anything left over from a previous start()/stop() cycle - a
         # stale STOP sentinel, or straggler packets a consumer that broke out
@@ -625,6 +632,16 @@ class DriverPacketSource:
                 optimizeDataPacketLatency=True,
             )
             if not started:
+                # HIGH 2: a `False` return is the driver's own statement
+                # that nothing engaged - the weakest possible case for
+                # "may have engaged". Unlike an exception from the call
+                # itself (caught below), there is no uncertainty to
+                # preserve here, so clear the flag before raising: stop()
+                # must not call StopDataStreaming on a device the driver
+                # just told us never started. Controller's original
+                # directive covered only "set the flag before the call",
+                # not this case - see the Gate 1 report.
+                self._maybe_streaming = False
                 raise RuntimeError("StartDataStreaming failed.")
         except BaseException:
             # BaseException, not Exception: a KeyboardInterrupt landing
@@ -648,56 +665,77 @@ class DriverPacketSource:
         stopped_ok = True
         stop_error = None
         try:
-            # issue #18: `_maybe_streaming` (set in start(), immediately
-            # before StartDataStreaming) covers the gap `_streaming` alone
-            # cannot - a start() that raised or was interrupted after the
-            # hardware was actually told to start, but before `_streaming`
-            # itself was set. Attempting StopDataStreaming on a device that
-            # never started is harmless (nothing for the driver to stop);
-            # never attempting it on one that may actually be streaming is
-            # not - so both flags are checked, not just `_streaming`.
-            if self._streaming or self._maybe_streaming:
-                if biocam is not None:
-                    try:
-                        stopped_ok = biocam.StopDataStreaming()
-                    except Exception as exc:
-                        # Propagate the original exception after cleanup
-                        # below, rather than swallowing it or replacing it
-                        # with the generic "failed" error used for a falsy
-                        # return: a caller should be able to tell an
-                        # exception from a refusal.
-                        stopped_ok = False
-                        stop_error = exc
-                    if stopped_ok:
+            try:
+                # issue #18: `_maybe_streaming` (set in start(), immediately
+                # before StartDataStreaming) covers the gap `_streaming`
+                # alone cannot - a start() that raised or was interrupted
+                # after the hardware was actually told to start, but before
+                # `_streaming` itself was set. Attempting StopDataStreaming
+                # on a device that never started is harmless (nothing for
+                # the driver to stop); never attempting it on one that may
+                # actually be streaming is not - so both flags are checked,
+                # not just `_streaming`.
+                if self._streaming or self._maybe_streaming:
+                    if biocam is not None:
+                        try:
+                            stopped_ok = biocam.StopDataStreaming()
+                        except BaseException as exc:
+                            # HIGH 1: BaseException, not Exception. cli.py
+                            # reaches stop() FROM a KeyboardInterrupt
+                            # handler (a first Ctrl+C), so a second Ctrl+C
+                            # arriving while this call is in flight is a
+                            # real path, not a hypothetical one - and it
+                            # must still be captured here so cleanup below
+                            # (unsubscription, stop flag, sentinel) runs,
+                            # instead of the exception skipping straight
+                            # past all of it. Propagate the original
+                            # exception after cleanup, rather than
+                            # swallowing it or replacing it with the generic
+                            # "failed" error used for a falsy return: a
+                            # caller should be able to tell an exception
+                            # (including an interrupt) from a refusal.
+                            stopped_ok = False
+                            stop_error = exc
+                        if stopped_ok:
+                            self._streaming = False
+                            self._maybe_streaming = False
+                        # If it failed or raised, leave both flags as they
+                        # were so a retried stop() calls StopDataStreaming()
+                        # again instead of silently skipping it.
+                    else:
+                        # biocam is None: BioCamDevice.__exit__ has already
+                        # cleared our reference to it (it calls
+                        # ReleaseBioCamControl and sets biocam = None; it
+                        # does not call StopDataStreaming or detach handlers
+                        # itself), so there is nothing left here to call
+                        # StopDataStreaming() on, and nothing to retry
+                        # either - unlike the stopped_ok=False branch above,
+                        # a future stop() call would find biocam still None
+                        # and be no more able to call it. Both flags must
+                        # still be cleared here, or start()'s re-entrancy
+                        # guard blocks every subsequent start() on this
+                        # instance permanently. Whether the driver still
+                        # considers itself streaming, and whether the
+                        # handlers subscribed to the now-unreachable biocam
+                        # object are still live on the .NET side, is
+                        # unverified - see the lab follow-up note in the
+                        # Gate 1 report - but that is a driver-side question
+                        # this Python flag cannot answer either way.
                         self._streaming = False
                         self._maybe_streaming = False
-                    # If it failed or raised, leave both flags as they were
-                    # so a retried stop() calls StopDataStreaming() again
-                    # instead of silently skipping it.
-                else:
-                    # biocam is None: BioCamDevice.__exit__ has already
-                    # cleared our reference to it (it calls
-                    # ReleaseBioCamControl and sets biocam = None; it does
-                    # not call StopDataStreaming or detach handlers itself),
-                    # so there is nothing left here to call
-                    # StopDataStreaming() on, and nothing to retry either -
-                    # unlike the stopped_ok=False branch above, a future
-                    # stop() call would find biocam still None and be no
-                    # more able to call it. Both flags must still be
-                    # cleared here, or start()'s re-entrancy guard blocks
-                    # every subsequent start() on this instance permanently.
-                    # Whether the driver still considers itself streaming,
-                    # and whether the handlers subscribed to the now-
-                    # unreachable biocam object are still live on the .NET
-                    # side, is unverified - see the lab follow-up note in
-                    # the Gate 1 report - but that is a driver-side question
-                    # this Python flag cannot answer either way.
-                    self._streaming = False
-                    self._maybe_streaming = False
-            if biocam is not None:
-                self._unsubscribe(biocam)
-            self._stop_event.set()
-            self._try_enqueue_stop()
+                self._stop_event.set()
+                self._try_enqueue_stop()
+            finally:
+                # HIGH 1: unconditional, matching start()'s
+                # `except BaseException` cleanup - must run even if
+                # something above (StopDataStreaming's own BaseException
+                # handling notwithstanding, or stop_event.set()/
+                # _try_enqueue_stop() themselves) raised, or a second
+                # Ctrl+C during StopDataStreaming leaves handlers
+                # subscribed for the rest of the process. Sample
+                # unsubscribes unconditionally too (MainForm.cs:219-221).
+                if biocam is not None:
+                    self._unsubscribe(biocam)
         finally:
             # Unconditional: must run even if something above raised, so
             # the switch interval and GC state never stay tuned past a

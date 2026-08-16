@@ -5,7 +5,8 @@ import pytest
 
 from biocam.cli import (
     MAX_PACKET_MS, MAX_QUEUE_BYTES, MIN_QUEUE_PACKETS,
-    _bytes_per_packet, _queue_size_for, _ConsolePrinter, build_parser, main,
+    _bytes_per_packet, _probe_data_format, _queue_size_for, _ConsolePrinter,
+    build_parser, main,
 )
 from biocam.data.events import RecordingStarted
 from biocam.data.recording import AcquisitionParameters
@@ -158,6 +159,122 @@ def test_convert_command_runs_without_hardware(tmp_path):
 def test_unknown_command_returns_an_error_code():
     with pytest.raises(SystemExit):
         main(["nonsense"])
+
+
+def test_probe_data_format_reports_every_member_when_all_resolve():
+    # finding 9: a normal, successful run must still print every value -
+    # issue #11 asks the colleague to compare these against the known-good
+    # June recording, so they need to be visible even when nothing failed.
+    class FakeDataFormat:
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    lines = _probe_data_format(FakeDataFormat())
+
+    assert len(lines) == 5
+    assert any("BitDepth: 12" in line for line in lines)
+    assert any("ADCCountsToValue: 1.0" in line for line in lines)
+    assert any("Offset: 0.0" in line for line in lines)
+    assert any("MinDigitalValue: 0" in line for line in lines)
+    assert any("MaxDigitalValue: 4095" in line for line in lines)
+    assert not any("FAILED" in line for line in lines)
+
+
+def test_probe_data_format_isolates_one_failing_member_from_the_rest():
+    # finding 9: an AttributeError on one member (BitDepth is deliberately
+    # missing here) must not stop the probe from reading - and reporting -
+    # the other four. A plain, unguarded attribute-block read (the old
+    # _parameters_from() behaviour) would have aborted on the first miss and
+    # said nothing about the rest.
+    class PartialDataFormat:
+        # BitDepth intentionally absent.
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    lines = _probe_data_format(PartialDataFormat())
+
+    assert len(lines) == 5
+    failed = [line for line in lines if "FAILED" in line]
+    assert len(failed) == 1
+    assert "BitDepth" in failed[0]
+    assert any("ADCCountsToValue: 1.0" in line for line in lines)
+    assert any("Offset: 0.0" in line for line in lines)
+    assert any("MinDigitalValue: 0" in line for line in lines)
+    assert any("MaxDigitalValue: 4095" in line for line in lines)
+
+
+def test_record_command_prints_the_data_format_probe_before_parameters_from(
+        tmp_path, monkeypatch, capsys):
+    # finding 9, exercised through the real CLI: the probe must run and
+    # print unconditionally, before _parameters_from() reads the same
+    # members - so a colleague sees the values (or the one that failed)
+    # even on a session that never gets past device-claim.
+    import numpy as np
+
+    import biocam.interop.device as device_module
+    import biocam.interop.source as source_module
+    from biocam.data.replay import Packet
+
+    class FakeDataFormat:
+        FrameRate = 1000.0
+        NWells = 1
+        NChsPerWell = 4
+        ChSampleByteSize = 2
+        BitDepth = 12
+        ADCCountsToValue = 1.0
+        Offset = 0.0
+        MinDigitalValue = 0
+        MaxDigitalValue = 4095
+
+    class FakeDevice:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        @property
+        def data_format(self):
+            return FakeDataFormat()
+
+    class FakeSource:
+        def __init__(self, device, queue_size=None, listener=None):
+            self.driver_loss_events = 0
+            self.queue_overflows = 0
+            self.callback_errors = 0
+            self._packets = [
+                Packet(timestamp=0, counter=0,
+                       payload=np.arange(4, dtype=np.uint16).tobytes())
+            ]
+
+        def start(self, packet_timespan_ms=1):
+            pass
+
+        def stop(self):
+            pass
+
+        def __iter__(self):
+            return iter(self._packets)
+
+    monkeypatch.setattr(device_module, "BioCamDevice", FakeDevice)
+    monkeypatch.setattr(source_module, "DriverPacketSource", FakeSource)
+
+    main(["record", "--output-dir", str(tmp_path), "--name", "probe"])
+
+    console = capsys.readouterr().err
+    assert "DataFormat probe" in console
+    assert "BitDepth: 12" in console
+    assert "ADCCountsToValue: 1.0" in console
+    assert "Offset: 0.0" in console
+    assert "MinDigitalValue: 0" in console
+    assert "MaxDigitalValue: 4095" in console
+    # The probe's own banner must appear before the values it produced.
+    assert console.index("DataFormat probe") < console.index("BitDepth: 12")
 
 
 def test_record_command_carries_driver_counters_into_the_sidecar(tmp_path, monkeypatch, capsys):

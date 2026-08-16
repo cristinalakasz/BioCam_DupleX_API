@@ -340,6 +340,49 @@ class _ConsolePrinter:
         return False
 
 
+# finding 9 (Gate 1 final pass): the five _3Brain.Common DataFormat members
+# _parameters_from() reads below. None appears in
+# API/3Brain.BioCamDriver.xml - verified, zero occurrences, while FrameRate
+# and NWells (also read there) each have exactly one - so all five are
+# presumed inherited from _3Brain.Common, which ships no XML in this repo
+# (see CLAUDE.md). Order matches _parameters_from().
+_DATA_FORMAT_PROBE_MEMBERS = (
+    "BitDepth", "ADCCountsToValue", "Offset", "MinDigitalValue",
+    "MaxDigitalValue",
+)
+
+
+def _probe_data_format(data_format) -> list:
+    """Read each undocumented DataFormat member individually and report it.
+
+    finding 9: _parameters_from() below reads all five of these members in
+    one block, immediately after the device is claimed and before a single
+    packet has arrived. Because none of the five is documented in this repo
+    (see _DATA_FORMAT_PROBE_MEMBERS above), an AttributeError on any one of
+    them used to abort the whole session there - and a plain AttributeError
+    names only the first member it happened to hit, leaving nothing to say
+    about the other four, with the colleague 600 km away and nothing to
+    report but a traceback.
+
+    This probe reads every member individually so one failure cannot hide
+    whether the others resolve, and returns one line per member
+    unconditionally - not only the ones that fail - because issue #11 asks
+    the colleague to compare these exact values against the known-good June
+    recording, so the values themselves need to be visible on an ordinary,
+    successful run too, not just a broken one. A dead session should return
+    a diagnosis, not a stack trace.
+    """
+    lines = []
+    for name in _DATA_FORMAT_PROBE_MEMBERS:
+        try:
+            value = getattr(data_format, name)
+        except Exception as exc:
+            lines.append(f"  {name}: FAILED - {exc!r}")
+        else:
+            lines.append(f"  {name}: {value!r}")
+    return lines
+
+
 def _parameters_from(data_format) -> AcquisitionParameters:
     return AcquisitionParameters(
         frame_rate_hz=data_format.FrameRate,
@@ -394,7 +437,24 @@ def record_command(args) -> int:
 
     try:
         with BioCamDevice() as device:
-            params = _parameters_from(device.data_format)
+            # finding 9: probe every undocumented DataFormat member
+            # individually, before _parameters_from() reads the same five
+            # in one uninterruptible block - see _probe_data_format's
+            # docstring. Printed directly, not through printer's bounded
+            # ring: streaming has not started (source.start() has not been
+            # called yet), so nothing here can compete with the callback -
+            # the same reasoning that makes the end-of-run summary further
+            # down safe to print directly once acquisition has stopped.
+            data_format = device.data_format
+            print(
+                "DataFormat probe (finding 9 - members with no XML in "
+                "this repo; compare against the known-good June recording "
+                "per issue #11):",
+                file=sys.stderr,
+            )
+            for line in _probe_data_format(data_format):
+                print(line, file=sys.stderr)
+            params = _parameters_from(data_format)
 
             if args.duration is not None:
                 out_dir.mkdir(parents=True, exist_ok=True)
