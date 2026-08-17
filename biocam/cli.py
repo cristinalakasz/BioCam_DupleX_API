@@ -231,7 +231,132 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("meta")
     convert.add_argument("out")
 
+    stim = sub.add_parser(
+        "stim",
+        help="send a stimulus, or plan one without an instrument (--dry-run)",
+        description=(
+            "Amplitudes are in the stimulator's unit (uA on the DupleX) and "
+            "durations in microseconds. A pulse is refused rather than "
+            "adjusted if the driver would alter it - see "
+            "docs/api/stimulation-reference.md."
+        ),
+    )
+    stim.add_argument("--amplitude", type=float, required=True,
+                      help="first-phase amplitude, uA")
+    stim.add_argument("--phase-us", type=float, required=True,
+                      help="first-phase duration, microseconds")
+    stim.add_argument("--gap-us", type=float, default=0.0,
+                      help="inter-phase gap, microseconds (default 0)")
+    stim.add_argument(
+        "--amplitude2", type=float, default=None,
+        help="second-phase amplitude, uA (default: the negative of "
+             "--amplitude, giving a charge-balanced pulse)")
+    stim.add_argument(
+        "--phase2-us", type=float, default=None,
+        help="second-phase duration, microseconds (default: same as "
+             "--phase-us)")
+    stim.add_argument(
+        "--positive", type=_electrode_list, required=True,
+        help="positive endpoints as 1-based row,col pairs separated by "
+             "semicolons, e.g. '10,10' or '10,10;11,10'")
+    stim.add_argument("--negative", type=_electrode_list, required=True,
+                      help="negative endpoints, same format as --positive")
+    stim.add_argument("--count", type=int, default=1,
+                      help="number of pulses (default 1)")
+    group = stim.add_mutually_exclusive_group()
+    group.add_argument("--rate-hz", type=float, default=None,
+                       help="train rate; requires --count above 1")
+    group.add_argument("--period-us", type=float, default=None,
+                       help="train period in microseconds; alternative to "
+                            "--rate-hz")
+    stim.add_argument(
+        "--delay-us", type=float, default=0.0,
+        help="when the train starts, in microseconds FROM THE BEGINNING OF "
+             "THE ACQUISITION - not from now (see the reference document)")
+    stim.add_argument(
+        "--allow-unbalanced", action="store_true",
+        help="permit a pulse that injects net charge. Sustained net charge "
+             "drives electrolysis at the electrode; this is off by default "
+             "for that reason")
+    stim.add_argument(
+        "--allow-short-period", action="store_true",
+        help="permit a period below the driver's 1000 us minimum distance")
+    stim.add_argument(
+        "--no-column-rule", action="store_true",
+        help="skip the check that positive and negative endpoints use "
+             "different electrode columns")
+    stim.add_argument(
+        "--grid", type=_grid, default="64x64",
+        help="MEA dimensions as ROWSxCOLS, for bounds-checking electrodes "
+             "(default 64x64). ChCoord does not bounds-check, so this is the "
+             "only place an out-of-array electrode is caught")
+    stim.add_argument(
+        "--dry-run", action="store_true",
+        help="plan and print the stimulus without touching the instrument. "
+             "Needs no BioCAM and no DLLs; use it to check a protocol before "
+             "a lab session")
+    stim.add_argument(
+        "--time-resolution-us", type=int, default=None,
+        help="stimulator clock period, for --dry-run only. On the instrument "
+             "the real value is read from the device and this is ignored")
+    stim.add_argument(
+        "--amplitude-resolution", type=float, default=1.0,
+        help="amplitude step, for --dry-run only (default 1.0)")
+    stim.add_argument(
+        "--max-amplitude", type=float, default=1000.0,
+        help="amplitude limit, for --dry-run only (default 1000)")
+    stim.add_argument(
+        "--max-total-ticks", type=int, default=1000,
+        help="MaxPulseDuration in ticks, for --dry-run only (default 1000)")
+
     return parser
+
+
+def _electrode_list(value: str):
+    """Parse '10,10;11,12' into a tuple of Electrodes.
+
+    Coordinates are 1-based, matching ChCoord. Kept in the CLI rather than in
+    biocam.stim because it is a text format, not a stimulation concept.
+    """
+    from biocam.stim import Electrode
+
+    electrodes = []
+    for chunk in value.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(",")
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError(
+                f"{chunk!r} is not a row,col pair; expected e.g. '10,10' or "
+                "'10,10;11,12'")
+        try:
+            row, col = (int(part) for part in parts)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{chunk!r} has a non-integer coordinate") from None
+        electrodes.append(Electrode(row, col))
+    if not electrodes:
+        raise argparse.ArgumentTypeError("no electrodes given")
+    return tuple(electrodes)
+
+
+def _grid(value: str):
+    from biocam.stim import ElectrodeGrid
+
+    parts = value.lower().split("x")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not ROWSxCOLS, e.g. '64x64'")
+    try:
+        rows, cols = (int(part) for part in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} has a non-integer dimension") from None
+    try:
+        return ElectrodeGrid(rows, cols)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 class _ConsolePrinter:
@@ -639,10 +764,200 @@ def convert_command(args) -> int:
     return convert_main([args.raw, args.meta, args.out])
 
 
+def _spec_from(args):
+    """Build a PulseSpec from the parsed arguments.
+
+    The second phase defaults to the mirror image of the first, because that
+    is the charge-balanced pulse and it is what an experimenter almost always
+    means. Asking for an unbalanced one should be deliberate.
+    """
+    from biocam.stim import PulseSpec
+
+    amplitude2 = (
+        -args.amplitude if args.amplitude2 is None else args.amplitude2
+    )
+    phase2_us = args.phase_us if args.phase2_us is None else args.phase2_us
+    return PulseSpec(
+        amplitude1=args.amplitude,
+        phase1_us=args.phase_us,
+        inter_us=args.gap_us,
+        amplitude2=amplitude2,
+        phase2_us=phase2_us,
+        name="cli-pulse",
+    )
+
+
+def _plan_stimulus(args, constraints):
+    """Plan a pulse or a train, whichever the arguments describe."""
+    from biocam.stim import TrainSpec, plan, plan_train
+
+    spec = _spec_from(args)
+    balanced = not args.allow_unbalanced
+
+    if args.count <= 1 and args.rate_hz is None and args.period_us is None:
+        return plan(spec, constraints, require_charge_balance=balanced), None
+
+    if args.rate_hz is not None:
+        train = TrainSpec.at_rate(
+            spec, count=args.count, rate_hz=args.rate_hz,
+            delay_us=args.delay_us, name="cli-train")
+    elif args.period_us is not None:
+        train = TrainSpec(
+            spec, count=args.count, period_us=args.period_us,
+            delay_us=args.delay_us, name="cli-train")
+    else:
+        raise SystemExit(
+            "--count above 1 needs --rate-hz or --period-us to say how fast "
+            "the train repeats")
+
+    train_plan = plan_train(
+        train, constraints,
+        require_charge_balance=balanced,
+        allow_short_period=args.allow_short_period,
+    )
+    return train_plan.pulse_plan, train_plan
+
+
+def stim_command(args) -> int:
+    from biocam.stim import (
+        PatternValidationError,
+        PulseValidationError,
+        StimConstraints,
+        StimPattern,
+        TrainValidationError,
+        validate_pattern,
+    )
+
+    pattern = StimPattern(
+        positive=args.positive, negative=args.negative, name="cli-pattern"
+    )
+
+    if args.dry_run:
+        if args.time_resolution_us is None:
+            print(
+                "--dry-run needs --time-resolution-us: the stimulator's clock "
+                "period decides how every duration is interpreted, and this "
+                "machine cannot read it from the instrument. Do not guess it "
+                "for a protocol you intend to run - read it from the device "
+                "(it is reported by `biocam stim` without --dry-run) or from "
+                "docs/api/stimulation-reference.md once the lab has confirmed "
+                "it.",
+                file=sys.stderr,
+            )
+            return 2
+        constraints = StimConstraints(
+            time_resolution_us=args.time_resolution_us,
+            amplitude_resolution=args.amplitude_resolution,
+            min_amplitude=-args.max_amplitude,
+            max_amplitude=args.max_amplitude,
+            max_total_ticks=args.max_total_ticks,
+        )
+    else:
+        constraints = None  # read from the device below
+
+    if constraints is None:
+        # Imported here, never at module scope: importing biocam.interop
+        # requires the 3Brain DLLs, and `biocam convert` must keep working on
+        # a machine that has none.
+        from biocam.interop.device import BioCamDevice
+        from biocam.interop.stimulator import Stimulator, StimulatorError
+
+        def warn(message):
+            print(f"WARNING: {message}", file=sys.stderr)
+
+        try:
+            with BioCamDevice() as device, Stimulator(
+                device,
+                grid=args.grid,
+                enforce_column_rule=not args.no_column_rule,
+                warn=warn,
+            ) as stimulator:
+                constraints = stimulator.constraints
+                print(f"stimulator constraints: {constraints}")
+                try:
+                    pulse_plan, train_plan = _plan_stimulus(args, constraints)
+                    validate_pattern(
+                        pattern, args.grid,
+                        enforce_column_rule=not args.no_column_rule)
+                except (
+                    PulseValidationError,
+                    TrainValidationError,
+                    PatternValidationError,
+                ) as exc:
+                    print(f"\nrefused: {exc}", file=sys.stderr)
+                    return 2
+
+                print(f"\n{(train_plan or pulse_plan).describe()}")
+                print(f"positive: {', '.join(str(e) for e in pattern.positive)}")
+                print(f"negative: {', '.join(str(e) for e in pattern.negative)}")
+
+                if train_plan is None:
+                    streaming = bool(device.biocam.IsStreaming)
+                    latency = stimulator.send_now(pulse_plan, pattern)
+                    if streaming:
+                        print(f"\nsent. latency {latency} clock cycles "
+                              "(relative to the beginning of the acquisition; "
+                              "convert with IBioCam.ClockCyclesToMilliseconds "
+                              "rather than a guessed clock rate)")
+                    else:
+                        # The warning went to stderr and may be far up the
+                        # scrollback by now. A latency measured from an
+                        # acquisition that never started must not be printed
+                        # as though it meant something.
+                        print(f"\nsent. latency reported as {latency}, but "
+                              "MEANINGLESS: no acquisition was running, and "
+                              "the value is measured in clock cycles from the "
+                              "beginning of one.")
+                else:
+                    stimulator.send_scheduled(train_plan, pattern)
+                    print(f"\nqueued {train_plan.count} pulses. Timestamps are "
+                          "relative to the beginning of the acquisition, so "
+                          "this fires only if the acquisition has not passed "
+                          "them.")
+        except StimulatorError as exc:
+            # Reported rather than allowed to traceback: the messages name the
+            # documented cause, and a colleague on the instrument should get
+            # those rather than a stack trace.
+            print(f"\nstimulator error: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
+    # --dry-run: no device, no DLLs.
+    try:
+        pulse_plan, train_plan = _plan_stimulus(args, constraints)
+        validate_pattern(
+            pattern, args.grid, enforce_column_rule=not args.no_column_rule)
+    except (
+        PulseValidationError,
+        TrainValidationError,
+        PatternValidationError,
+    ) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"planned against: {constraints}")
+    print(f"\n{(train_plan or pulse_plan).describe()}")
+    print(f"positive: {', '.join(str(e) for e in pattern.positive)}")
+    print(f"negative: {', '.join(str(e) for e in pattern.negative)}")
+    if train_plan is not None:
+        shown = ", ".join(f"{t:g}" for t in train_plan.timestamps_us[:8])
+        more = " ..." if train_plan.count > 8 else ""
+        print(f"timestamps (us from start of acquisition): {shown}{more}")
+        print(f"train net charge: {train_plan.net_charge_pc:+g} pC")
+    print(
+        "\nNOT SENT (--dry-run). The constraints above were supplied on the "
+        "command line, not read from an instrument; if they differ from the "
+        "device's, this plan is wrong."
+    )
+    return 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "record":
         return record_command(args)
+    if args.command == "stim":
+        return stim_command(args)
     return convert_command(args)
 
 

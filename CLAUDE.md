@@ -17,7 +17,14 @@ of what to check.
 - `biocam/interop/` — Layer 1, .NET interop via pythonnet. The only package
   allowed to import `clr`. Cannot be tested here; written and reviewed by hand.
 - `biocam/data/` — Layer 2, pure byte/number logic. Fully testable here.
+- `biocam/stim/` — Layer 2, stimulation modelling and validation. Pure
+  arithmetic; no `clr`, no device. Fully testable here.
 - `biocam/analysis/` — Layer 3, signal processing. Fully testable here.
+
+Two Layer 1 modules are exceptions worth knowing about: `interop/reflect.py`
+and `interop/verify_stim_model.py` need the DLLs but **not** the instrument,
+because loading an assembly and reading its metadata makes no USB call. They
+are the only Layer 1 code that produces verified ground truth on this machine.
 
 Layer 2 code is never written without tests. It is testable, so untested Layer 2
 code is not a limitation of the environment — it's a choice, and the wrong one.
@@ -36,14 +43,38 @@ Never guess a .NET member name, signature, or behavior. Verify against:
 - `BioCam_DupleX_API/SampleApp_BioCamCL/MainForm.cs`
 
 The stimulator lifecycle is `Initialize → Start → Stop → Close`. `connector.py`
-currently never calls `Start()`, so stimulation silently fails to fire — a known
-defect. Remediation is scheduled in
-`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md`; check that
-file for the current phase rather than assuming one here.
+calls only `Initialize()` and `Close()` — a known defect, remediated by
+`biocam/interop/stimulator.py`, which runs all four and checks every return.
+
+Do **not** describe the consequence as "stimulation silently fails to fire".
+That was this repo's wording and the XML contradicts it: every `Send` overload
+documents `InvalidOperationException` "when the stimulator has not started".
+`connector.py` never calls `Send` at all, so what it has is an incomplete
+lifecycle, not an observed silent failure. Issue #22 establishes what the
+DupleX actually does.
+
+Each lifecycle call documents exceptions as well as a bool return — `Initialize`
+throws if already initialized, `Stop`/`Reset` throw if not started, `Close`
+throws if not initialized. Handle both.
 
 `RectangularStimPulse` and `StimProperties` live in `_3Brain.Common`, which has
-**no XML documentation in this repo**. Their members cannot be verified from
-documentation here — treat any claim about them as unverifiable and say so.
+**no XML documentation in this repo**. They are nonetheless verifiable: run
+`python -m biocam.interop.reflect <TypeName>` to read the members straight off
+the assembly. That needs the DLLs but no instrument. Their verified surface is
+recorded in `docs/api/stimulation-reference.md` — regenerate rather than
+trusting the transcription, and never guess a member that reflection can tell
+you.
+
+**The stimulator adjusts invalid pulses instead of rejecting them.** An
+out-of-range amplitude is clamped, an off-grid amplitude is rounded, and a pulse
+over `MaxPulseDuration` has its *later* phases shortened — so a charge-balanced
+request can silently become one that injects net DC, with `IsBiphasic` still
+reporting true. Never hand a pulse to `RectangularStimPulse` without planning it
+through `biocam.stim.plan()` first and checking the result with
+`verify_built_pulse()`.
+
+`StimProperties.Default` is a placeholder, not the device's limits. Always build
+against `biocam.Stimulator.Properties`.
 
 ## The two mandatory gates
 
@@ -66,6 +97,11 @@ not repeatable on demand):
 - `python -m pytest` — runs the suite (Layers 2–3 and scaffolding only).
 - `python -m biocam.preflight` — environment checks only; does not detect or
   contact the device.
+- `python -m biocam.interop.reflect [Type…]` — read the 3Brain assemblies'
+  own metadata. Needs the DLLs, not the instrument.
+- `python -m biocam.interop.verify_stim_model` — check `biocam/stim/`'s
+  validation against the real `RectangularStimPulse`, in both directions.
+  Needs the DLLs, not the instrument.
 - `pip install -r requirements-dev.txt` — dev machine, no pythonnet.
 - `pip install -r requirements.txt` — lab machine, includes pythonnet.
 
