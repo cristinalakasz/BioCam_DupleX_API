@@ -57,6 +57,20 @@ class DriverDataLoss:
 
 
 @dataclass(frozen=True)
+class StimulationSuspended:
+    """Stimulation was disconnected mid-recording, and why.
+
+    Emitted rather than warned so it reaches the CLI's bounded printer ring
+    instead of writing to stderr from the consumer thread - the same reason
+    RecordingWriter emits everything else. A warnings.warn() here would block
+    on the one thread draining the packet queue under exactly the conditions
+    that already have it struggling.
+    """
+    reason: str
+    after_frame: int
+
+
+@dataclass(frozen=True)
 class DiskLow:
     free_bytes: int
     required_bytes: int
@@ -71,7 +85,7 @@ class RecordingStopped:
 
 RecordingEvent = Union[
     RecordingStarted, GapDetected, GapSummary, QueuePressure, QueueOverflow,
-    DriverDataLoss, DiskLow, RecordingStopped,
+    DriverDataLoss, StimulationSuspended, DiskLow, RecordingStopped,
 ]
 
 Listener = Callable[[RecordingEvent], None]
@@ -94,6 +108,9 @@ def describe(event) -> str:
         return f"QUEUE OVERFLOW: {event.total} packets dropped by our software"
     if isinstance(event, DriverDataLoss):
         return f"DRIVER DATA LOSS: {event.total} events reported by the driver"
+    if isinstance(event, StimulationSuspended):
+        return (f"STIMULATION SUSPENDED after frame {event.after_frame}: "
+                f"{event.reason}. The recording continues.")
     if isinstance(event, DiskLow):
         return (f"DISK LOW: {event.free_bytes:,} bytes free, "
                 f"{event.required_bytes:,} required")

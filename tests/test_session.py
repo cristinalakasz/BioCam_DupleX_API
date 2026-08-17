@@ -5,7 +5,9 @@ import time
 import numpy as np
 import pytest
 
-from biocam.data.events import DriverDataLoss, QueueOverflow
+from biocam.data.events import (
+    DriverDataLoss, QueueOverflow, StimulationSuspended,
+)
 from biocam.data.recording import AcquisitionParameters, RecordingWriter, read_sidecar
 from biocam.data.replay import Packet, ReplayPacketSource
 from biocam.session import (
@@ -843,9 +845,16 @@ def test_a_clock_that_raises_costs_the_clock_and_not_the_recording(tmp_path):
     source, data = _source(tmp_path, 100, frames_per_packet=10)
     raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
     clock = ExplodingClock()
-    with pytest.warns(RuntimeWarning, match="acquisition clock stopped"):
-        with RecordingWriter(raw, meta, PARAMS) as writer:
-            result = record_session(source, writer, clock=clock)
+    events = []
+    with RecordingWriter(raw, meta, PARAMS, listener=events.append) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    # Emitted, not warned: warnings.warn writes to stderr from the consumer
+    # thread, bypassing the bounded printer ring that exists to stop a
+    # blocked stdout stalling the drain.
+    suspensions = [e for e in events if isinstance(e, StimulationSuspended)]
+    assert len(suspensions) == 1
+    assert "acquisition clock stopped being fed" in suspensions[0].reason
 
     assert result.n_frames == 100
     assert result.verdict == "clean"
@@ -863,7 +872,9 @@ def test_stimulation_is_serviced_between_packets(tmp_path):
     from biocam.control import StimulationQueue
 
     source, _ = _source(tmp_path, 100, frames_per_packet=10)
-    q = StimulationQueue()
+    # min_interval_us off: this is about one-per-packet, and a replay
+    # source runs far faster than any real acquisition.
+    q = StimulationQueue(min_interval_us=0.0)
     sent = []
     q.request("plan", "pattern", label="one")
     q.request("plan", "pattern", label="two")
@@ -883,7 +894,7 @@ def test_only_one_stimulus_is_dispatched_per_packet(tmp_path):
     from biocam.control import StimulationQueue
 
     source, _ = _source(tmp_path, 100, frames_per_packet=10)
-    q = StimulationQueue(capacity=64)
+    q = StimulationQueue(capacity=64, min_interval_us=0.0)
     for _ in range(20):
         q.request("plan", "pattern")
     sent = []
@@ -908,9 +919,14 @@ def test_a_service_that_raises_costs_the_stimulus_and_not_the_recording(
         raise RuntimeError("control thread is on fire")
 
     raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
-    with pytest.warns(RuntimeWarning, match="stimulation service failed"):
-        with RecordingWriter(raw, meta, PARAMS) as writer:
-            result = record_session(source, writer, service=broken)
+    events = []
+    with RecordingWriter(raw, meta, PARAMS, listener=events.append) as writer:
+        result = record_session(source, writer, service=broken)
+
+    suspensions = [e for e in events if isinstance(e, StimulationSuspended)]
+    assert len(suspensions) == 1
+    assert "stimulation service raised" in suspensions[0].reason
+    assert suspensions[0].after_frame > 0
 
     assert result.n_frames == 100
     assert result.verdict == "clean"

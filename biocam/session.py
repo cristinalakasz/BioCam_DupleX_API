@@ -14,7 +14,9 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional
 
-from biocam.data.events import DriverDataLoss, QueueOverflow
+from biocam.data.events import (
+    DriverDataLoss, QueueOverflow, StimulationSuspended,
+)
 
 # Wall-clock ceiling for a "drain to exhaustion" pass (record_session's
 # drain=True mode - see cli.py FIX 1). After Ctrl+C, the normal
@@ -74,13 +76,19 @@ def _feed_clock(clock, packet, writer):
             packet, writer.n_frames_written, writer.n_frames_missing
         )
     except Exception as exc:  # noqa: BLE001 - the recording outranks the clock
-        warnings.warn(
-            f"acquisition clock stopped being fed after "
-            f"{writer.n_frames_written} frames: {exc}. The recording "
-            "continues; scheduled stimulation must not be timed against this "
-            "session.",
-            RuntimeWarning,
-        )
+        # Emitted, not warned. warnings.warn writes to stderr from the
+        # consumer thread, bypassing the CLI's bounded printer ring - the ring
+        # that exists because print() on this thread stalls under Windows
+        # QuickEdit, a full pipe or a slow log collector. One blocked write on
+        # the only thread draining the packet queue is a stall, one-shot or
+        # not. writer.emit is already the route everything else on this path
+        # takes, and it is guarded against a listener that raises.
+        writer.emit(StimulationSuspended(
+            reason=f"the acquisition clock stopped being fed ({exc}); "
+                   "scheduled stimulation must not be timed against this "
+                   "session",
+            after_frame=writer.n_frames_written,
+        ))
         return None
     return clock
 
@@ -102,12 +110,12 @@ def _run_service(service, writer):
     try:
         service()
     except Exception as exc:  # noqa: BLE001 - the recording outranks the stimulus
-        warnings.warn(
-            f"stimulation service failed after {writer.n_frames_written} "
-            f"frames and has been disconnected for the rest of this "
-            f"recording: {exc}. The recording continues.",
-            RuntimeWarning,
-        )
+        # Emitted rather than warned, for the reason given in _feed_clock.
+        writer.emit(StimulationSuspended(
+            reason=f"the stimulation service raised ({exc}) and has been "
+                   "disconnected for the rest of this recording",
+            after_frame=writer.n_frames_written,
+        ))
         return None
     return service
 
