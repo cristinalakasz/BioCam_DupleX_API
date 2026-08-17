@@ -5,7 +5,9 @@ import time
 import numpy as np
 import pytest
 
-from biocam.data.events import DriverDataLoss, QueueOverflow
+from biocam.data.events import (
+    DriverDataLoss, QueueOverflow, StimulationSuspended,
+)
 from biocam.data.recording import AcquisitionParameters, RecordingWriter, read_sidecar
 from biocam.data.replay import Packet, ReplayPacketSource
 from biocam.session import (
@@ -726,3 +728,218 @@ def test_finally_drain_survives_a_write_failure_and_still_finalises(tmp_path, mo
     integrity = record["integrity"]
     assert integrity["discarded_at_stop"] > 0
     assert integrity["verdict"] != "clean"
+
+
+# --------------------------------------------------------------------------
+# the acquisition clock, driven through a real writer
+# --------------------------------------------------------------------------
+
+def test_the_clock_tracks_acquisition_time_through_a_real_recording(tmp_path):
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(tmp_path, 1000, frames_per_packet=10)
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    # 1000 frames at 1 kHz is one second of acquisition.
+    assert result.n_frames == 1000
+    assert clock.frames_seen == 1000
+    assert clock.now_us() == pytest.approx(1_000_000.0)
+
+
+def test_the_clock_counts_dropped_packets_as_elapsed_time(tmp_path):
+    # The instrument kept acquiring while those packets were missing, so the
+    # clock must not run slow. This is the case that would otherwise schedule
+    # a stimulus early by exactly the duration of the loss.
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(
+        tmp_path, 1000, frames_per_packet=10, drop_packets=(10, 11, 12, 13, 14))
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    assert result.verdict == "gaps_detected"
+    assert clock.frames_seen == 950
+    assert clock.frames_lost == 50
+    # 950 received + 50 lost is still a full second of acquisition.
+    assert clock.now_us() == pytest.approx(1_000_000.0)
+
+
+def test_a_session_without_a_clock_is_unaffected(tmp_path):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer)
+    assert result.n_frames == 100
+    assert raw.read_bytes() == data.tobytes()
+
+
+def test_the_writer_reports_missing_frames(tmp_path):
+    source, _ = _source(
+        tmp_path, 1000, frames_per_packet=10, drop_packets=(5, 6))
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(source, writer)
+        assert writer.n_frames_missing == 20
+
+
+def test_the_clock_sees_the_frames_the_finally_drain_writes(tmp_path):
+    # The backlog drain in record_session's `finally` writes real frames. It
+    # once did not feed the clock, which on an ordinary --duration run left
+    # the clock short by the whole backlog - 40x the disagreement tolerance,
+    # and so a confident "do not schedule stimulation against this" printed
+    # at the end of a healthy recording.
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(tmp_path, 1000, frames_per_packet=10)
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        # 55 frames is mid-burst: the limit lands inside a 10-frame packet,
+        # so the loop stops with the rest of the source still to drain.
+        result = record_session(source, writer, duration_sec=0.055, clock=clock)
+        assert clock.frames_seen == writer.n_frames_written
+
+    assert result.stop_reason == "duration_reached"
+    assert clock.frames_seen == result.n_frames
+
+
+def test_a_second_record_session_keeps_feeding_the_same_clock(tmp_path):
+    # cli.py calls record_session twice with the same writer and the same
+    # clock after a KeyboardInterrupt. The clock differences the writer's
+    # running totals, so the second call must pick up where the first left
+    # off rather than raising about totals going backwards.
+    from biocam.data.clock import AcquisitionClock
+
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    first, _ = _source(tmp_path, 500, frames_per_packet=10)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(first, writer, duration_sec=0.2, clock=clock)
+        after_first = clock.frames_seen
+        assert after_first == writer.n_frames_written
+
+        second = ReplayPacketSource(tmp_path / "src.raw", PARAMS,
+                                    frames_per_packet=10)
+        record_session(second, writer, drain=True, clock=clock)
+        assert clock.frames_seen > after_first
+        assert clock.frames_seen == writer.n_frames_written
+
+
+def test_a_clock_that_raises_costs_the_clock_and_not_the_recording(tmp_path):
+    # An escaping exception here would skip the backlog drain, skip
+    # finalise(), and stamp an intact raw file "failed". Losing the clock is
+    # not a reason to lose the recording.
+    class ExplodingClock:
+        def __init__(self):
+            self.calls = 0
+
+        def observe_totals(self, packet, frames_written, frames_missing):
+            self.calls += 1
+            raise ValueError("totals went backwards")
+
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    clock = ExplodingClock()
+    events = []
+    with RecordingWriter(raw, meta, PARAMS, listener=events.append) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    # Emitted, not warned: warnings.warn writes to stderr from the consumer
+    # thread, bypassing the bounded printer ring that exists to stop a
+    # blocked stdout stalling the drain.
+    suspensions = [e for e in events if isinstance(e, StimulationSuspended)]
+    assert len(suspensions) == 1
+    assert "acquisition clock stopped being fed" in suspensions[0].reason
+
+    assert result.n_frames == 100
+    assert result.verdict == "clean"
+    assert raw.read_bytes() == data.tobytes()
+    assert read_sidecar(meta)["status"] == "complete"
+    # Dropped after the first failure rather than raising on every packet.
+    assert clock.calls == 1
+
+
+# --------------------------------------------------------------------------
+# stimulation on the consumer thread, between packets
+# --------------------------------------------------------------------------
+
+def test_stimulation_is_serviced_between_packets(tmp_path):
+    from biocam.control import StimulationQueue
+
+    source, _ = _source(tmp_path, 100, frames_per_packet=10)
+    # min_interval_us off: this is about one-per-packet, and a replay
+    # source runs far faster than any real acquisition.
+    q = StimulationQueue(min_interval_us=0.0)
+    sent = []
+    q.request("plan", "pattern", label="one")
+    q.request("plan", "pattern", label="two")
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(
+            source, writer, service=lambda: q.service(sent.append))
+
+    assert result.n_frames == 100
+    assert [r.label for r in sent] == ["one", "two"]
+    assert q.dispatched == 2
+
+
+def test_only_one_stimulus_is_dispatched_per_packet(tmp_path):
+    # Ten packets, twenty requests: a backlog must not become a burst.
+    from biocam.control import StimulationQueue
+
+    source, _ = _source(tmp_path, 100, frames_per_packet=10)
+    q = StimulationQueue(capacity=64, min_interval_us=0.0)
+    for _ in range(20):
+        q.request("plan", "pattern")
+    sent = []
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(source, writer, service=lambda: q.service(sent.append))
+
+    # 10 packets means at most 10 dispatches, and the rest stay queued.
+    assert len(sent) == 10
+    assert len(q) == 10
+
+
+def test_a_service_that_raises_costs_the_stimulus_and_not_the_recording(
+    tmp_path,
+):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError("control thread is on fire")
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    events = []
+    with RecordingWriter(raw, meta, PARAMS, listener=events.append) as writer:
+        result = record_session(source, writer, service=broken)
+
+    suspensions = [e for e in events if isinstance(e, StimulationSuspended)]
+    assert len(suspensions) == 1
+    assert "stimulation service raised" in suspensions[0].reason
+    assert suspensions[0].after_frame > 0
+
+    assert result.n_frames == 100
+    assert result.verdict == "clean"
+    assert raw.read_bytes() == data.tobytes()
+    assert read_sidecar(meta)["status"] == "complete"
+    # Disconnected after the first failure, not re-entered on every packet.
+    assert len(calls) == 1
+
+
+def test_a_session_without_a_service_is_unaffected(tmp_path):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer)
+    assert result.n_frames == 100
+    assert raw.read_bytes() == data.tobytes()

@@ -68,6 +68,7 @@ import time
 import warnings
 from pathlib import Path
 
+from biocam.data.clock import AcquisitionClock
 from biocam.data.events import DiskLow, DriverDataLoss, QueueOverflow, describe
 from biocam.data.recording import AcquisitionParameters, RecordingWriter
 from biocam.preflight import bytes_per_second, check_disk_space
@@ -290,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="MEA dimensions as ROWSxCOLS, for bounds-checking electrodes "
              "(default 64x64). ChCoord does not bounds-check, so this is the "
              "only place an out-of-array electrode is caught")
+    stim.add_argument(
+        "--log", type=str, default=None,
+        help="write a JSON record of every stimulation attempt to this path. "
+             "Keep it beside the recording: without it there is no way to "
+             "say afterwards which stimulus corresponds to which moment in "
+             "the signal, and that correspondence cannot be reconstructed")
     stim.add_argument(
         "--dry-run", action="store_true",
         help="plan and print the stimulus without touching the instrument. "
@@ -605,6 +612,13 @@ def record_command(args) -> int:
             # nothing consuming it while those syscalls ran. It also means
             # a writer that cannot open its output file can no longer claim
             # the stream in the first place.
+            # Fed by record_session on the consumer thread. Pure arithmetic -
+            # nothing on the callback path - and it is what gives a scheduled
+            # stimulus a time origin. Its warnings are reported at the end,
+            # because a clock that cannot agree with itself must not be
+            # scheduled against silently.
+            clock = AcquisitionClock(params.frame_rate_hz)
+
             with RecordingWriter(raw_path, meta_path, params,
                                  listener=report) as writer:
                 # Gate 1, item A: start() lives inside the try whose finally
@@ -625,7 +639,8 @@ def record_command(args) -> int:
                         result = record_session(source, writer,
                                                 duration_sec=args.duration,
                                                 stop_event=stop, counters=source,
-                                                stop_source=source.stop)
+                                                stop_source=source.stop,
+                                                clock=clock)
                     except KeyboardInterrupt:
                         stop.set()
                         # The first call's `finally` already ran stop_source
@@ -641,6 +656,7 @@ def record_command(args) -> int:
                         # passed too so this call is correct even run on its
                         # own.
                         result = record_session(source, writer, drain=True,
+                                                clock=clock,
                                                 counters=source,
                                                 stop_source=source.stop)
                 finally:
@@ -704,6 +720,20 @@ def record_command(args) -> int:
             "inside a driver callback")
 
     session_only_lines = []
+    # The clock's own account of itself. Not in the sidecar - it describes
+    # what could be scheduled against this recording, not what the recording
+    # contains - so it is grouped with the session-only lines. Worth printing
+    # even when clean, because "the instrument's clock and our frame count
+    # agree" is the precondition for scheduled stimulation and the colleague
+    # has no other way to learn it.
+    try:
+        reading = clock.read()
+        session_only_lines.append(f"ACQUISITION CLOCK: {reading.describe()}")
+        for warning in clock.warnings():
+            session_only_lines.append(f"ACQUISITION CLOCK: {warning}")
+    except Exception as exc:  # noqa: BLE001 - a summary line is not worth raising for
+        session_only_lines.append(f"ACQUISITION CLOCK: unavailable ({exc})")
+
     if printer.dropped:
         session_only_lines.append(
             f"CONSOLE OUTPUT DROPPED: {printer.dropped} event(s) - printing "
@@ -865,15 +895,33 @@ def stim_command(args) -> int:
         def warn(message):
             print(f"WARNING: {message}", file=sys.stderr)
 
+        from biocam.stim import StimulusLog
+
+        log = StimulusLog()
+        # Read from the device inside the with-block below. Without it every
+        # immediate stimulus lands in the log with a latency in clock cycles
+        # and no way to turn it into a time - which is the one thing the log
+        # exists to preserve.
+        cycles_per_us = None
         try:
             with BioCamDevice() as device, Stimulator(
                 device,
                 grid=args.grid,
                 enforce_column_rule=not args.no_column_rule,
                 warn=warn,
+                log=log,
             ) as stimulator:
                 constraints = stimulator.constraints
+                cycles_per_us = stimulator.cycles_per_us
                 print(f"stimulator constraints: {constraints}")
+                if cycles_per_us:
+                    print(f"clock: {cycles_per_us:g} cycles/us "
+                          "(IBioCam.ClockCyclesToMilliseconds)")
+                else:
+                    print("WARNING: could not read "
+                          "IBioCam.ClockCyclesToMilliseconds, so any latency "
+                          "in the stimulus log stays in raw clock cycles and "
+                          "cannot be converted to a time.", file=sys.stderr)
                 try:
                     pulse_plan, train_plan = _plan_stimulus(args, constraints)
                     validate_pattern(
@@ -914,13 +962,25 @@ def stim_command(args) -> int:
                           "relative to the beginning of the acquisition, so "
                           "this fires only if the acquisition has not passed "
                           "them.")
+            status = 0
         except StimulatorError as exc:
             # Reported rather than allowed to traceback: the messages name the
             # documented cause, and a colleague on the instrument should get
             # those rather than a stack trace.
             print(f"\nstimulator error: {exc}", file=sys.stderr)
-            return 2
-        return 0
+            status = 2
+        finally:
+            # Written even when the attempt failed, and especially then: a
+            # stimulus that did not fire is part of the record, because a hole
+            # in a train looks exactly like a stimulus that evoked nothing.
+            if args.log:
+                try:
+                    log.write(args.log, cycles_per_us=cycles_per_us)
+                    print(f"stimulus log: {args.log} ({log.describe()})")
+                except OSError as exc:
+                    print(f"WARNING: could not write the stimulus log to "
+                          f"{args.log}: {exc}", file=sys.stderr)
+        return status
 
     # --dry-run: no device, no DLLs.
     try:

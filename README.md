@@ -40,6 +40,7 @@ each one; #16 is the ten-minute first session, #21 the first stimulation step.
 13. [Before handing code to the lab](#13-before-handing-code-to-the-lab)
 14. [Roadmap and status](#14-roadmap-and-status)
 15. [Stimulation](#15-stimulation)
+16. [Recording and stimulating together](#16-recording-and-stimulating-together)
 
 ---
 
@@ -668,8 +669,8 @@ only:
 |---|---|---|
 | 0 | Setup: `CLAUDE.md`, verifier agents, test scaffolding, this README | **Done** |
 | 1 | Acquisition: recording, saving, data integrity, on the three-layer split | **Done and merged.** Gate 1 clean. Never run on the instrument — issues #11–#18 |
-| 2 | Stimulation engine + manual and scheduled triggering | **In progress.** `biocam/stim/` and `biocam/interop/stimulator.py` written, Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
-| 3 | Session control: recording and stimulation together, changing live | Not started |
+| 2 | Stimulation engine + manual and scheduled triggering | **Merged** (PR #25), Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
+| 3 | Session control: recording and stimulation together, changing live | **In progress.** The acquisition clock, the stimulus log and the control queue are built (§16). No combined command yet — issues #26, #27 |
 | 4 | UI | Not started |
 | 5 | Spike detection | Not started |
 | 6 | Closed-loop stimulation (depends on Phase 5) | Not started |
@@ -820,3 +821,85 @@ the validation.
 The full recovered surface, the measurements behind every claim above, and the
 list of what still needs the instrument are in
 `docs/api/stimulation-reference.md`.
+
+---
+
+## 16. Recording and stimulating together
+
+**Built, never run on the instrument.** Two things here can only be settled in
+the lab, and both have issues: how long a stimulus takes to dispatch (#26) and
+whether the arrangement below is required or merely cautious (#27).
+
+### 16.1 Where "now" comes from
+
+Scheduled stimulation takes timestamps measured **from the beginning of the
+acquisition**, so sending one requires knowing how far into the acquisition
+you are. Phase 2 could not answer that, which is why `biocam stim --count N`
+shipped unable to run.
+
+The answer was already in every packet: `DataPacketHeader.Timestamp`.
+`biocam.data.clock.AcquisitionClock` turns it into a clock, fed by
+`record_session` as packets are written.
+
+Three things it is careful about, each a way of being *silently* wrong:
+
+- **A timestamp of `0` means "not available", not "time zero".** The
+  difference is the whole elapsed duration of the recording.
+- **Frames lost to gaps still count as elapsed time.** The instrument kept
+  acquiring; counting only what arrived would schedule early by exactly the
+  duration of the loss.
+- **The device clock and the frame count are compared** — but only when the
+  conversion factor came from the instrument. When the clock calibrates its
+  own factor, the comparison reduces to an identity and cannot detect
+  anything, and it says so rather than reporting a pass.
+
+Every recording now ends with an `ACQUISITION CLOCK:` line saying where it
+got to, which estimate it used, and anything it distrusts.
+
+### 16.2 Stimulation runs on the acquisition thread
+
+`biocam.control.StimulationQueue` takes requests from any thread and hands
+them to the recording loop, which dispatches them between packets.
+
+That is the arrangement 3Brain's own sample uses, and it is deliberate: **the
+documentation nowhere states whether `Send` may be called from another
+thread**, so this avoids depending on the answer. Issue #27 asks for it.
+
+The cost is that a stimulus spends part of the packet queue's drain budget. At
+`--packet-ms 1` the consumer has 1000 µs per packet for *everything*. So:
+
+- requesting never blocks — a full queue drops and counts rather than growing;
+- at most one stimulus is dispatched per packet, so a backlog cannot become a
+  burst;
+- every dispatch is timed, and `summary()` reports the slowest.
+
+**Watch `queue_overflows` in the sidecar.** If a recording with stimulation
+shows overflows and the same recording without shows none, stimulating is
+costing you packets. That is what issue #26 measures.
+
+### 16.3 The stimulus log
+
+`biocam.stim.StimulusLog`, written with `biocam stim --log <path>`.
+
+Keep it beside the recording. Without it there is no way to say afterwards
+which stimulus corresponds to which moment in the signal, and **that
+correspondence cannot be reconstructed** — a 4096-channel recording with no
+stimulus times is not an experiment.
+
+Two details worth knowing when you read one:
+
+- **Refusals are recorded too.** A stimulus that did not fire looks, in the
+  signal, exactly like one that evoked nothing. `outcome` is `sent`,
+  `refused` (this software declined) or `rejected` (the driver did).
+- **`time_is_measured` tells you which clock you are reading.**
+  `best_time_us` prefers the latency the driver reported, which is a
+  measurement; it falls back to the acquisition clock, which is only a lower
+  bound on when the stimulus went out.
+
+### 16.4 What is still missing
+
+There is **no command yet that records and stimulates in one run**. The
+mechanism is built and tested; driving it — a window with a "stimulate now"
+button, a protocol timeline — is Phase 4. Until then `biocam record` and
+`biocam stim` are separate, and scheduled trains are not usable from the CLI
+at all (§15.5).

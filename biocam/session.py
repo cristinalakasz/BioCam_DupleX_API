@@ -13,7 +13,9 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from biocam.data.events import DriverDataLoss, QueueOverflow
+from biocam.data.events import (
+    DriverDataLoss, QueueOverflow, StimulationSuspended,
+)
 
 # Wall-clock ceiling for a "drain to exhaustion" pass (record_session's
 # drain=True mode - see cli.py FIX 1). After Ctrl+C, the normal
@@ -44,6 +46,79 @@ DRAIN_DEADLINE_SEC = 5.0
 COUNTER_CHECK_INTERVAL_PACKETS = 200
 
 
+def _feed_clock(clock, packet, writer):
+    """Feed the acquisition clock one packet. Returns the clock, or None.
+
+    Fed from the writer's own running totals rather than counted a second
+    time here, so the clock and the sidecar can never disagree about how many
+    frames a recording holds. Pure integer arithmetic on the consumer thread -
+    nothing on the callback path, nothing that allocates, nothing that grows.
+
+    The guard is the point. This is the only call on the packet loop that can
+    raise something other than an OSError, and an escaping exception here is
+    catastrophically out of proportion to its cause: `interrupted` would be
+    set, which skips the backlog drain, `pending_count()` and
+    `note_discarded()`; `finalise()` would never run; and
+    `RecordingWriter.__exit__` would stamp an otherwise intact raw file
+    `status="failed"`. Up to a full queue of acquired data - hundreds of
+    megabytes - would be written nowhere and counted nowhere, because a clock
+    used for scheduling stimuli disagreed with itself.
+
+    Losing the clock is not a reason to lose the recording. So a failure drops
+    the clock and lets the recording continue, exactly as
+    `RecordingWriter._emit` already does for a listener that raises.
+    """
+    if clock is None:
+        return None
+    try:
+        clock.observe_totals(
+            packet, writer.n_frames_written, writer.n_frames_missing
+        )
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the clock
+        # Emitted, not warned. warnings.warn writes to stderr from the
+        # consumer thread, bypassing the CLI's bounded printer ring - the ring
+        # that exists because print() on this thread stalls under Windows
+        # QuickEdit, a full pipe or a slow log collector. One blocked write on
+        # the only thread draining the packet queue is a stall, one-shot or
+        # not. writer.emit is already the route everything else on this path
+        # takes, and it is guarded against a listener that raises.
+        writer.emit(StimulationSuspended(
+            reason=f"the acquisition clock stopped being fed ({exc}); "
+                   "scheduled stimulation must not be timed against this "
+                   "session",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return clock
+
+
+def _run_service(service, writer):
+    """Run the between-packets hook once. Returns it, or None if it failed.
+
+    Guarded for the reason `_feed_clock` is: this runs inside the packet loop,
+    and an escaping exception there sets `interrupted`, which skips the
+    backlog drain, `pending_count()` and `finalise()`, leaving an intact raw
+    file stamped `failed` and a queue's worth of acquired data written
+    nowhere. A stimulus that could not be dispatched must not cost the
+    recording.
+
+    A hook that raises is dropped rather than retried every packet: if it is
+    broken it will stay broken, and re-entering it 9000 times a second would
+    turn one fault into a stall.
+    """
+    try:
+        service()
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the stimulus
+        # Emitted rather than warned, for the reason given in _feed_clock.
+        writer.emit(StimulationSuspended(
+            reason=f"the stimulation service raised ({exc}) and has been "
+                   "disconnected for the rest of this recording",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return service
+
+
 @dataclass(frozen=True)
 class SessionResult:
     raw_path: str
@@ -55,7 +130,7 @@ class SessionResult:
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
-                   stop_source=None) -> SessionResult:
+                   stop_source=None, clock=None, service=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -209,6 +284,19 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
+            clock = _feed_clock(clock, packet, writer)
+            if service is not None:
+                # Stimulation runs here, on the consumer thread, between
+                # packets - the arrangement 3Brain's own sample uses
+                # (MainForm.cs:383, inside the loop its data callback drives),
+                # which avoids depending on whether Send is safe from another
+                # thread. Nothing in the XML says whether it is.
+                #
+                # The cost is that this time comes out of the drain's budget,
+                # so `service` must dispatch at most one stimulus and must not
+                # raise. StimulationQueue.service does both, and times itself
+                # so the cost is measured rather than assumed.
+                service = _run_service(service, writer)
             packets_since_counter_check += 1
             if packets_since_counter_check >= COUNTER_CHECK_INTERVAL_PACKETS:
                 packets_since_counter_check = 0
@@ -301,6 +389,16 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                             counter=packet.counter,
                             payload=packet.payload,
                         )
+                        # This drain writes real frames, so the clock has to
+                        # see them. Omitting it left the clock short by the
+                        # whole backlog - and on an ordinary --duration run
+                        # this path fires almost every time, because the
+                        # frame limit lands mid-burst. Two seconds of
+                        # unobserved frames is 40x the clock's disagreement
+                        # tolerance, so the omission printed a confident
+                        # "do not schedule stimulation against this" at the
+                        # end of a perfectly healthy recording.
+                        clock = _feed_clock(clock, packet, writer)
                         if writer.disk_low:
                             # MEDIUM 1: same reasoning as the main loop -
                             # a full disk must stop this drain too, not
