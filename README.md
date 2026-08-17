@@ -9,11 +9,17 @@ on the instrument, not for the person who wrote the code. The author is
 it was wrong on the page, not caught by hand. Report discrepancies rather than
 working around them.
 
-**What works today:** recording raw signal to disk (`BioCam_DupleX_API/recorder.py`,
-with known defects — see §7). **What does not exist yet:** the rebuilt
-acquisition path, online spike detection, spike sorting, and closed-loop
-stimulation. §14 gives the current status; do not assume anything not listed
-there works.
+**What is built:** the rebuilt acquisition path (`python -m biocam.cli record`)
+and the stimulation engine (`python -m biocam.cli stim`, §15). **What does not
+exist yet:** combined recording-and-stimulation sessions, a UI, online spike
+detection, spike sorting, and closed-loop stimulation.
+
+**Built is not the same as proven.** None of this software has ever run on the
+instrument — not one recording, not one stimulus. It was written against the
+vendor's documentation and assemblies and reviewed by hand. The open
+`hardware-verification` issues list what has never executed and how to check
+each one; #16 is the ten-minute first session, #21 the first stimulation step.
+§14 gives the current status; do not assume anything not listed there works.
 
 ---
 
@@ -33,6 +39,7 @@ there works.
 12. [Development](#12-development)
 13. [Before handing code to the lab](#13-before-handing-code-to-the-lab)
 14. [Roadmap and status](#14-roadmap-and-status)
+15. [Stimulation](#15-stimulation)
 
 ---
 
@@ -42,14 +49,19 @@ This repository controls a 3Brain BioCAM DupleX: a 4096-channel high-density
 microelectrode array (MEA) system capable of both recording extracellular
 signal and delivering electrical stimulation.
 
-- **Works today:** recording raw signal from all 4096 channels to disk, and
-  reading it back into a NumPy array (`BioCam_DupleX_API/recorder.py`). This
-  script has known defects (§7, Appendix A of the design spec) and is
-  scheduled for a rebuild.
-- **Does not exist yet:** the rebuilt acquisition path (Phase 1), a stimulation
-  engine (Phase 2), combined recording+stimulation sessions (Phase 3), a UI
-  (Phase 4), online spike detection (Phase 5), and closed-loop stimulation
+- **Built:** the acquisition path (Phase 1) — `python -m biocam.cli record`,
+  recording all 4096 channels to disk with gap detection and an integrity
+  sidecar, plus conversion to HDF5 — and the stimulation engine (Phase 2),
+  `python -m biocam.cli stim` (§15).
+- **Superseded:** `BioCam_DupleX_API/recorder.py` and `connector.py`, the
+  original scripts. They have known defects (§7, Appendix A of the design
+  spec); Phase 1 replaced them.
+- **Does not exist yet:** combined recording+stimulation sessions (Phase 3), a
+  UI (Phase 4), online spike detection (Phase 5), and closed-loop stimulation
   (Phase 6). See §14.
+- **Never executed on the instrument:** all of it. The development machine is
+  ~600 km from the BioCAM. A green test suite is evidence about Layers 2–3
+  only (§12) and proves nothing about the .NET interop.
 
 If you were told "it can already do X" and X is not in the list above, ask
 before relying on it.
@@ -520,9 +532,12 @@ One line per top-level path:
 - `CLAUDE.md` — project briefing for Claude Code sessions; not duplicated here, see there for AI-agent-specific rules
 - `.claude/` — agent definitions (`biocam-api-verifier`, `realtime-safety-reviewer`, `dsp-implementer`) and tool permissions (`settings.json`)
 - `biocam/` — the Python package under active development, split by testability (§12):
-  - `biocam/interop/` — **Layer 1**: .NET interop via `pythonnet`. Cannot run without hardware and the DLLs (§4); the only package allowed to import `clr`. Empty in Phase 0, populated by Phase 1.
-  - `biocam/data/` — **Layer 2**: pure byte/number logic (payload decoding, frame reassembly, unit conversion). Fully testable with synthetic buffers. Empty in Phase 0, populated by Phase 1.
-  - `biocam/analysis/` — **Layer 3**: signal processing (spike detection, sorting). Fully testable against fixtures. Empty in Phase 0, populated starting Phase 5.
+  - `biocam/interop/` — **Layer 1**: .NET interop via `pythonnet`. The only package allowed to import `clr`. Mostly needs the instrument; `reflect.py` and `verify_stim_model.py` are the exceptions, needing the DLLs but no BioCAM (§15).
+  - `biocam/data/` — **Layer 2**: pure byte/number logic (payload decoding, frame reassembly, unit conversion, integrity). Fully testable with synthetic buffers.
+  - `biocam/stim/` — **Layer 2**: stimulation modelling — pulses, electrode patterns, trains, arbitrary sequences, and the validation that keeps the driver from silently altering any of them (§15). Pure arithmetic; no `clr`, no device.
+  - `biocam/analysis/` — **Layer 3**: signal processing (spike detection, sorting). Fully testable against fixtures. Populated starting Phase 5.
+  - `biocam/cli.py` — the `record`, `convert` and `stim` subcommands
+  - `biocam/session.py` — the recording loop that joins a packet source to a writer
   - `biocam/preflight.py` — the environment check run by `python -m biocam.preflight` (§6)
 - `BioCam_DupleX_API/` — legacy, pre-layer-split code and vendor material:
   - `connector.py`, `recorder.py`, `Hello_BioCam.py` — the working-but-defective scripts described in §7 and §10
@@ -652,8 +667,8 @@ only:
 | Phase | Contents | Status |
 |---|---|---|
 | 0 | Setup: `CLAUDE.md`, verifier agents, test scaffolding, this README | **Done** |
-| 1 | Acquisition: recording, saving, data integrity, on the three-layer split | Not started |
-| 2 | Stimulation engine + manual and scheduled triggering | Not started |
+| 1 | Acquisition: recording, saving, data integrity, on the three-layer split | **Done and merged.** Gate 1 clean. Never run on the instrument — issues #11–#18 |
+| 2 | Stimulation engine + manual and scheduled triggering | **In progress.** `biocam/stim/` and `biocam/interop/stimulator.py` written, Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
 | 3 | Session control: recording and stimulation together, changing live | Not started |
 | 4 | UI | Not started |
 | 5 | Spike detection | Not started |
@@ -661,3 +676,136 @@ only:
 
 If this table and the roadmap document ever disagree, the roadmap document is
 correct — this table is a pointer, not a second source of truth.
+
+---
+
+## 15. Stimulation
+
+**Nothing in this section has ever run on the instrument.** The API was
+recovered by reading the shipped assemblies; the code was checked against them;
+no stimulus has been delivered. Issues #21–#24 carry the procedures, and #21
+comes first because everything here is parameterised on numbers only the
+instrument can report.
+
+### 15.1 The thing to understand before you use it
+
+The driver's `RectangularStimPulse` **adjusts pulses it does not like instead
+of rejecting them.** Measured against the real assembly:
+
+| You ask for | You get | Anything raised? |
+|---|---|---|
+| amplitude 2000 µA (range ±1000) | 1000 µA | no |
+| amplitude 7.0 µA on a 5 µA grid | 5.0 µA | no |
+| widths 8000/0/8000 ticks (cap 10000) | **8000/0/2000** | no |
+
+The last row is why this layer exists. A **charge-balanced** request — equal
+and opposite phases, net charge zero — comes back as one that injects a net
+600 nC, because the overflow is taken off the *later* phases. And
+`IsBiphasic` still reports `True`, so there is no signal in the returned object
+that anything happened.
+
+Net DC through a microelectrode drives electrolysis and corrodes it. The run
+does not fail; it looks fine.
+
+So `biocam/stim/` **refuses rather than adjusts**. A pulse either passes
+unchanged or is rejected with every reason listed at once, because a colleague
+on the instrument gets one attempt per turnaround. After the driver builds the
+pulse, `verify_built_pulse()` reads back all five fields and compares them to
+what was asked, which also catches limits this repository does not know about.
+
+### 15.2 Check a protocol without an instrument
+
+`--dry-run` needs no BioCAM and no DLLs. Use it before a lab session, not
+during one:
+
+```
+python -m biocam.cli stim --dry-run --time-resolution-us 10 \
+    --amplitude 100 --phase-us 200 --gap-us 100 \
+    --positive 10,10 --negative 20,30 \
+    --count 5 --rate-hz 10
+```
+
+```
+cli-train: 5 x [cli-pulse: +100 uA for 200 us, gap 100 us, -100 uA for 200 us
+                (500 us total, 50 ticks; balanced)]
+           every 100000 us (10 Hz), starting at 0 us, lasting 400500 us
+positive: (10,10)
+negative: (20,30)
+timestamps (us from start of acquisition): 0, 100000, 200000, 300000, 400000
+train net charge: +0 pC
+
+NOT SENT (--dry-run). The constraints above were supplied on the command line,
+not read from an instrument; if they differ from the device's, this plan is wrong.
+```
+
+`--time-resolution-us` is **required** for `--dry-run` and deliberately has no
+default. It is the stimulator's clock period, and every duration is an integer
+count of it — guess it wrong and every pulse is wrong by that ratio, silently.
+Get the real value from issue #21.
+
+Amplitudes are µA and durations are µs throughout. The second phase mirrors the
+first unless you say otherwise, because that is the charge-balanced pulse.
+
+### 15.3 Sending for real
+
+Drop `--dry-run`. The constraints are then read from the device and the
+command-line limits are ignored:
+
+```
+python -m biocam.cli stim --amplitude 100 --phase-us 200 --gap-us 100 \
+    --positive 10,10 --negative 20,30
+```
+
+**Electrode coordinates are 1-based**, matching `ChCoord`: the first electrode
+is `1,1`, not `0,0`. `--grid` (default `64x64`) bounds-checks them — and it is
+the *only* thing that does, because `ChCoord.IsValid` reports `(65,65)` as
+valid on a 64×64 plate.
+
+### 15.4 What will refuse to run, and why
+
+| Refusal | Reason |
+|---|---|
+| net charge is not zero | electrolysis; pass `--allow-unbalanced` if deliberate |
+| total duration over `MaxPulseDuration` | the driver would shorten the later phases silently |
+| amplitude out of range, or off the resolution grid | the driver would clamp or round it silently |
+| a duration that is not a whole number of ticks | the driver would snap it silently |
+| electrode outside the grid, or 0-indexed | `ChCoord` would not catch it |
+| positive and negative sharing a column | the API PDF forbids it; `--no-column-rule` overrides |
+| train period shorter than the pulse | the stimuli would overlap — never waived, it is arithmetic |
+| train period below 1000 µs | the driver's own minimum; `--allow-short-period` overrides |
+
+### 15.5 Scheduled trains fire on acquisition time, not wall-clock
+
+The XML is explicit that timestamps are *"in microsecond relative to the
+beginning of the acquisition"* — **not** relative to when you send them.
+
+A train planned as "start in half a second" and sent ten minutes into a
+recording has every timestamp ten minutes in the past. What the instrument does
+then is untested (issue #24), and the plausible outcomes include firing the
+whole train at once. `TrainPlan.shifted_by(current_acquisition_time_us)` does
+the conversion — but note that nothing in this repository can yet *read* the
+current acquisition time, which is the other half of issue #24.
+
+Until that is answered, treat scheduled stimulation as unfinished and use
+single pulses.
+
+### 15.6 Reading the API yourself
+
+`_3Brain.Common` ships no XML here, but the assembly can be read directly.
+This needs the DLLs and no instrument:
+
+```
+python -m biocam.interop.reflect RectangularStimPulse StimProperties
+python -m biocam.interop.reflect --all-stim
+python -m biocam.interop.verify_stim_model
+```
+
+The last one checks `biocam/stim/`'s rules against the real driver in **both**
+directions: every pulse it accepts must come back unchanged, and every pulse it
+refuses must be one the driver would have altered. A rule that blocks a pulse
+the driver builds correctly is a bug, not caution. Run it after any change to
+the validation.
+
+The full recovered surface, the measurements behind every claim above, and the
+list of what still needs the instrument are in
+`docs/api/stimulation-reference.md`.
