@@ -23,11 +23,18 @@ error of the whole elapsed duration.
 undercounts elapsed time whenever packets are dropped. Frames known to be lost
 are counted in, so a recording that loses data does not also lose time.
 
-**Two independent estimates, cross-checked.** The instrument's own timestamps
-and our frame count should agree. When they do, either can be trusted; when
-they drift apart, something is wrong with an assumption - the frame rate, the
-clock calibration, or the loss accounting - and that is worth surfacing rather
-than averaging away.
+**Two estimates, cross-checked - but only when the check is real.** The
+instrument's timestamps and our frame count should advance at the same rate,
+and divergence means an assumption is wrong. That comparison is only evidence
+when the cycles-per-microsecond factor comes from outside: calibrating it from
+these same packets makes the device estimate reduce algebraically to the frame
+estimate, and the difference is then identically zero no matter how wrong the
+clock is. Measured, on the configuration the CLI actually builds: a device
+clock running 30% fast produced a disagreement of 5e-10 us.
+
+`cross_check_is_meaningful` says which case you are in, and `warnings()` says
+so out loud. A check that cannot fail reads exactly like a check that passed,
+which is the more dangerous of the two.
 
 Nothing here talks to the driver, so all of it is testable.
 """
@@ -70,7 +77,7 @@ class ClockReading:
 
     @property
     def is_from_device(self) -> bool:
-        return self.source == "device"
+        return self.source in ("device", "device-calibrated")
 
     def describe(self) -> str:
         text = (
@@ -243,33 +250,75 @@ class AcquisitionClock:
 
     # -- reading ---------------------------------------------------------
 
+    @property
+    def cross_check_is_meaningful(self) -> bool:
+        """Whether comparing the two estimates can detect anything.
+
+        It cannot when the conversion factor was calibrated from these same
+        packets. Calibration defines the factor as elapsed-cycles divided by
+        frame-derived elapsed-time, so feeding it back in makes the device
+        estimate reduce algebraically to the frame estimate and the difference
+        is identically zero. Measured: a device clock running 30% fast
+        produced a disagreement of 5e-10 us.
+
+        So the comparison is only evidence when `cycles_per_us` came from
+        somewhere else - `IBioCam.ClockCyclesToMilliseconds` on the device.
+        Reported rather than hidden, because a check that cannot fail reads
+        exactly like a check that passed.
+        """
+        return self._cycles_per_us is not None and self.device_timestamps_available
+
     def elapsed_us_from_frames(self) -> float:
         """Acquisition time implied by the frames, lost ones included."""
         return self._total_frames / self._frame_rate * 1e6
 
     def elapsed_us_from_device(self) -> float:
-        """Acquisition time implied by the instrument's own timestamps.
+        """Acquisition time from the instrument's own clock, in microseconds.
+
+        The timestamp is treated as **absolute** - measured from the same
+        origin the stimulator schedules against - rather than as an offset
+        from the first packet this recording happened to see.
+
+        That is what 3Brain's own sample does. `MainForm.cs:508` keeps
+        `e.Header.Timestamp` from the data callback, and `MainForm.cs:383-385`
+        subtracts it directly from the `out` latency of `Send`, which the XML
+        documents as "clock cycles relative to the beginning of the
+        acquisition". For that subtraction to mean anything the two must share
+        units and origin.
+
+        It is still an inference - the sample only ever takes a difference, so
+        it establishes a *shared* origin, not where that origin is. Issue #24.
 
         Returns None when no usable timestamp has been seen, or when the
         cycles-per-microsecond factor is neither supplied nor yet calibrated.
         """
-        if self._first_timestamp is None:
+        if self._last_timestamp is None:
             return None
         factor = self.cycles_per_us
         if not factor:
             return None
-        # Measured from the first timestamp seen, plus however much
-        # acquisition preceded it - the recording may not have started at the
-        # instrument's time zero.
-        offset_us = self._frames_at_first_timestamp / self._frame_rate * 1e6
-        return offset_us + (self._last_timestamp - self._first_timestamp) / factor
+        return self._last_timestamp / factor
 
-    def disagreement_us(self) -> float:
-        """How far the two estimates differ, or None if only one exists."""
-        device = self.elapsed_us_from_device()
-        if device is None:
+    def drift_us(self) -> float:
+        """How far the two clocks have diverged since the first timestamp.
+
+        Compares *rates of advance*, not absolute times: the instrument may
+        have been acquiring before this recording started, so the absolute
+        values legitimately differ while the rates should not.
+
+        Returns None when there is nothing to compare, including when the
+        comparison would be vacuous - see `cross_check_is_meaningful`.
+        """
+        if not self.cross_check_is_meaningful:
             return None
-        return abs(device - self.elapsed_us_from_frames())
+        elapsed_frames = self._total_frames - self._frames_at_first_timestamp
+        device_us = (self._last_timestamp - self._first_timestamp) / self._cycles_per_us
+        frames_us = elapsed_frames / self._frame_rate * 1e6
+        return abs(device_us - frames_us)
+
+    # Retained under its old name because `warnings()` and `schedule_after`
+    # read better with it, but it is the drift, not a difference of absolutes.
+    disagreement_us = drift_us
 
     def read(self) -> ClockReading:
         """The current acquisition time, and where it came from.
@@ -289,21 +338,24 @@ class AcquisitionClock:
             )
 
         device = self.elapsed_us_from_device()
-        disagreement = self.disagreement_us()
+        drift = self.drift_us()
         if device is not None:
             return ClockReading(
                 acquisition_us=device,
-                source="device",
+                # "device" when the instrument supplied both the timestamps
+                # and the factor; "device-calibrated" when we derived the
+                # factor ourselves, which is a weaker claim and says so.
+                source="device" if self._cycles_per_us else "device-calibrated",
                 frames_seen=self._frames_seen,
                 frames_lost=self._frames_lost,
-                disagreement_us=disagreement,
+                disagreement_us=drift,
             )
         return ClockReading(
             acquisition_us=self.elapsed_us_from_frames(),
             source="frames",
             frames_seen=self._frames_seen,
             frames_lost=self._frames_lost,
-            disagreement_us=disagreement,
+            disagreement_us=drift,
         )
 
     def now_us(self) -> float:
@@ -314,15 +366,16 @@ class AcquisitionClock:
         return self.read().acquisition_us
 
     def estimates_agree(self) -> bool:
-        """Whether the two estimates are within tolerance.
+        """Whether the two clocks have stayed within tolerance of each other.
 
-        True when only one estimate exists - there is nothing to disagree
-        with. Check `device_timestamps_available` if that distinction matters.
+        True when there is nothing to compare - including when the comparison
+        would be vacuous. Do not read a True from this as "the clock was
+        checked"; ask `cross_check_is_meaningful` for that.
         """
-        disagreement = self.disagreement_us()
-        if disagreement is None:
+        drift = self.drift_us()
+        if drift is None:
             return True
-        return disagreement <= self._tolerance_us
+        return drift <= self._tolerance_us
 
     def warnings(self) -> list:
         """Everything about this clock that a person should be told."""
@@ -343,13 +396,20 @@ class AcquisitionClock:
                 "this is a device reset, a corrupted header, or out-of-order "
                 "packets. They were ignored rather than adopted."
             )
+        if self.device_timestamps_available and not self.cross_check_is_meaningful:
+            problems.append(
+                "the clock's conversion factor was calibrated from these same "
+                "packets, so comparing the instrument's clock against the "
+                "frame count cannot detect anything - the comparison reduces "
+                "to an identity. Supply cycles_per_us from "
+                "IBioCam.ClockCyclesToMilliseconds to make it real. Until "
+                "then the acquisition time is a single unchecked estimate."
+            )
         if not self.estimates_agree():
             problems.append(
-                f"the instrument's clock and the frame count disagree by "
-                f"{self.disagreement_us() / 1000:.1f} ms "
-                f"(device {self.elapsed_us_from_device() / 1e6:.3f} s, frames "
-                f"{self.elapsed_us_from_frames() / 1e6:.3f} s). One of the "
-                "frame rate, the clock calibration, or the loss accounting is "
+                f"the instrument's clock and the frame count have drifted "
+                f"{self.drift_us() / 1000:.1f} ms apart. One of the frame "
+                "rate, the clock calibration, or the loss accounting is "
                 "wrong. Do not schedule stimulation against this."
             )
         return problems

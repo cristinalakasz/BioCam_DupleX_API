@@ -125,18 +125,31 @@ def test_the_device_clock_is_used_once_available():
     c.observe(packet(1_100_000), 20)
     reading = c.read()
     assert reading.source == "device"
-    # 100000 cycles at 1 cycle/us, plus the 20 frames that preceded the first
-    # timestamp.
-    assert reading.acquisition_us == pytest.approx(us_for(20) + 100_000)
+    # Absolute, not an offset from the first packet seen: 1_100_000 cycles at
+    # 1 cycle/us.
+    assert reading.acquisition_us == pytest.approx(1_100_000.0)
 
 
-def test_the_device_clock_is_measured_from_the_first_timestamp_seen():
-    # The recording need not have started at the instrument's time zero, so a
-    # large absolute timestamp must not become a large elapsed time.
+def test_the_device_timestamp_is_absolute_not_relative_to_the_recording():
+    # The recording may start long after the acquisition did, and the
+    # stimulator schedules against the acquisition. 3Brain's own sample
+    # subtracts a packet header timestamp straight from Send's out latency
+    # (MainForm.cs:508 and :383-385), which only works if they share an
+    # origin - so the timestamp is taken as absolute.
     c = clock()
     c.observe(packet(999_000_000), 20)
     c.observe(packet(999_000_500), 20)
-    assert c.read().acquisition_us == pytest.approx(us_for(20) + 500)
+    assert c.read().acquisition_us == pytest.approx(999_000_500.0)
+
+
+def test_a_calibrated_factor_is_reported_as_a_weaker_claim():
+    # "device-calibrated" rather than "device": the timestamps came from the
+    # instrument but the conversion did not.
+    c = AcquisitionClock(RATE)
+    for i in range(30):
+        c.observe(packet(1_000_000 + int(us_for(i * 1000))), 1000)
+    assert c.read().source == "device-calibrated"
+    assert c.read().is_from_device
 
 
 def test_mixed_available_and_unavailable_timestamps():
@@ -223,14 +236,44 @@ def test_agreeing_estimates_report_no_disagreement():
     assert c.warnings() == []
 
 
-def test_a_wrong_frame_rate_shows_up_as_disagreement():
+def test_a_wrong_frame_rate_shows_up_as_drift():
     # Device clock says one thing, frame count says another. Exactly the
     # symptom of a frame rate that is not what we were told.
     c = AcquisitionClock(RATE, cycles_per_us=CYCLES_PER_US, tolerance_us=1000.0)
     for i in range(1, 100):
         c.observe(packet(1_000_000 + i * 5000), 20)  # clock runs fast
+    assert c.cross_check_is_meaningful
     assert not c.estimates_agree()
-    assert any("disagree" in w for w in c.warnings())
+    assert any("drifted" in w for w in c.warnings())
+
+
+def test_the_cross_check_is_inert_when_the_factor_was_calibrated():
+    # THE finding of this phase's review. Calibration defines the factor as
+    # elapsed-cycles over frame-derived-elapsed-time, so feeding it back makes
+    # the device estimate reduce to the frame estimate and the difference is
+    # identically zero however wrong the clock is. Measured before the fix: a
+    # clock running 30% fast produced a disagreement of 5e-10 us.
+    c = AcquisitionClock(RATE)          # no cycles_per_us - what cli.py builds
+    frames_per_packet = 1000
+    for i in range(MIN_CALIBRATION_FRAMES // frames_per_packet + 10):
+        wrong = us_for(i * frames_per_packet) * 1.3   # 30% fast
+        c.observe(packet(int(500_000 + wrong)), frames_per_packet)
+    assert not c.cross_check_is_meaningful
+    assert c.drift_us() is None
+    # It must say so rather than report a passing check.
+    assert any("cannot detect anything" in w for w in c.warnings())
+
+
+def test_the_same_error_IS_caught_when_the_factor_comes_from_outside():
+    # The control for the test above: identical data, external factor.
+    c = AcquisitionClock(RATE, cycles_per_us=1.0, tolerance_us=1000.0)
+    frames_per_packet = 1000
+    for i in range(MIN_CALIBRATION_FRAMES // frames_per_packet + 10):
+        wrong = us_for(i * frames_per_packet) * 1.3
+        c.observe(packet(int(500_000 + wrong)), frames_per_packet)
+    assert c.cross_check_is_meaningful
+    assert c.drift_us() > 100_000
+    assert not c.estimates_agree()
 
 
 def test_disagreement_is_none_when_only_one_estimate_exists():

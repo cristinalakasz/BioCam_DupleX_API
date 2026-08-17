@@ -783,3 +783,73 @@ def test_the_writer_reports_missing_frames(tmp_path):
     with RecordingWriter(raw, meta, PARAMS) as writer:
         record_session(source, writer)
         assert writer.n_frames_missing == 20
+
+
+def test_the_clock_sees_the_frames_the_finally_drain_writes(tmp_path):
+    # The backlog drain in record_session's `finally` writes real frames. It
+    # once did not feed the clock, which on an ordinary --duration run left
+    # the clock short by the whole backlog - 40x the disagreement tolerance,
+    # and so a confident "do not schedule stimulation against this" printed
+    # at the end of a healthy recording.
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(tmp_path, 1000, frames_per_packet=10)
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        # 55 frames is mid-burst: the limit lands inside a 10-frame packet,
+        # so the loop stops with the rest of the source still to drain.
+        result = record_session(source, writer, duration_sec=0.055, clock=clock)
+        assert clock.frames_seen == writer.n_frames_written
+
+    assert result.stop_reason == "duration_reached"
+    assert clock.frames_seen == result.n_frames
+
+
+def test_a_second_record_session_keeps_feeding_the_same_clock(tmp_path):
+    # cli.py calls record_session twice with the same writer and the same
+    # clock after a KeyboardInterrupt. The clock differences the writer's
+    # running totals, so the second call must pick up where the first left
+    # off rather than raising about totals going backwards.
+    from biocam.data.clock import AcquisitionClock
+
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    first, _ = _source(tmp_path, 500, frames_per_packet=10)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(first, writer, duration_sec=0.2, clock=clock)
+        after_first = clock.frames_seen
+        assert after_first == writer.n_frames_written
+
+        second = ReplayPacketSource(tmp_path / "src.raw", PARAMS,
+                                    frames_per_packet=10)
+        record_session(second, writer, drain=True, clock=clock)
+        assert clock.frames_seen > after_first
+        assert clock.frames_seen == writer.n_frames_written
+
+
+def test_a_clock_that_raises_costs_the_clock_and_not_the_recording(tmp_path):
+    # An escaping exception here would skip the backlog drain, skip
+    # finalise(), and stamp an intact raw file "failed". Losing the clock is
+    # not a reason to lose the recording.
+    class ExplodingClock:
+        def __init__(self):
+            self.calls = 0
+
+        def observe_totals(self, packet, frames_written, frames_missing):
+            self.calls += 1
+            raise ValueError("totals went backwards")
+
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    clock = ExplodingClock()
+    with pytest.warns(RuntimeWarning, match="acquisition clock stopped"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            result = record_session(source, writer, clock=clock)
+
+    assert result.n_frames == 100
+    assert result.verdict == "clean"
+    assert raw.read_bytes() == data.tobytes()
+    assert read_sidecar(meta)["status"] == "complete"
+    # Dropped after the first failure rather than raising on every packet.
+    assert clock.calls == 1

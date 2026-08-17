@@ -10,6 +10,7 @@ must never import biocam.interop.
 """
 
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -42,6 +43,46 @@ DRAIN_DEADLINE_SEC = 5.0
 # trailing check in the `finally` below catches whatever moved since the
 # last check, however many packets short of N that was.
 COUNTER_CHECK_INTERVAL_PACKETS = 200
+
+
+def _feed_clock(clock, packet, writer):
+    """Feed the acquisition clock one packet. Returns the clock, or None.
+
+    Fed from the writer's own running totals rather than counted a second
+    time here, so the clock and the sidecar can never disagree about how many
+    frames a recording holds. Pure integer arithmetic on the consumer thread -
+    nothing on the callback path, nothing that allocates, nothing that grows.
+
+    The guard is the point. This is the only call on the packet loop that can
+    raise something other than an OSError, and an escaping exception here is
+    catastrophically out of proportion to its cause: `interrupted` would be
+    set, which skips the backlog drain, `pending_count()` and
+    `note_discarded()`; `finalise()` would never run; and
+    `RecordingWriter.__exit__` would stamp an otherwise intact raw file
+    `status="failed"`. Up to a full queue of acquired data - hundreds of
+    megabytes - would be written nowhere and counted nowhere, because a clock
+    used for scheduling stimuli disagreed with itself.
+
+    Losing the clock is not a reason to lose the recording. So a failure drops
+    the clock and lets the recording continue, exactly as
+    `RecordingWriter._emit` already does for a listener that raises.
+    """
+    if clock is None:
+        return None
+    try:
+        clock.observe_totals(
+            packet, writer.n_frames_written, writer.n_frames_missing
+        )
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the clock
+        warnings.warn(
+            f"acquisition clock stopped being fed after "
+            f"{writer.n_frames_written} frames: {exc}. The recording "
+            "continues; scheduled stimulation must not be timed against this "
+            "session.",
+            RuntimeWarning,
+        )
+        return None
+    return clock
 
 
 @dataclass(frozen=True)
@@ -209,15 +250,7 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
-            if clock is not None:
-                # Fed from the writer's own totals rather than counted a
-                # second time here, so the clock and the sidecar can never
-                # disagree about how many frames a recording holds. Pure
-                # arithmetic on the consumer thread - nothing on the callback
-                # path, and nothing that can block the drain.
-                clock.observe_totals(
-                    packet, writer.n_frames_written, writer.n_frames_missing
-                )
+            clock = _feed_clock(clock, packet, writer)
             packets_since_counter_check += 1
             if packets_since_counter_check >= COUNTER_CHECK_INTERVAL_PACKETS:
                 packets_since_counter_check = 0
@@ -310,6 +343,16 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                             counter=packet.counter,
                             payload=packet.payload,
                         )
+                        # This drain writes real frames, so the clock has to
+                        # see them. Omitting it left the clock short by the
+                        # whole backlog - and on an ordinary --duration run
+                        # this path fires almost every time, because the
+                        # frame limit lands mid-burst. Two seconds of
+                        # unobserved frames is 40x the clock's disagreement
+                        # tolerance, so the omission printed a confident
+                        # "do not schedule stimulation against this" at the
+                        # end of a perfectly healthy recording.
+                        clock = _feed_clock(clock, packet, writer)
                         if writer.disk_low:
                             # MEDIUM 1: same reasoning as the main loop -
                             # a full disk must stop this drain too, not

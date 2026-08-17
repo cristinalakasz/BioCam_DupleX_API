@@ -1,9 +1,9 @@
 # API roadmap: decomposition and hardware findings
 
 **Date:** 2026-08-12
-**Status:** Decomposition agreed. Phases 0 and 1 built and merged; Phase 2 in
+**Status:** Decomposition agreed. Phases 0–2 built and merged; Phase 3 in
 progress. Section 4's open item was closed on 2026-08-17 by reflecting over the
-assembly.
+assembly; section 6 records what Phase 3 found in its place.
 **Purpose:** Records the build order and the stimulator capabilities discovered
 while decomposing, so that later phases start from findings rather than
 rediscovering them.
@@ -45,8 +45,8 @@ preference, places it last.
 |---|---|---|
 | **0** | Setup: `CLAUDE.md`, verifier agents, test scaffolding, README | Specced 2026-08-03. **Done** (2026-08-12). |
 | **1** | Acquisition: recording, saving, data integrity | Specced and **merged** (2026-08-13). Gate 1 ran afterwards and did **not** come back clean — see `2026-08-13-phase1-followups.md`. Not cleared for the lab. |
-| **2** | Stimulation engine + manual (a) + scheduled (b) | **In progress** (2026-08-17). `biocam/stim/` (Layer 2: pulses, patterns, trains, sequences, validation) and `biocam/interop/stimulator.py` (Layer 1: lifecycle and the three `Send` paths) are written. Not cleared for the lab. |
-| **3** | Session control: recording and stimulation together, changing live | |
+| **2** | Stimulation engine + manual (a) + scheduled (b) | **Merged** (2026-08-17, PR #25). `biocam/stim/` (Layer 2: pulses, patterns, trains, sequences, validation) and `biocam/interop/stimulator.py` (Layer 1: lifecycle and the three `Send` paths). Gate 1 clean. Not cleared for the lab — issues #21–#24. |
+| **3** | Session control: recording and stimulation together, changing live | **In progress** (2026-08-17). `biocam/data/clock.py` (the acquisition clock scheduled stimulation needs a time origin from) and `biocam/stim/log.py` (the stimulus record every later analysis depends on). Not cleared for the lab. |
 | **4** | UI | |
 | **5** | Spike detection | |
 | **6** | Closed-loop (c) | Depends on 5 |
@@ -171,3 +171,46 @@ that are hard to misuse are requirements, not decoration.
 Note for closed-loop work: timing must not be measured during an active
 remote-desktop session, since screen encoding loads the same CPU the process sets
 to `RealTime` priority.
+
+---
+
+## 6. Phase 3 note: where acquisition time comes from
+
+Phase 2 shipped `biocam stim --count N` unable to run, for one reason: the
+driver's scheduled-stimulation overload takes timestamps "relative to the
+beginning of the acquisition", and nothing here could say how far into an
+acquisition it was.
+
+The answer had been flowing past since Phase 1. `DataPacketHeader.Timestamp`
+is documented as *"the timestamp of the data packet in number of BioCAM's
+clock cycles or 0 when the timestamp is not available"*, and
+`biocam/interop/source.py` puts it on every `Packet`. Nothing consumed it.
+
+`biocam/data/clock.py` does. Three things it must get right, each a way of
+being silently wrong rather than loudly:
+
+1. **A timestamp of 0 is a sentinel, not a time.** Reading it as "the
+   acquisition just started" places a stimulus at the beginning of a recording
+   that may be hours old.
+2. **Lost frames still count as elapsed time.** The instrument kept acquiring
+   through the gap; counting only what arrived schedules early by exactly the
+   duration of the loss.
+3. **Two independent estimates, cross-checked.** The device's timestamps and
+   our frame count should agree. `schedule_after()` refuses when they do not,
+   rather than picking one.
+
+### Still an inference
+
+That `DataPacketHeader.Timestamp` and the stimulation timestamps share an
+origin. Both are documented "relative to the beginning of the acquisition",
+but that they mean the same instant is not stated anywhere. If they differ by
+a constant offset, every scheduled train is wrong by it. Issue #24.
+
+### What Phase 3 still owes
+
+- Reading `IBioCam.ClockCyclesToMilliseconds` to get the real
+  cycles-per-microsecond factor, rather than calibrating it.
+- A combined session: one process recording while a control thread stimulates.
+  The open question there is whether `Send` may be called from a thread other
+  than the one the data callback wakes — 3Brain's sample only ever does the
+  latter, so the safe pattern is unestablished.

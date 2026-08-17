@@ -63,6 +63,8 @@ only translates a validated plan into .NET objects and calls the driver, so
 that the untestable surface stays as thin as it can be.
 """
 
+from contextlib import contextmanager
+
 from biocam.stim.electrodes import ElectrodeGrid, StimPattern, validate_pattern
 from biocam.stim.pulse import PulsePlan, verify_built_pulse
 from biocam.stim.train import MAX_TRAIN_PULSES
@@ -102,11 +104,19 @@ class Stimulator:
         grid: ElectrodeGrid = None,
         enforce_column_rule: bool = True,
         warn=None,
+        log=None,
+        clock=None,
     ):
         self._device = device
         self._grid = grid
         self._enforce_column_rule = enforce_column_rule
         self._warn = warn or (lambda message: None)
+        # A StimulusLog and an AcquisitionClock, both optional and both pure
+        # Layer 2. Given them, every attempt is recorded with the acquisition
+        # time it was made at - which is the correspondence every later
+        # analysis depends on, and which cannot be reconstructed afterwards.
+        self._log = log
+        self._clock = clock
         self._stimulator = None
         self._initialized = False
         self._started = False
@@ -356,6 +366,34 @@ class Stimulator:
         return self._constraints
 
     @property
+    def cycles_per_us(self):
+        """The instrument's clock cycles per microsecond, or None.
+
+        Derived from `IBioCam.ClockCyclesToMilliseconds(UInt64)`, which the
+        XML documents as "Converts a time in clock cycles to milliseconds" and
+        which the sample uses for exactly this (`MainForm.cs:272`). This is
+        the authoritative factor; `AcquisitionClock` can calibrate one from
+        the packets, but that calibration cannot then be used to check itself.
+
+        Needed to turn the latency `send_now` returns - clock cycles - into a
+        time. Without it a stimulus log records a latency nothing can
+        interpret.
+
+        Returns None rather than raising: a factor that cannot be read is a
+        reason to say the times are unresolved, not to abandon the session.
+        """
+        try:
+            probe = 1_000_000
+            milliseconds = float(
+                self._device.biocam.ClockCyclesToMilliseconds(probe)
+            )
+        except BaseException:  # noqa: BLE001 - an unreadable factor is not fatal
+            return None
+        if milliseconds <= 0:
+            return None
+        return probe / (milliseconds * 1000.0)
+
+    @property
     def is_stimulating(self) -> bool:
         if self._stimulator is None:
             return False
@@ -373,24 +411,34 @@ class Stimulator:
         which is what the sample uses (MainForm.cs:272); do not divide by a
         guessed clock rate.
         """
-        pulse, positive, negative = self._prepare(pulse_plan, pattern)
-
-        try:
-            ok, latency = self._send_immediate(pulse, positive, negative)
-        except BaseException as exc:
-            raise StimulatorError(
-                f"IBioCamStim.Send raised {exc!r}. The XML documents "
-                "InvalidOperationException when the stimulator has not "
-                "started, ArgumentNullException for a null pulse, and "
-                "ArgumentException for invalid endpoints."
-            ) from exc
-        if not ok:
-            raise StimulatorError(
-                "IBioCamStim.Send returned false: the stimulation values were "
-                "not accepted. Per the XML, an internal buffer overflow makes "
-                "the NEXT call ignore its values, so check the endpoint and "
-                "pulse counts before retrying."
-            )
+        with self._logging("immediate", pulse_plan, pattern) as entry:
+            pulse, positive, negative = self._prepare(pulse_plan, pattern)
+            try:
+                ok, latency = self._send_immediate(pulse, positive, negative)
+            except BaseException as exc:
+                raise StimulatorError(
+                    f"IBioCamStim.Send raised {exc!r}. The XML documents "
+                    "InvalidOperationException when the stimulator has not "
+                    "started, ArgumentNullException for a null pulse, and "
+                    "ArgumentException for invalid endpoints."
+                ) from exc
+            # `not ok`, not `ok is not True` - deliberately different from
+            # _send_timestamps. That one needs the identity check because it
+            # does not unpack, so a by-ref binding would hand it a truthy
+            # tuple. Here the unpack above has already proven the shape, so an
+            # identity comparison would only add a way to raise AFTER the
+            # pulse reached the culture, if pythonnet ever marshals
+            # System.Boolean to something other than the True singleton.
+            if not ok:
+                entry["rejected_by_driver"] = True
+                raise StimulatorError(
+                    f"IBioCamStim.Send returned {ok!r}: the stimulation values "
+                    "were not accepted. Per the XML, an internal buffer "
+                    "overflow makes the NEXT call ignore its values, so check "
+                    "the endpoint and pulse counts before retrying."
+                )
+            entry["latency_cycles"] = int(latency)
+            entry["delivered"] = True
         return int(latency)
 
     def send_scheduled(self, plan, pattern: StimPattern) -> None:
@@ -409,6 +457,19 @@ class Stimulator:
         `IStimProtocol` through `IBioCamStimProtocolManager` instead, which
         this module does not yet wrap.
         """
+        # Every refusal below happens INSIDE the logging block. They used to
+        # raise before it, so a scheduled train refused for any of these
+        # reasons left no trace at all - while send_now, whose validation sits
+        # inside _prepare, logged every one of its refusals. A stimulus that
+        # was supposed to fire and did not is exactly what the log exists to
+        # record: in the signal, a hole in a train is indistinguishable from a
+        # stimulus that evoked nothing.
+        with self._logging("scheduled", plan, pattern) as entry:
+            pulse_plan, timestamps = self._check_schedule(plan)
+            self._send_timestamps(pulse_plan, pattern, timestamps, entry)
+
+    def _check_schedule(self, plan):
+        """Validate a scheduled plan and return its pulse and timestamps."""
         pulse_plans = getattr(plan, "pulse_plans", None)
         if pulse_plans is not None:
             distinct = {p.constructor_args() for p in pulse_plans}
@@ -459,6 +520,26 @@ class Stimulator:
                 "the current acquisition time."
             )
 
+        # The clock was already being read for the log; this is the check it
+        # was collected for. A train whose timestamps have all passed is the
+        # issue-#24 case, and refusing beats discovering on a culture what the
+        # instrument does with it.
+        reading = self._read_clock()
+        if reading is not None and timestamps[-1] <= reading.acquisition_us:
+            raise StimulatorError(
+                f"every timestamp in this plan is in the past: the last is "
+                f"{timestamps[-1]:.0f} us and the acquisition is already at "
+                f"{reading.acquisition_us:.0f} us ({reading.source}). "
+                "Timestamps are measured from the beginning of the "
+                "acquisition, not from now - shift the plan with "
+                "TrainPlan.shifted_by(), or use "
+                "biocam.data.clock.schedule_after(plan, clock, lead_us). What "
+                "the instrument does with past timestamps is untested "
+                "(issue #24)."
+            )
+        return pulse_plan, timestamps
+
+    def _send_timestamps(self, pulse_plan, pattern, timestamps, entry):
         pulse, positive, negative = self._prepare(pulse_plan, pattern)
 
         import System
@@ -478,14 +559,101 @@ class Stimulator:
         # is truthy - a rejected send would then report success. send_now is
         # self-checking because it unpacks; this one has to say so.
         if ok is not True:
+            entry["rejected_by_driver"] = True
             raise StimulatorError(
                 f"IBioCamStim.Send did not return True for {len(timestamps)} "
                 f"timestamps (returned {ok!r}): the values were not accepted. "
                 "The XML warns that a buffer overflow makes the NEXT call "
                 "ignore its values."
             )
+        entry["delivered"] = True
 
     # -- internals -------------------------------------------------------
+
+    @contextmanager
+    def _logging(self, kind, plan, pattern):
+        """Record one attempt into the log, whatever happens to it.
+
+        A refused stimulus belongs in the record as much as a delivered one:
+        a hole in a stimulus train looks, in the recorded signal, exactly like
+        a stimulus that evoked nothing. So the failure path writes an entry
+        and re-raises rather than letting the attempt vanish.
+
+        The clock is read *before* sending, so the recorded time is a lower
+        bound on delivery rather than an upper one. Where the driver reports a
+        latency, that supersedes it - see StimulusRecord.best_time_us.
+        """
+        entry = {"delivered": False, "rejected_by_driver": False,
+                 "latency_cycles": None}
+        reading = self._read_clock()
+        try:
+            yield entry
+        except BaseException as exc:
+            self._record(
+                lambda: self._log.failure(
+                    kind, exc, plan=plan, pattern=pattern,
+                    clock_reading=reading,
+                    rejected_by_driver=entry["rejected_by_driver"],
+                )
+            )
+            raise
+        if kind == "immediate":
+            self._record(
+                lambda: self._log.immediate(
+                    plan, pattern, clock_reading=reading,
+                    latency_cycles=entry["latency_cycles"],
+                )
+            )
+        else:
+            self._record(
+                lambda: self._log.scheduled(
+                    plan, pattern, clock_reading=reading)
+            )
+
+    def _record(self, write):
+        """Write one log entry, never at the expense of the stimulus.
+
+        Guarded for two distinct reasons, both of which turn a bookkeeping
+        problem into a clinical one if left unguarded:
+
+        On the success path the pulse has **already been delivered** by the
+        time this runs. An exception here would make `send_now` raise after
+        the current reached the culture, and the CLI would print
+        "stimulator error" for a stimulus that fired.
+
+        On the failure path an exception here replaces the original
+        `StimulatorError` - contextlib re-raises whatever comes out - so the
+        colleague would be told about a logging fault instead of the reason
+        the stimulus was refused.
+
+        A log that cannot be written is reported and the run continues, the
+        same treatment `RecordingWriter._emit` gives a listener that raises.
+        """
+        if self._log is None:
+            return
+        try:
+            write()
+        except Exception as exc:  # noqa: BLE001 - the stimulus outranks its record
+            self._warn(
+                f"could not record a stimulus in the log ({exc!r}). The "
+                "stimulus itself was unaffected, but this session's log is "
+                "now incomplete - do not treat it as a full record of what "
+                "was delivered."
+            )
+
+    def _read_clock(self):
+        """The acquisition clock's current reading, or None.
+
+        Never raises: a clock that cannot yet say where it is must not stop a
+        stimulus that is otherwise valid, and the absent reading is recorded
+        as absent rather than as zero.
+        """
+        if self._clock is None:
+            return None
+        try:
+            return self._clock.read()
+        except Exception:  # noqa: BLE001 - an unusable clock is not fatal here
+            return None
 
     def _resolve_overloads(self):
         """Bind the two `Send` overloads explicitly.

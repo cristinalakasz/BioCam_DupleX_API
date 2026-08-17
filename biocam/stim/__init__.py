@@ -25,6 +25,7 @@ from biocam.stim.pulse import (
     plan,
     verify_built_pulse,
 )
+from biocam.stim.log import StimulusLog, StimulusRecord
 from biocam.stim.train import (
     SequencePlan,
     TrainPlan,
@@ -51,6 +52,9 @@ __all__ = [
     "StimPattern",
     "bipolar_pair",
     "validate_pattern",
+    # the record of what was stimulated
+    "StimulusLog",
+    "StimulusRecord",
     # trains and sequences
     "SequencePlan",
     "TrainPlan",
