@@ -183,8 +183,15 @@ class SessionController:
             self._clock = clock
             with factory.make_writer(listener=self._events.put) as writer:
                 source = factory.make_source()
-                factory.start_source(source)
+                # start_source is INSIDE the try whose finally stops it.
+                # It performs two driver calls now - StartDataStreaming and
+                # then the stimulator's Start - and the second can raise. With
+                # it outside, that raise skipped stop_source_safely entirely
+                # and left the device streaming, handlers still subscribed,
+                # with nothing holding a reference to the source. cli.py makes
+                # exactly this fix for the same reason.
                 try:
+                    factory.start_source(source)
                     result = record_session(
                         source,
                         writer,
@@ -238,6 +245,15 @@ class SessionController:
             )
 
     # -- for the UI thread -----------------------------------------------
+
+    @property
+    def listener(self):
+        """The callable a writer or source should emit events to.
+
+        Public because the factory needs it: reaching into `_events` from
+        outside was the only private access left on this path.
+        """
+        return self._events.put
 
     def drain_events(self) -> list:
         """Take every event since the last call. UI thread only."""

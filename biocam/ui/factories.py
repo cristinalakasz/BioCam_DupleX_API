@@ -156,7 +156,6 @@ class LiveFactory:
     device: object = None
     stimulator: object = None
     log: object = None
-    grid: object = None
     listener: object = None
     warn: object = None
     _params: object = field(default=None, init=False)
@@ -200,13 +199,14 @@ class LiveFactory:
     def make_clock(self):
         from biocam.data.clock import AcquisitionClock
 
-        cycles_per_us = None
-        if self.stimulator is not None:
-            # The authoritative factor, from IBioCam.ClockCyclesToMilliseconds.
-            # Supplying it is also what makes the clock's cross-check able to
-            # fail at all - calibrating it from the same packets reduces the
-            # comparison to an identity.
-            cycles_per_us = self.stimulator.cycles_per_us
+        # From IBioCam.ClockCyclesToMilliseconds (XML:4667) - the device,
+        # not the stimulator - so a recording-only session keeps it. Supplying
+        # it is also what makes the clock's cross-check able to fail at all:
+        # calibrating the factor from the same packets reduces the comparison
+        # to an identity.
+        from biocam.interop.device import cycles_per_us_of
+
+        cycles_per_us = cycles_per_us_of(self.device)
         return AcquisitionClock(
             self.params.frame_rate_hz, cycles_per_us=cycles_per_us
         )
@@ -251,10 +251,29 @@ class LiveFactory:
         return source
 
     def stop_source(self, source):
-        return source.stop
+        """The callable `record_session` runs the moment its loop ends.
+
+        This - not `stop_source_safely` - is what runs first: `record_session`
+        invokes it in its own `finally` (session.py), long before
+        `SessionController._run`'s `finally` gets there. Putting the
+        stimulator stop only in `stop_source_safely` therefore produced
+        StopDataStreaming *then* Stop() on every ordinary session, the exact
+        inversion of MainForm.cs:210 then :213.
+        """
+        def stop():
+            if self.stimulator is not None:
+                self.stimulator.stop()      # never raises; warns instead
+            source.stop()
+
+        return stop
 
     def stop_source_safely(self, source):
-        # Stimulator first, then streaming - MainForm.cs:210 then :213.
+        """The safety net, for paths where `stop_source` never ran.
+
+        Same order for the same reason. Both calls are idempotent: `stop()`
+        returns immediately once `_started` is clear, and `source.stop()` is
+        deliberately re-callable after a failure.
+        """
         if self.stimulator is not None:
             self.stimulator.stop()          # never raises; warns instead
         try:
@@ -269,6 +288,11 @@ class LiveFactory:
         Raising here is caught and counted by `StimulationQueue.service`; the
         stimulator's own log records why.
         """
+        if self.stimulator is None:
+            raise RuntimeError(
+                "no stimulator: this session is recording only. The request "
+                "was not delivered."
+            )
         if request.scheduled:
             self.stimulator.send_scheduled(request.plan, request.pattern)
         else:

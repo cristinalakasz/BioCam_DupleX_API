@@ -104,16 +104,17 @@ class StimulatorError(RuntimeError):
 class Stimulator:
     """Claims the stimulator for the duration of a with-block.
 
-    Usage, with the ordering the sample uses:
+    Two brackets, not one - see the module docstring:
 
-        with BioCamDevice() as device:
+        with BioCamDevice() as device, Stimulator(device) as stim:
             ...start data streaming...
-            with Stimulator(device) as stim:
+            with stim.stimulating():
                 stim.send_now(pulse_plan, pattern)
             ...stop data streaming...
 
-    `__enter__` runs `Initialize` then `Start`; `__exit__` runs `Stop` then
-    `Close`, and runs both even if the body raised.
+    `__enter__`/`__exit__` run `Initialize`/`Close` and bracket the device.
+    `stimulating()` runs `Start`/`Stop` and brackets the acquisition. Sending
+    outside a `stimulating()` block raises rather than silently doing nothing.
     """
 
     def __init__(
@@ -142,8 +143,16 @@ class Stimulator:
         self._constraints = None
         self._send_immediate = None
         self._send_scheduled = None
+        self._maybe_started = False
 
     # -- lifecycle -------------------------------------------------------
+
+    def _safe_warn(self, message):
+        """warn() that cannot itself raise. For teardown paths only."""
+        try:
+            self._warn(message)
+        except BaseException:  # noqa: BLE001 - nothing left to report it to
+            pass
 
     @staticmethod
     def _read(what: str, read):
@@ -183,25 +192,12 @@ class Stimulator:
         # a cp1252 console then fails to print, replacing the real error with
         # a UnicodeEncodeError. Initialize and Start were already wrapped; the
         # asymmetry was the bug.
-        if not self._read("IBioCam.IsStreaming",
-                          lambda: self._device.biocam.IsStreaming):
-            # A warning, not a refusal. A single pulse is still delivered
-            # without an acquisition; only the reported latency loses its
-            # meaning. send_scheduled refuses separately, because a timestamp
-            # measured from an acquisition that does not exist is not a time.
-            #
-            # Untested either way: that Start() and Send() work at all with no
-            # acquisition running. No source says they do, and the sample
-            # never tries it - issue #22.
-            self._warn(
-                "the BioCAM is not streaming. 3Brain's sample starts the "
-                "stimulator after StartDataStreaming (MainForm.cs:186,192). "
-                "Pulses should still be delivered - though that is itself "
-                "untested - but the latency reported by send_now is measured "
-                "from the beginning of the acquisition and has no reference "
-                "point, and scheduled trains cannot be sent at all."
-            )
-
+        # No streaming check here. __enter__ is claim-time Initialize, and
+        # the sample Initializes before streaming too - MainForm.cs:111, inside
+        # TakeBioCamControl, long before :186. Warning here would have been
+        # wrong on its own terms and would have fired on every correctly
+        # ordered session, drowning out start()'s copy, which is the one that
+        # means the ordering has regressed.
         stimulator = self._read("IBioCam.Stimulator",
                                 lambda: self._device.biocam.Stimulator)
         if stimulator is None:
@@ -324,6 +320,14 @@ class Stimulator:
             )
 
         # The step connector.py omits.
+        #
+        # _maybe_started mirrors DriverPacketSource._maybe_streaming: if
+        # Start() engages the stimulator and THEN raises - undocumented either
+        # way - _started would stay False, so neither stop() nor _shutdown()
+        # would ever call Stop(), and _shutdown would Close() something that
+        # may still be running. Set before the call, cleared only on an
+        # explicit False, which is the one case that says nothing engaged.
+        self._maybe_started = True
         try:
             started = self._stimulator.Start()
         except BaseException as exc:
@@ -333,6 +337,7 @@ class Stimulator:
                 "started or the protocol type is not supported."
             ) from exc
         if not started:
+            self._maybe_started = False
             raise StimulatorError(
                 "IBioCamStim.Start() returned false. The stimulator "
                 "initialized but did not start, so every subsequent Send "
@@ -343,18 +348,21 @@ class Stimulator:
     def stop(self) -> None:
         """Stop the stimulator. Call this BEFORE data streaming stops.
 
-        Never raises: it runs on teardown paths where an exception would
-        replace whatever failure is already propagating. Problems are warned.
+        Never raises - including from `warn`, which callers on teardown
+        paths rely on. `LiveFactory.stop_source_safely` calls this unguarded
+        on the strength of that promise, so the guarantee belongs here rather
+        than in whatever callable a caller happened to pass.
         """
-        if self._stimulator is None or not self._started:
+        if self._stimulator is None or not (self._started or self._maybe_started):
             return
         try:
             if not self._stimulator.Stop():
-                self._warn("IBioCamStim.Stop() returned false.")
+                self._safe_warn("IBioCamStim.Stop() returned false.")
         except BaseException as exc:  # noqa: BLE001 - teardown must not raise
-            self._warn(f"IBioCamStim.Stop() raised {exc!r}.")
+            self._safe_warn(f"IBioCamStim.Stop() raised {exc!r}.")
         finally:
             self._started = False
+            self._maybe_started = False
 
     @contextmanager
     def stimulating(self):
@@ -420,12 +428,13 @@ class Stimulator:
         # closed cleanly, and Stop throws when it has not started, so both
         # stay behind their flags.
         try:
-            if self._started and not stimulator.Stop():
+            if (self._started or self._maybe_started) and not stimulator.Stop():
                 problems.append("IBioCamStim.Stop() returned false")
         except BaseException as stop_exc:  # noqa: BLE001 - collected, not raised
             problems.append(f"IBioCamStim.Stop() raised {stop_exc!r}")
         finally:
             self._started = False
+            self._maybe_started = False
 
         try:
             if self._initialized and not stimulator.Close():
@@ -468,34 +477,13 @@ class Stimulator:
     def cycles_per_us(self):
         """The instrument's clock cycles per microsecond, or None.
 
-        Derived from `IBioCam.ClockCyclesToMilliseconds(UInt64)`, which the
-        XML documents as "Converts a time in clock cycles to milliseconds" and
-        which the sample uses for exactly this (`MainForm.cs:272`). This is
-        the authoritative factor; `AcquisitionClock` can calibrate one from
-        the packets, but that calibration cannot then be used to check itself.
-
-        Needed to turn the latency `send_now` returns - clock cycles - into a
-        time. Without it a stimulus log records a latency nothing can
-        interpret.
-
-        Returns None rather than raising: a factor that cannot be read is a
-        reason to say the times are unresolved, not to abandon the session.
+        Delegates to `biocam.interop.device.cycles_per_us_of`: the member is
+        `IBioCam.ClockCyclesToMilliseconds`, on the device rather than the
+        stimulator, so a recording-only session can read it too.
         """
-        try:
-            probe = 1_000_000
-            milliseconds = float(
-                self._device.biocam.ClockCyclesToMilliseconds(probe)
-            )
-        except BaseException:  # noqa: BLE001 - an unreadable factor is not fatal
-            return None
-        if milliseconds <= 0:
-            return None
-        return probe / (milliseconds * 1000.0)
+        from biocam.interop.device import cycles_per_us_of
 
-    @property
-    def log(self):
-        """The StimulusLog this stimulator records into, if any."""
-        return self._log
+        return cycles_per_us_of(self._device)
 
     @property
     def is_stimulating(self) -> bool:
@@ -801,10 +789,10 @@ class Stimulator:
     def _require_running(self, what: str) -> None:
         if self._stimulator is None or not self._started:
             raise StimulatorError(
-                f"cannot {what}: the stimulator is not started. Use "
-                "`with Stimulator(device) as stim:` - outside that block the "
-                "stimulator is closed and Send would throw "
-                "InvalidOperationException."
+                f"cannot {what}: the stimulator is initialized but not "
+                "started. Open the streaming bracket - "
+                "`with stim.stimulating():` - after data streaming has begun. "
+                "Outside it, Send would throw InvalidOperationException."
             )
 
     def _prepare(self, pulse_plan: PulsePlan, pattern: StimPattern):

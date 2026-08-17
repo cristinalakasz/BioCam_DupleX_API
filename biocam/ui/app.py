@@ -78,7 +78,9 @@ class BioCamWindow:
         # calling _log() from either would breach this module's own first
         # rule. SimpleQueue.put is thread-safe and never blocks, which
         # also matters because one of those callers is the drain.
-        self._messages = queue.SimpleQueue()
+        # Bounded, like every other buffer here. Unbounded, a _poll that
+        # stopped draining would let it grow without limit.
+        self._messages = queue.Queue(maxsize=256)
 
         root.title(
             "BioCAM DupleX — LIVE INSTRUMENT" if live
@@ -266,8 +268,7 @@ class BioCamWindow:
     def _build_stimulus(self):
         """Return (plan, pattern), or raise with a message fit for a label."""
         from biocam.stim import (
-            PulseSpec, StimConstraints, StimPattern, plan as plan_pulse,
-            validate_pattern,
+            PulseSpec, StimPattern, plan as plan_pulse, validate_pattern,
         )
 
         amplitude = float(self.var_amplitude.get())
@@ -277,7 +278,9 @@ class BioCamWindow:
             positive=self._electrodes(self.var_positive.get()),
             negative=self._electrodes(self.var_negative.get()),
         )
-        validate_pattern(pattern)
+        # The same grid the stimulator will use, so the window and the
+        # instrument cannot disagree about what is inside the array.
+        validate_pattern(pattern, self.grid)
 
         constraints = self._constraints()
         spec = PulseSpec(
@@ -299,6 +302,17 @@ class BioCamWindow:
 
         if self.live:
             if self._stimulator is None:
+                if self._live_stack is not None:
+                    # Claimed, but the stimulator would not initialize. Start
+                    # will never change that, so saying "press Start" would
+                    # send the operator round a loop.
+                    raise RuntimeError(
+                        "this session is recording only: the stimulator did "
+                        "not initialize when the instrument was claimed. "
+                        "Stimulation is unavailable until the instrument is "
+                        "released and re-claimed - the session log has the "
+                        "reason it gave."
+                    )
                 raise RuntimeError(
                     "the stimulator's limits are unknown until the instrument "
                     "is claimed. Press Start; the pulse is validated against "
@@ -351,7 +365,11 @@ class BioCamWindow:
         try:
             self._factory = self._make_factory()
         except Exception as exc:  # noqa: BLE001 - shown, never swallowed
-            self._release_live()
+            # Deliberately NOT releasing the instrument here. It is held for
+            # the window's lifetime, and a typo in the Duration field should
+            # not force the next Start to re-Activate a deactivated pool.
+            # _ensure_live_instrument cleans up after itself if the claim is
+            # what failed.
             self._log(f"Cannot start: {exc}", "bad")
             return
         try:
@@ -419,7 +437,7 @@ class BioCamWindow:
         exercised re-activation is the second recording of a lab day.
         """
         from biocam.interop.device import BioCamDevice
-        from biocam.interop.stimulator import Stimulator, StimulatorError
+        from biocam.interop.stimulator import Stimulator
         from biocam.stim import StimulusLog
 
         if self._live_stack is not None:
@@ -452,7 +470,7 @@ class BioCamWindow:
                     Stimulator(self._device, log=StimulusLog(),
                                grid=self.grid,
                                warn=self._warn_from_any_thread))
-            except StimulatorError as exc:
+            except Exception as exc:  # noqa: BLE001 - see below
                 # A stimulator that will not initialize must not block
                 # recording. It is a separate module that may not be
                 # installed, or connector.py may already hold it; refusing
@@ -477,13 +495,21 @@ class BioCamWindow:
             output_path=output, duration_sec=duration,
             device=self._device, stimulator=self._stimulator,
             log=self._stimulator.log if self._stimulator else None,
-            listener=self.controller._events.put,
+            listener=self.controller.listener,
             warn=self._warn_from_any_thread,
         )
 
     def _warn_from_any_thread(self, message):
-        """A `warn` callable safe to hand to code running on another thread."""
-        self._messages.put(message)
+        """A `warn` callable safe to hand to code running on another thread.
+
+        Never blocks: two of its callers are the recording thread and the
+        consumer thread, and the consumer thread is the drain. A full queue
+        drops rather than waiting.
+        """
+        try:
+            self._messages.put_nowait(message)
+        except queue.Full:
+            pass
 
     def _release_live(self):
         """Release the instrument. Safe to call when nothing is held.
@@ -534,9 +560,9 @@ class BioCamWindow:
             cycles_per_us = self._stimulator.cycles_per_us
         try:
             log.write(path, cycles_per_us=cycles_per_us)
-        except OSError as exc:
-            self._log(f"Could not write the stimulus log to {path}: {exc}",
-                      "bad")
+        except Exception as exc:  # noqa: BLE001 - never at the cost of the UI
+            self._log(f"Could not write the stimulus log to {path}: {exc}. "
+                      "The recording itself is unaffected.", "bad")
             return
         self._log(f"Stimulus log: {path} ({log.describe()})", "ok")
 
@@ -607,8 +633,12 @@ class BioCamWindow:
             # The instrument is deliberately NOT released here. It is held for
             # the window's lifetime so a second recording need not re-Activate
             # the pool; use "Release instrument", or close the window.
-            self._write_stimulus_log()
+            # Buttons first. This branch is guarded on btn_start still
+            # being "disabled", so anything that raises in between made
+            # _render retry it every 150 ms for the life of the window, with
+            # the recording finished and Start greyed out for good.
             self.btn_start.configure(state="normal")
+            self._write_stimulus_log()
             self.btn_stop.configure(state="disabled")
             self._log(f"Finished: {state.stop_reason}, {state.frames:,} frames, "
                       f"verdict {state.verdict}",
@@ -629,10 +659,37 @@ class BioCamWindow:
         self.text.configure(state="disabled")
 
     def _on_close(self):
+        """Close the window, but never while the instrument is still live.
+
+        `_release_live` refuses while a recording runs - correctly, because
+        releasing mid-stream leaves the slot back in the pool still streaming.
+        But ignoring that refusal and destroying the window anyway is worse
+        than the defect it replaced: the instrument is then never released at
+        all, and the message saying so is written into a widget that is
+        destroyed on the next line.
+
+        So the close waits, generously, and if the worker still will not stop
+        it says what is being left behind rather than pretending otherwise.
+        """
         if self.controller.running:
+            self._log("Stopping the recording before closing...")
             self.controller.stop()
-            self.controller.join(5.0)
+            # Longer than DRAIN_DEADLINE_SEC (5 s), which is only the first
+            # of several steps left after stop() is seen - stop_source, the
+            # backlog drain and finalise() all follow it.
+            if not self.controller.join(20.0):
+                self._log(
+                    "The recording thread has not stopped. Not closing yet - "
+                    "closing now would leave the instrument claimed and "
+                    "streaming, with no way to release it but ending the "
+                    "process. Wait, or kill the process if it never "
+                    "finishes.", "bad")
+                self.root.after(1000, self._on_close)
+                return
         self._release_live()
+        if self._live_stack is not None:
+            self._log("The instrument could not be released; closing anyway. "
+                      "It will be freed when this process exits.", "bad")
         self.root.destroy()
 
     def run(self):

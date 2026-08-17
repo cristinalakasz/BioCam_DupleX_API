@@ -259,3 +259,96 @@ def test_clock_warnings_reach_the_snapshot(tmp_path):
     controller = SessionController()
     state = run_to_completion(controller, a_factory(tmp_path))
     assert any("cannot detect anything" in w for w in state.warnings)
+
+
+# --------------------------------------------------------------------------
+# ordering and cleanup on the live path (no instrument: fakes for the driver)
+# --------------------------------------------------------------------------
+
+def test_stop_source_stops_the_stimulator_before_the_stream():
+    """MainForm.cs:210 then :213 - Stop() then StopDataStreaming().
+
+    This must live in `stop_source`, not `stop_source_safely`: `stop_source`
+    is the callable `record_session` invokes in its own `finally`, and it runs
+    long before the controller's `finally` reaches `stop_source_safely`.
+    Putting it only in the latter produced StopDataStreaming *then* Stop() on
+    every ordinary session - the exact inversion.
+    """
+    from biocam.ui.factories import LiveFactory
+
+    order = []
+
+    class FakeStimulator:
+        def stop(self):
+            order.append("stimulator.stop")
+
+    class FakeSource:
+        def stop(self):
+            order.append("source.stop")
+
+    factory = LiveFactory(output_path="out.raw", stimulator=FakeStimulator())
+    factory.stop_source(FakeSource())()
+    assert order == ["stimulator.stop", "source.stop"]
+
+
+def test_start_source_starts_the_stream_before_the_stimulator():
+    # MainForm.cs:186 then :192, the other end of the same bracket.
+    from biocam.ui.factories import LiveFactory
+
+    order = []
+
+    class FakeStimulator:
+        def start(self):
+            order.append("stimulator.start")
+
+    class FakeSource:
+        def start(self, packet_timespan_ms=None):
+            order.append("source.start")
+
+    factory = LiveFactory(output_path="out.raw", stimulator=FakeStimulator())
+    factory.start_source(FakeSource())
+    assert order == ["source.start", "stimulator.start"]
+
+
+def test_stop_source_works_with_no_stimulator():
+    # A recording-only session must still stop its stream.
+    from biocam.ui.factories import LiveFactory
+
+    stopped = []
+
+    class FakeSource:
+        def stop(self):
+            stopped.append(True)
+
+    LiveFactory(output_path="out.raw", stimulator=None).stop_source(
+        FakeSource())()
+    assert stopped == [True]
+
+
+def test_a_failure_starting_the_stimulator_still_stops_the_stream(tmp_path):
+    """The leak the split introduced.
+
+    `start_source` now makes two driver calls and the second can raise. With
+    it outside the try/finally, that raise skipped cleanup entirely and left
+    the device streaming with handlers subscribed and nothing referencing the
+    source.
+    """
+    stopped = []
+
+    class HalfStarting(ReplayFactory):
+        def start_source(self, source):
+            # The stream engages, then the stimulator refuses.
+            raise RuntimeError("IBioCamStim.Start() returned false")
+
+        def stop_source_safely(self, source):
+            stopped.append(True)
+
+    factory = HalfStarting(
+        raw_path=a_factory(tmp_path).raw_path, params=PARAMS,
+        output_path=tmp_path / "out.raw",
+    )
+    controller = SessionController()
+    state = run_to_completion(controller, factory)
+
+    assert "IBioCamStim.Start() returned false" in state.error
+    assert stopped == [True], "cleanup was skipped; the stream would be left running"
