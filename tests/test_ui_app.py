@@ -325,3 +325,125 @@ def test_releasing_is_refused_while_a_recording_runs(root, tmp_path, demo):
     assert window._live_stack is not None   # not dropped, so it can be retried
     window.controller.stop()
     window.controller.join(10.0)
+
+
+# --------------------------------------------------------------------------
+# the array: clicking it, and watching it
+# --------------------------------------------------------------------------
+
+def test_the_grid_matches_the_recording_channel_count(root, tmp_path, demo):
+    # The demo fixture is 4 channels, so a 64x64 grid would render nothing.
+    window = a_window(root, tmp_path, demo)
+    assert window.n_rows * window.n_cols == PARAMS.total_channels
+
+
+def test_clicking_the_array_fills_the_text_fields(root, tmp_path, demo):
+    # The picture is the source of truth; the fields follow it. Typing
+    # "10,10" to address one of 4096 electrodes is not an interface.
+    from biocam.ui.arrayview import cell_bounds
+
+    window = a_window(root, tmp_path, demo)
+    window.array.clear()
+    x0, y0, _, _ = cell_bounds(2, 1, window.array.cell)
+    window.array._click(type("E", (), {"x": x0 + 2, "y": y0 + 2})(), "positive")
+    root.update()
+    assert window.var_positive.get() == "2,1"
+
+
+def test_editing_the_text_fields_moves_the_array(root, tmp_path, demo):
+    # Both directions, so the two views cannot drift apart.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,2")
+    window.var_negative.set("2,1")
+    root.update()
+    assert window.array.positive == [(1, 2)]
+    assert window.array.negative == [(2, 1)]
+
+
+def test_a_half_typed_field_does_not_wipe_the_selection(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,2")
+    root.update()
+    window.var_positive.set("1,")          # mid-keystroke
+    root.update()
+    assert window.array.positive == [(1, 2)]
+
+
+def test_the_array_selection_is_what_gets_validated(root, tmp_path, demo):
+    from biocam.ui.arrayview import cell_bounds
+
+    window = a_window(root, tmp_path, demo)
+    window.array.clear()
+    for row, col, which in ((1, 1, "positive"), (2, 2, "negative")):
+        x0, y0, _, _ = cell_bounds(row, col, window.array.cell)
+        window.array._click(
+            type("E", (), {"x": x0 + 2, "y": y0 + 2})(), which)
+    root.update()
+    plan, pattern = window._build_stimulus()
+    assert [(e.row, e.col) for e in pattern.positive] == [(1, 1)]
+    assert [(e.row, e.col) for e in pattern.negative] == [(2, 2)]
+
+
+def test_an_empty_selection_disables_stimulation_with_a_reason(
+    root, tmp_path, demo
+):
+    window = a_window(root, tmp_path, demo)
+    window.array.clear()
+    root.update()
+    assert str(window.btn_stim["state"]) == "disabled"
+    assert "electrode" in window.lbl_stim["text"].lower()
+
+
+def test_the_array_lights_up_during_a_recording(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_duration.set("2")
+    window._on_start()
+    pump(root, window)
+    activity = window.controller.activity()
+    assert activity is not None and activity.has_data
+    low, high = activity.range()
+    assert high > low
+    assert "peak-to-peak" in window.lbl_scale["text"]
+
+
+def test_hovering_reports_the_electrode_and_its_reading(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_duration.set("2")
+    window._on_start()
+    pump(root, window)
+    window._on_array_hover((1, 1))
+    text = window.lbl_hover["text"]
+    assert "(1,1)" in text
+    assert "uV" in text
+
+
+def test_hovering_off_the_array_says_nothing_specific(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window._on_array_hover(None)
+    assert "Hover" in window.lbl_hover["text"]
+
+
+def test_the_activity_display_never_costs_the_recording(root, tmp_path, demo):
+    # The monitor runs on the drain's thread. If it fails, the recording
+    # continues and the sidecar is still complete.
+    from biocam.data.recording import read_sidecar
+
+    class BrokenMonitor:
+        def observe(self, packet):
+            raise RuntimeError("the display fell over")
+
+        def snapshot(self):
+            return None
+
+        def warnings(self):
+            return []
+
+    window = a_window(root, tmp_path, demo)
+    window.var_duration.set("1")
+    window._on_start()
+    # Swap the monitor in mid-flight; the guard is in record_session.
+    window.controller._monitor = BrokenMonitor()
+    state = pump(root, window)
+    assert state.verdict in ("clean", "gaps_detected")
+    assert read_sidecar(
+        list((tmp_path / "out").glob("*_meta.json"))[0])["status"] == "complete"

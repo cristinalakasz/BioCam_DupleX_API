@@ -21,6 +21,13 @@ recordings/*
 # to test analysis code on a machine with no instrument.
 !tests/fixtures/*.raw
 
+# The UI's demo recording, made by tools/make_demo_recording.py. The .raw is
+# already excluded above; the sidecar goes with it. Committing a sidecar
+# whose recording is absent is worse than committing neither - it looks like
+# a real run that someone forgot to upload.
+/demo.raw
+/demo_meta.json
+
 # --- Build output ------------------------------------------------------
 bin/
 obj/

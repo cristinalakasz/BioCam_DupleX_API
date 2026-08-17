@@ -119,6 +119,7 @@ class SessionController:
         self._started_at = None
         self._factory = None
         self._clock = None
+        self._monitor = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -181,6 +182,9 @@ class SessionController:
             # mid-observe can be one packet stale but never torn. A lock would
             # be a lock the drain has to take.
             self._clock = clock
+            # Built by the factory, because only it knows the acquisition
+            # parameters and the array geometry.
+            self._monitor = factory.make_monitor()
             with factory.make_writer(listener=self._events.put) as writer:
                 source = factory.make_source()
                 # start_source is INSIDE the try whose finally stops it.
@@ -200,6 +204,7 @@ class SessionController:
                         counters=factory.counters(source),
                         stop_source=factory.stop_source(source),
                         clock=clock,
+                        monitor=self._monitor,
                         service=lambda: self.stim_queue.service(factory.send),
                     )
                 finally:
@@ -245,6 +250,13 @@ class SessionController:
             )
 
     # -- for the UI thread -----------------------------------------------
+
+    def activity(self):
+        """The latest picture of the array, or None. UI thread only."""
+        monitor = self._monitor
+        if monitor is None:
+            return None
+        return monitor.snapshot()
 
     @property
     def listener(self):
@@ -318,6 +330,8 @@ class SessionController:
                 problems.extend(clock.warnings())
             except Exception:  # noqa: BLE001
                 pass
+        if self._monitor is not None:
+            problems.extend(self._monitor.warnings())
         problems.extend(self.stim_queue.warnings())
         if self._events.dropped:
             problems.append(
