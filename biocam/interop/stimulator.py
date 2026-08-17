@@ -116,6 +116,26 @@ class Stimulator:
 
     # -- lifecycle -------------------------------------------------------
 
+    @staticmethod
+    def _read(what: str, read):
+        """Read one driver property, turning a .NET failure into ours.
+
+        These assemblies are obfuscated: an escaping exception carries
+        private-use codepoints in place of method names, and printing one to a
+        cp1252 console raises UnicodeEncodeError - so the real error is
+        replaced by an encoding error about the real error. Wrapping keeps the
+        member name that failed in the message and keeps the type something
+        callers can catch.
+        """
+        try:
+            return read()
+        except BaseException as exc:
+            raise StimulatorError(
+                f"reading {what} raised {exc!r}. That is a driver-level "
+                "failure before any stimulation was attempted; the BioCAM may "
+                "have been disconnected or claimed by another process."
+            ) from exc
+
     def __enter__(self):
         if getattr(self._device, "biocam", None) is None:
             # Without this the line below raises a bare "'NoneType' object has
@@ -127,21 +147,34 @@ class Stimulator:
                 "`with BioCamDevice() as device:` around this block."
             )
 
-        if not self._device.biocam.IsStreaming:
+        # Every read below goes through _read(). These are plain property
+        # accesses, but they are property accesses *on the driver*, and an
+        # unwrapped .NET exception from one arrives as an obfuscated
+        # _3Brain exception whose text carries private-use codepoints - which
+        # a cp1252 console then fails to print, replacing the real error with
+        # a UnicodeEncodeError. Initialize and Start were already wrapped; the
+        # asymmetry was the bug.
+        if not self._read("IBioCam.IsStreaming",
+                          lambda: self._device.biocam.IsStreaming):
             # A warning, not a refusal. A single pulse is still delivered
             # without an acquisition; only the reported latency loses its
             # meaning. send_scheduled refuses separately, because a timestamp
             # measured from an acquisition that does not exist is not a time.
+            #
+            # Untested either way: that Start() and Send() work at all with no
+            # acquisition running. No source says they do, and the sample
+            # never tries it - issue #22.
             self._warn(
                 "the BioCAM is not streaming. 3Brain's sample starts the "
                 "stimulator after StartDataStreaming (MainForm.cs:186,192). "
-                "Pulses will still be delivered, but the latency reported by "
-                "send_now is measured from the beginning of the acquisition "
-                "and has no reference point; scheduled trains cannot be sent "
-                "at all."
+                "Pulses should still be delivered - though that is itself "
+                "untested - but the latency reported by send_now is measured "
+                "from the beginning of the acquisition and has no reference "
+                "point, and scheduled trains cannot be sent at all."
             )
 
-        stimulator = self._device.biocam.Stimulator
+        stimulator = self._read("IBioCam.Stimulator",
+                                lambda: self._device.biocam.Stimulator)
         if stimulator is None:
             raise StimulatorError(
                 "biocam.Stimulator is None. The BioCAM firmware reports no "
@@ -149,7 +182,7 @@ class Stimulator:
                 "reports whether the instrument has one at all."
             )
 
-        if not stimulator.IsAvailable():
+        if not self._read("IBioCamStim.IsAvailable()", stimulator.IsAvailable):
             raise StimulatorError(
                 "IBioCamStim.IsAvailable() returned false: the stimulator "
                 "module is not available. It may not be installed, or another "
@@ -160,14 +193,16 @@ class Stimulator:
         # is already initialized. connector.py:185 calls Initialize() during
         # connect(), so this is reachable in an ordinary session rather than
         # only in a misuse.
-        if stimulator.IsInitialized:
+        if self._read("IBioCamStim.IsInitialized",
+                      lambda: stimulator.IsInitialized):
             raise StimulatorError(
                 "the stimulator is already initialized. Initialize() would "
                 "throw InvalidOperationException. Something else in this "
                 "process already holds it - connector.py calls Initialize() "
                 "during connect(); use one or the other, not both."
             )
-        if stimulator.IsStimulating:
+        if self._read("IBioCamStim.IsStimulating",
+                      lambda: stimulator.IsStimulating):
             raise StimulatorError(
                 "the stimulator reports it is already stimulating, so Start() "
                 "would probably throw InvalidOperationException - the XML "
@@ -191,9 +226,15 @@ class Stimulator:
         # not relying on the C# default either (issue #17).
         protocol_type = StimProtocolType.RealTime
 
+        # Both failure paths call _shutdown() before raising. Neither Stop nor
+        # Close fires (both flags are still False), so it is a no-op apart
+        # from releasing self._stimulator - which is the point: __enter__ is
+        # about to raise, so __exit__ will never run, and the instance must
+        # not be left holding a handle it does not own.
         try:
             initialized = stimulator.Initialize(protocol_type)
         except BaseException as exc:
+            self._shutdown()
             raise StimulatorError(
                 f"IBioCamStim.Initialize({protocol_type}) raised {exc!r}. The "
                 "XML documents InvalidOperationException when already "
@@ -201,6 +242,7 @@ class Stimulator:
                 "not supported. Nothing has been started."
             ) from exc
         if not initialized:
+            self._shutdown()
             raise StimulatorError(
                 f"IBioCamStim.Initialize({protocol_type}) returned false. The "
                 "stimulator did not initialize; nothing has been started."
@@ -404,13 +446,17 @@ class Stimulator:
                 "time-stamps."
             )
 
-        if not self._device.biocam.IsStreaming:
+        if not self._read("IBioCam.IsStreaming",
+                          lambda: self._device.biocam.IsStreaming):
             raise StimulatorError(
                 "cannot send a scheduled train: the BioCAM is not streaming. "
                 "The XML says these timestamps are microseconds 'relative to "
-                "the beginning of the acquisition' - with no acquisition "
-                "running they refer to nothing. Start data streaming first, "
-                "then shift the plan by the current acquisition time."
+                "the beginning of the acquisition', so with no acquisition "
+                "running there is nothing for them to be relative to. What "
+                "the instrument would actually do with them is untested "
+                "(issue #24) - this refuses rather than finding out on a "
+                "culture. Start data streaming first, then shift the plan by "
+                "the current acquisition time."
             )
 
         pulse, positive, negative = self._prepare(pulse_plan, pattern)
@@ -503,10 +549,10 @@ class Stimulator:
 
         # The plan was validated against some StimConstraints; check they are
         # the instrument's. A plan built against StimProperties.Default is the
-        # expected way to get this wrong, and it is silent. Only the numeric
-        # fields are compared: `unit` is cosmetic, and the device reports
-        # 'µA' (U+00B5) where a hand-built StimConstraints defaults to 'uA',
-        # which would otherwise fail an identical plan.
+        # expected way to get this wrong, and it is silent. `unit` is the only
+        # field excluded from the comparison - see
+        # StimConstraints.matches_numerically, which explains why is_current
+        # is compared despite also being a label.
         if not pulse_plan.constraints.matches_numerically(self.constraints):
             raise StimulatorError(
                 "this pulse was planned against different limits than the "

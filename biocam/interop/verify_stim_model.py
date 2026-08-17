@@ -219,6 +219,21 @@ def _check_send_overloads() -> list:
         "immediate, no latency": (pulse_type, endpoints_type, endpoints_type),
     }
 
+    # Keys that match no Send overload. Without these the positive cases
+    # prove nothing: if Overloads[...] were permissive, three successes would
+    # be three successes at nothing. This is the negative control the
+    # MaxPulseDuration cases lacked until a non-default cap was added.
+    wrong_keys = {
+        "Int32 as the fourth argument": (
+            pulse_type, endpoints_type, endpoints_type,
+            clr.GetClrType(System.Int32)),
+        "String as the first argument": (
+            clr.GetClrType(System.String), endpoints_type, endpoints_type),
+        "five arguments, an arity Send does not have": (
+            pulse_type, endpoints_type, endpoints_type, timestamps_type,
+            timestamps_type),
+    }
+
     failures = []
     print("Resolving the Send overloads against IBioCamStim's method table\n")
     for label, key in keys.items():
@@ -228,10 +243,31 @@ def _check_send_overloads() -> list:
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             failures.append(f"Send overload {label!r} did not resolve: {exc!r}")
             print(f"  [FAILED] {label}: {type(exc).__name__}")
+
+    print("\n  negative control - these must NOT resolve:")
+    for label, key in wrong_keys.items():
+        try:
+            IBioCamStim.Send.Overloads[key]
+        except Exception:  # noqa: BLE001 - refusing is the expected outcome
+            print(f"    [ok] refused: {label}")
+        else:
+            failures.append(
+                f"Overloads[...] accepted a key matching no Send overload "
+                f"({label}). Overload selection is not discriminating, so the "
+                "positive checks above establish nothing."
+            )
+            print(f"    [PERMISSIVE] accepted: {label}")
+
     print(
-        "\n  Note: resolution is verified, invocation is not. Calling these "
-        "needs a live\n  IBioCamStim, so the two-tuple return of the "
-        "out-parameter form is still\n  untested - see issue #22.\n"
+        "\n  Two limits, stated rather than glossed:\n"
+        "    - Resolution is checked; invocation is not. Calling these needs "
+        "a live\n      IBioCamStim, so the two-tuple return of the "
+        "out-parameter form remains\n      untested - issue #22.\n"
+        "    - That each key returned the overload *intended* is not "
+        "confirmed. All\n      three bindings share one repr and one "
+        "__doc__, so nothing here\n      distinguishes them; the negative "
+        "control shows only that a key matching\n      no overload is "
+        "refused.\n"
     )
     return failures
 
@@ -319,8 +355,9 @@ def main(argv=None) -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print(f"All {len(CASES)} cases agree: biocam.stim.plan() accepts exactly "
-          "the pulses the driver builds faithfully.")
+    print(f"All {len(CASES)} pulse cases agree (biocam.stim.plan() accepts "
+          "exactly the pulses\nthe driver builds faithfully), and every Send "
+          "overload key resolves while\nevery wrong key is refused.")
     return 0
 
 

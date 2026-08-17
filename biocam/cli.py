@@ -892,11 +892,22 @@ def stim_command(args) -> int:
                 print(f"negative: {', '.join(str(e) for e in pattern.negative)}")
 
                 if train_plan is None:
+                    streaming = bool(device.biocam.IsStreaming)
                     latency = stimulator.send_now(pulse_plan, pattern)
-                    print(f"\nsent. latency {latency} clock cycles "
-                          "(relative to the beginning of the acquisition; "
-                          "convert with IBioCam.ClockCyclesToMilliseconds "
-                          "rather than a guessed clock rate)")
+                    if streaming:
+                        print(f"\nsent. latency {latency} clock cycles "
+                              "(relative to the beginning of the acquisition; "
+                              "convert with IBioCam.ClockCyclesToMilliseconds "
+                              "rather than a guessed clock rate)")
+                    else:
+                        # The warning went to stderr and may be far up the
+                        # scrollback by now. A latency measured from an
+                        # acquisition that never started must not be printed
+                        # as though it meant something.
+                        print(f"\nsent. latency reported as {latency}, but "
+                              "MEANINGLESS: no acquisition was running, and "
+                              "the value is measured in clock cycles from the "
+                              "beginning of one.")
                 else:
                     stimulator.send_scheduled(train_plan, pattern)
                     print(f"\nqueued {train_plan.count} pulses. Timestamps are "

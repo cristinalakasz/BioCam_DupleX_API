@@ -786,8 +786,19 @@ whole train at once. `TrainPlan.shifted_by(current_acquisition_time_us)` does
 the conversion — but note that nothing in this repository can yet *read* the
 current acquisition time, which is the other half of issue #24.
 
-Until that is answered, treat scheduled stimulation as unfinished and use
-single pulses.
+**So `biocam stim --count N` cannot run yet.** Nothing on the `stim` path
+starts an acquisition, so a scheduled train has no time origin, and the command
+refuses with a clear message rather than sending one into an undefined one.
+Single pulses work. Trains wait on issue #24 and on Phase 3, where recording
+and stimulation are driven together.
+
+One more thing to expect on the first session: **`Start()` and `Send()` have
+never been tried with no acquisition running**, and `biocam stim` without a
+recording is exactly that case. The XML does not list streaming among `Send`'s
+preconditions and the vendor's sample never tests it, so this software warns
+rather than refusing — but if the very first `biocam stim` throws, that is the
+likely reason, and it is worth reporting on issue #22 rather than working
+around.
 
 ### 15.6 Reading the API yourself
 

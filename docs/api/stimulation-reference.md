@@ -340,6 +340,22 @@ Everything above was established without one. These cannot be:
 6. **What the instrument does with timestamps in the past** — issue #24. This
    is also where the *current acquisition time* has to come from, and nothing
    in this repository can yet read it.
+7. **That `Start()` and `Send()` work at all with no acquisition running.** No
+   source says they do. The XML's only preconditions on `Send` are "the
+   stimulator has not started", a null pulse, and invalid endpoints —
+   streaming is not among them — and the sample never tries it. `biocam stim`
+   without a recording is the *first* thing that will exercise this, so it is
+   the first thing that may fail. `Stimulator.__enter__` warns rather than
+   refusing, precisely because refusing would be asserting something unproven.
+
+### A limitation to know before the session
+
+**`biocam stim --count N` cannot run yet.** Scheduled trains need an
+acquisition, since their timestamps are measured from the start of one, and
+nothing on the `biocam stim` path starts data streaming. The command refuses
+with a clear message rather than sending a train into an undefined time
+origin. Single pulses work; trains wait on issue #24 and on Phase 3, which is
+where recording and stimulation are driven together.
 
 Issues #21–#24 carry runnable procedures. **#21 is the one to close first**:
 every limit in `biocam/stim/` is parameterised on the DupleX's real
