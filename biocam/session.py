@@ -85,6 +85,33 @@ def _feed_clock(clock, packet, writer):
     return clock
 
 
+def _run_service(service, writer):
+    """Run the between-packets hook once. Returns it, or None if it failed.
+
+    Guarded for the reason `_feed_clock` is: this runs inside the packet loop,
+    and an escaping exception there sets `interrupted`, which skips the
+    backlog drain, `pending_count()` and `finalise()`, leaving an intact raw
+    file stamped `failed` and a queue's worth of acquired data written
+    nowhere. A stimulus that could not be dispatched must not cost the
+    recording.
+
+    A hook that raises is dropped rather than retried every packet: if it is
+    broken it will stay broken, and re-entering it 9000 times a second would
+    turn one fault into a stall.
+    """
+    try:
+        service()
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the stimulus
+        warnings.warn(
+            f"stimulation service failed after {writer.n_frames_written} "
+            f"frames and has been disconnected for the rest of this "
+            f"recording: {exc}. The recording continues.",
+            RuntimeWarning,
+        )
+        return None
+    return service
+
+
 @dataclass(frozen=True)
 class SessionResult:
     raw_path: str
@@ -96,7 +123,7 @@ class SessionResult:
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
-                   stop_source=None, clock=None) -> SessionResult:
+                   stop_source=None, clock=None, service=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -251,6 +278,18 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 payload=packet.payload,
             )
             clock = _feed_clock(clock, packet, writer)
+            if service is not None:
+                # Stimulation runs here, on the consumer thread, between
+                # packets - the arrangement 3Brain's own sample uses
+                # (MainForm.cs:383, inside the loop its data callback drives),
+                # which avoids depending on whether Send is safe from another
+                # thread. Nothing in the XML says whether it is.
+                #
+                # The cost is that this time comes out of the drain's budget,
+                # so `service` must dispatch at most one stimulus and must not
+                # raise. StimulationQueue.service does both, and times itself
+                # so the cost is measured rather than assumed.
+                service = _run_service(service, writer)
             packets_since_counter_check += 1
             if packets_since_counter_check >= COUNTER_CHECK_INTERVAL_PACKETS:
                 packets_since_counter_check = 0

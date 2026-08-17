@@ -853,3 +853,77 @@ def test_a_clock_that_raises_costs_the_clock_and_not_the_recording(tmp_path):
     assert read_sidecar(meta)["status"] == "complete"
     # Dropped after the first failure rather than raising on every packet.
     assert clock.calls == 1
+
+
+# --------------------------------------------------------------------------
+# stimulation on the consumer thread, between packets
+# --------------------------------------------------------------------------
+
+def test_stimulation_is_serviced_between_packets(tmp_path):
+    from biocam.control import StimulationQueue
+
+    source, _ = _source(tmp_path, 100, frames_per_packet=10)
+    q = StimulationQueue()
+    sent = []
+    q.request("plan", "pattern", label="one")
+    q.request("plan", "pattern", label="two")
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(
+            source, writer, service=lambda: q.service(sent.append))
+
+    assert result.n_frames == 100
+    assert [r.label for r in sent] == ["one", "two"]
+    assert q.dispatched == 2
+
+
+def test_only_one_stimulus_is_dispatched_per_packet(tmp_path):
+    # Ten packets, twenty requests: a backlog must not become a burst.
+    from biocam.control import StimulationQueue
+
+    source, _ = _source(tmp_path, 100, frames_per_packet=10)
+    q = StimulationQueue(capacity=64)
+    for _ in range(20):
+        q.request("plan", "pattern")
+    sent = []
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(source, writer, service=lambda: q.service(sent.append))
+
+    # 10 packets means at most 10 dispatches, and the rest stay queued.
+    assert len(sent) == 10
+    assert len(q) == 10
+
+
+def test_a_service_that_raises_costs_the_stimulus_and_not_the_recording(
+    tmp_path,
+):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError("control thread is on fire")
+
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with pytest.warns(RuntimeWarning, match="stimulation service failed"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            result = record_session(source, writer, service=broken)
+
+    assert result.n_frames == 100
+    assert result.verdict == "clean"
+    assert raw.read_bytes() == data.tobytes()
+    assert read_sidecar(meta)["status"] == "complete"
+    # Disconnected after the first failure, not re-entered on every packet.
+    assert len(calls) == 1
+
+
+def test_a_session_without_a_service_is_unaffected(tmp_path):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer)
+    assert result.n_frames == 100
+    assert raw.read_bytes() == data.tobytes()
