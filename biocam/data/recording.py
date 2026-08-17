@@ -518,6 +518,16 @@ class RecordingWriter:
         return self._bytes_written // self._params.bytes_per_frame
 
     @property
+    def n_frames_missing(self) -> int:
+        """Frames the instrument acquired that never reached this writer.
+
+        Already reported in the sidecar's integrity block; exposed as a
+        property so that AcquisitionClock can count them as elapsed time -
+        a recording that loses data must not also lose time.
+        """
+        return self._tracker.n_frames_missing
+
+    @property
     def params(self) -> AcquisitionParameters:
         return self._params
 

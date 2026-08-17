@@ -55,7 +55,7 @@ class SessionResult:
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
-                   stop_source=None) -> SessionResult:
+                   stop_source=None, clock=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -209,6 +209,15 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 counter=packet.counter,
                 payload=packet.payload,
             )
+            if clock is not None:
+                # Fed from the writer's own totals rather than counted a
+                # second time here, so the clock and the sidecar can never
+                # disagree about how many frames a recording holds. Pure
+                # arithmetic on the consumer thread - nothing on the callback
+                # path, and nothing that can block the drain.
+                clock.observe_totals(
+                    packet, writer.n_frames_written, writer.n_frames_missing
+                )
             packets_since_counter_check += 1
             if packets_since_counter_check >= COUNTER_CHECK_INTERVAL_PACKETS:
                 packets_since_counter_check = 0

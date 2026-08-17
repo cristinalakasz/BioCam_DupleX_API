@@ -726,3 +726,60 @@ def test_finally_drain_survives_a_write_failure_and_still_finalises(tmp_path, mo
     integrity = record["integrity"]
     assert integrity["discarded_at_stop"] > 0
     assert integrity["verdict"] != "clean"
+
+
+# --------------------------------------------------------------------------
+# the acquisition clock, driven through a real writer
+# --------------------------------------------------------------------------
+
+def test_the_clock_tracks_acquisition_time_through_a_real_recording(tmp_path):
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(tmp_path, 1000, frames_per_packet=10)
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    # 1000 frames at 1 kHz is one second of acquisition.
+    assert result.n_frames == 1000
+    assert clock.frames_seen == 1000
+    assert clock.now_us() == pytest.approx(1_000_000.0)
+
+
+def test_the_clock_counts_dropped_packets_as_elapsed_time(tmp_path):
+    # The instrument kept acquiring while those packets were missing, so the
+    # clock must not run slow. This is the case that would otherwise schedule
+    # a stimulus early by exactly the duration of the loss.
+    from biocam.data.clock import AcquisitionClock
+
+    source, _ = _source(
+        tmp_path, 1000, frames_per_packet=10, drop_packets=(10, 11, 12, 13, 14))
+    clock = AcquisitionClock(PARAMS.frame_rate_hz)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, clock=clock)
+
+    assert result.verdict == "gaps_detected"
+    assert clock.frames_seen == 950
+    assert clock.frames_lost == 50
+    # 950 received + 50 lost is still a full second of acquisition.
+    assert clock.now_us() == pytest.approx(1_000_000.0)
+
+
+def test_a_session_without_a_clock_is_unaffected(tmp_path):
+    source, data = _source(tmp_path, 100, frames_per_packet=10)
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer)
+    assert result.n_frames == 100
+    assert raw.read_bytes() == data.tobytes()
+
+
+def test_the_writer_reports_missing_frames(tmp_path):
+    source, _ = _source(
+        tmp_path, 1000, frames_per_packet=10, drop_packets=(5, 6))
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        record_session(source, writer)
+        assert writer.n_frames_missing == 20
