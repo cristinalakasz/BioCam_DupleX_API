@@ -358,8 +358,11 @@ none needed a BioCAM:
   `Send(pulse, pos, neg, out UInt64)` are both three-argument calls from
   Python. `Overloads[…]` selects explicitly, and
   `clr.GetClrType(T).MakeByRefType()` produces the `UInt64&` key an out
-  parameter needs. Both verified, so `stimulator.py` states which overload it
-  means rather than letting resolution guess.
+  parameter needs. All three overload keys resolve against the **real**
+  `IBioCamStim` method table, checked on every `verify_stim_model` run — so
+  `stimulator.py` names the overload it means rather than letting resolution
+  guess. The remaining gap is the *call*, not the key: invoking the
+  out-parameter form and getting a two-tuple back needs a live stimulator.
 - **`System.Array[T](list)`** works for `StimEndPoint[]` and `Double[]`.
 - **`StimProperties.MaxPulseDuration` is settable**, confirmed with a value
   other than the constructor default — a 500-tick cap really does truncate a

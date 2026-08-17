@@ -8,6 +8,14 @@ rather than a .NET member - building an array, selecting an overload - it is
 verified by running it on the development machine, which needs the DLLs but no
 BioCAM. Those are marked individually below.
 
+One exception, stated so the paragraph above stays literally true. All three
+`Send` overload *keys* resolve against the real `IBioCamStim` method table -
+`python -m biocam.interop.verify_stim_model` checks that on every run. What
+has not been executed is the *call*: an overload selected via
+`Overloads[..., UInt64&]`, invoked with the out argument omitted, returning a
+two-tuple. That needs a live stimulator. Failure would be a loud `TypeError`
+at the call site, not a wrong stimulus.
+
 ## The lifecycle is Initialize -> Start -> Stop -> Close
 
 `connector.py` calls `Initialize()` (line 185) and `Close()` (line 214) and
@@ -37,12 +45,18 @@ that uses both it and this class would hit the "already initialized" throw.
 ## Ordering against acquisition matters
 
 3Brain's own sample starts the stimulator *after* data streaming and stops it
-*before* (`MainForm.cs:186,192` then `:210,213`). That is not a stylistic
-preference: the latency the `out UInt64` overload reports is in clock cycles
-"relative to the beginning of the acquisition", and scheduled timestamps are
-microseconds "relative to the beginning of the acquisition". Started before an
-acquisition exists, both references are undefined. `__enter__` therefore
-requires the device to be streaming unless told otherwise.
+*before* (`MainForm.cs:186,192` then `:210,213`). The latency the `out UInt64`
+overload reports is in clock cycles "relative to the beginning of the
+acquisition", and scheduled timestamps are microseconds from the same origin.
+Started before an acquisition exists, neither has a reference point.
+
+That makes streaming **required for `send_scheduled`** - a timestamp measured
+from an acquisition that does not exist is meaningless - and merely
+**advisable for `send_now`**, which still delivers a stimulus; only the
+returned latency loses its meaning. Whether the driver itself requires the
+ordering is not documented either way, so `__enter__` warns rather than
+refuses. Making it refuse was tried and was wrong: it left `biocam stim`
+unable to run at all, since nothing on that path starts an acquisition.
 
 The pulse arithmetic lives in `biocam.stim`, which is testable. This module
 only translates a validated plan into .NET objects and calls the driver, so
@@ -53,15 +67,13 @@ from biocam.stim.electrodes import ElectrodeGrid, StimPattern, validate_pattern
 from biocam.stim.pulse import PulsePlan, verify_built_pulse
 from biocam.stim.train import MAX_TRAIN_PULSES
 
-# Verified by reflection over 3Brain.BioCamDriver:
-#   StimProtocolType.Static = 0, StimProtocolType.RealTime = 1
-#
-# Only RealTime is supported here. XML (T:StimProtocolType) says of Static:
-# "All stimulation arguments like the pulse shape, end points and timestamps,
-# must be first loaded before the stimulation starts" - the opposite of the
-# order this class enforces, which is Start() first and Send() afterwards.
-# Supporting Static means a different class, not a flag.
-PROTOCOL_REALTIME = "RealTime"
+# Only StimProtocolType.RealTime is supported here. XML (T:StimProtocolType)
+# says of Static: "All stimulation arguments like the pulse shape, end points
+# and timestamps, must be first loaded before the stimulation starts" - the
+# opposite of the order this class enforces, which is Start() first and Send()
+# afterwards. Supporting Static means a different class, not a flag. The enum
+# itself is imported where it is used; naming it here as a bare constant would
+# only invite passing a string to Initialize().
 
 
 class StimulatorError(RuntimeError):
@@ -89,12 +101,12 @@ class Stimulator:
         *,
         grid: ElectrodeGrid = None,
         enforce_column_rule: bool = True,
-        require_streaming: bool = True,
+        warn=None,
     ):
         self._device = device
         self._grid = grid
         self._enforce_column_rule = enforce_column_rule
-        self._require_streaming = require_streaming
+        self._warn = warn or (lambda message: None)
         self._stimulator = None
         self._initialized = False
         self._started = False
@@ -115,15 +127,18 @@ class Stimulator:
                 "`with BioCamDevice() as device:` around this block."
             )
 
-        if self._require_streaming and not self._device.biocam.IsStreaming:
-            raise StimulatorError(
+        if not self._device.biocam.IsStreaming:
+            # A warning, not a refusal. A single pulse is still delivered
+            # without an acquisition; only the reported latency loses its
+            # meaning. send_scheduled refuses separately, because a timestamp
+            # measured from an acquisition that does not exist is not a time.
+            self._warn(
                 "the BioCAM is not streaming. 3Brain's sample starts the "
-                "stimulator after StartDataStreaming (MainForm.cs:186,192), "
-                "and both the reported latency and any scheduled timestamps "
-                "are measured from the beginning of the acquisition - with no "
-                "acquisition running they have no reference point. Pass "
-                "require_streaming=False for bench work where timing does not "
-                "matter."
+                "stimulator after StartDataStreaming (MainForm.cs:186,192). "
+                "Pulses will still be delivered, but the latency reported by "
+                "send_now is measured from the beginning of the acquisition "
+                "and has no reference point; scheduled trains cannot be sent "
+                "at all."
             )
 
         stimulator = self._device.biocam.Stimulator
@@ -133,7 +148,6 @@ class Stimulator:
                 "stimulator module. BioCamSlotInfo.HasBioCamStimulator() "
                 "reports whether the instrument has one at all."
             )
-        self._stimulator = stimulator
 
         if not stimulator.IsAvailable():
             raise StimulatorError(
@@ -155,9 +169,19 @@ class Stimulator:
             )
         if stimulator.IsStimulating:
             raise StimulatorError(
-                "the stimulator reports it is already stimulating. Start() "
-                "would throw InvalidOperationException."
+                "the stimulator reports it is already stimulating, so Start() "
+                "would probably throw InvalidOperationException - the XML "
+                "defines IsStimulating as 'whether the stimulator is running' "
+                "and says Start throws when 'already started', which are very "
+                "likely the same condition but are not documented as such."
             )
+
+        # Only now, with every state check passed, does this instance take
+        # ownership. Set earlier, a failure above would leave the object
+        # holding a live handle it never claimed, with __exit__ never running
+        # because __enter__ did not return - and `is_stimulating` would go on
+        # querying a stimulator this instance does not own.
+        self._stimulator = stimulator
 
         from _3Brain.BioCamDriver import StimProtocolType
 
@@ -225,12 +249,25 @@ class Stimulator:
         the stimulator would not start with a message about shutting down.
         """
         stimulator, self._stimulator = self._stimulator, None
+        # Everything derived from that stimulator goes with it. The bound Send
+        # overloads are held against this particular object, and the cached
+        # constraints came from its Properties; carrying either into a second
+        # `with` block would silently use the previous session's bindings and
+        # limits.
+        self._send_immediate = None
+        self._send_scheduled = None
+        self._constraints = None
         if stimulator is None:
             return []
         problems = []
         # XML: Stop throws when the stimulator has not started, and Close
         # throws when it is not initialized - so both are guarded by the flags
         # rather than called unconditionally.
+        # BaseException, not Exception, and deliberately: a KeyboardInterrupt
+        # arriving between Stop() and Close() would otherwise leave the
+        # stimulator open. Ctrl+C during teardown is therefore recorded as a
+        # problem rather than propagating - the same trade biocam/interop/
+        # source.py makes in its own stop path, and for the same reason.
         try:
             if self._started and not stimulator.Stop():
                 problems.append("IBioCamStim.Stop() returned false")
@@ -260,7 +297,15 @@ class Stimulator:
         against it are wrong by that ratio without anything reporting it.
         """
         if self._constraints is None:
-            self._require_running("read the stimulator's constraints")
+            # Only initialization is required, not Start(). The XML documents
+            # no precondition on IBioCamStim.Properties, and reading the
+            # limits in order to plan against them is a reasonable thing to do
+            # before anything has been sent.
+            if self._stimulator is None or not self._initialized:
+                raise StimulatorError(
+                    "cannot read the stimulator's constraints: it is not "
+                    "initialized. Use `with Stimulator(device) as stim:`."
+                )
             from biocam.stim.constraints import StimConstraints
 
             self._constraints = StimConstraints.from_stim_properties(
@@ -359,6 +404,15 @@ class Stimulator:
                 "time-stamps."
             )
 
+        if not self._device.biocam.IsStreaming:
+            raise StimulatorError(
+                "cannot send a scheduled train: the BioCAM is not streaming. "
+                "The XML says these timestamps are microseconds 'relative to "
+                "the beginning of the acquisition' - with no acquisition "
+                "running they refer to nothing. Start data streaming first, "
+                "then shift the plan by the current acquisition time."
+            )
+
         pulse, positive, negative = self._prepare(pulse_plan, pattern)
 
         import System
@@ -373,11 +427,16 @@ class Stimulator:
                 "endpoints or time-stamps, and InvalidOperationException when "
                 "the stimulator has not started."
             ) from exc
-        if not ok:
+        # `is not True`, not `not ok`. If this binding ever resolved to a
+        # by-ref overload the return would be a tuple, and any non-empty tuple
+        # is truthy - a rejected send would then report success. send_now is
+        # self-checking because it unpacks; this one has to say so.
+        if ok is not True:
             raise StimulatorError(
-                f"IBioCamStim.Send returned false for {len(timestamps)} "
-                "timestamps: the values were not accepted. The XML warns that "
-                "a buffer overflow makes the NEXT call ignore its values."
+                f"IBioCamStim.Send did not return True for {len(timestamps)} "
+                f"timestamps (returned {ok!r}): the values were not accepted. "
+                "The XML warns that a buffer overflow makes the NEXT call "
+                "ignore its values."
             )
 
     # -- internals -------------------------------------------------------

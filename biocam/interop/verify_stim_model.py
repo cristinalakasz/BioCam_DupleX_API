@@ -189,6 +189,53 @@ def _requested(spec, constraints):
     )
 
 
+def _check_send_overloads() -> list:
+    """Resolve the three `Send` overloads against the real method table.
+
+    `biocam.interop.stimulator` selects overloads explicitly rather than
+    letting pythonnet choose, because `Send(pulse, positive, negative)` and
+    `Send(pulse, positive, negative, out UInt64)` are both three-argument
+    calls from Python. That only helps if the type keys are right.
+
+    Resolution needs no instrument - it reads the type's method table - so the
+    keys can be checked here. **Calling** them still cannot be: that needs a
+    live `IBioCamStim`.
+    """
+    import clr
+    import System
+    from _3Brain.BioCamDriver import IBioCamStim, StimEndPoint
+    from _3Brain.Common import RectangularStimPulse
+
+    pulse_type = clr.GetClrType(RectangularStimPulse)
+    endpoints_type = clr.GetClrType(System.Array[StimEndPoint])
+    latency_ref = clr.GetClrType(System.UInt64).MakeByRefType()
+    timestamps_type = clr.GetClrType(System.Array[System.Double])
+
+    keys = {
+        "immediate, out UInt64 latency": (
+            pulse_type, endpoints_type, endpoints_type, latency_ref),
+        "scheduled, Double[] timestamps": (
+            pulse_type, endpoints_type, endpoints_type, timestamps_type),
+        "immediate, no latency": (pulse_type, endpoints_type, endpoints_type),
+    }
+
+    failures = []
+    print("Resolving the Send overloads against IBioCamStim's method table\n")
+    for label, key in keys.items():
+        try:
+            IBioCamStim.Send.Overloads[key]
+            print(f"  [ok] {label}")
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            failures.append(f"Send overload {label!r} did not resolve: {exc!r}")
+            print(f"  [FAILED] {label}: {type(exc).__name__}")
+    print(
+        "\n  Note: resolution is verified, invocation is not. Calling these "
+        "needs a live\n  IBioCamStim, so the two-tuple return of the "
+        "out-parameter form is still\n  untested - see issue #22.\n"
+    )
+    return failures
+
+
 def main(argv=None) -> int:
     # Obfuscated stack traces in these assemblies carry private-use codepoints
     # that a cp1252 console cannot encode; printing one would raise
@@ -202,7 +249,7 @@ def main(argv=None) -> int:
 
     load_assemblies()
 
-    failures = []
+    failures = _check_send_overloads()
     print(f"Checking {len(CASES)} cases against the real RectangularStimPulse\n")
 
     for label, spec, constraints, expect_accept in CASES:

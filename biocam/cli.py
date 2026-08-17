@@ -860,41 +860,55 @@ def stim_command(args) -> int:
         # requires the 3Brain DLLs, and `biocam convert` must keep working on
         # a machine that has none.
         from biocam.interop.device import BioCamDevice
-        from biocam.interop.stimulator import Stimulator
+        from biocam.interop.stimulator import Stimulator, StimulatorError
 
-        with BioCamDevice() as device, Stimulator(
-            device,
-            grid=args.grid,
-            enforce_column_rule=not args.no_column_rule,
-        ) as stimulator:
-            constraints = stimulator.constraints
-            print(f"stimulator constraints: {constraints}")
-            try:
-                pulse_plan, train_plan = _plan_stimulus(args, constraints)
-                validate_pattern(
-                    pattern, args.grid,
-                    enforce_column_rule=not args.no_column_rule)
-            except (
-                PulseValidationError,
-                TrainValidationError,
-                PatternValidationError,
-            ) as exc:
-                print(f"\nrefused: {exc}", file=sys.stderr)
-                return 2
+        def warn(message):
+            print(f"WARNING: {message}", file=sys.stderr)
 
-            print(f"\n{(train_plan or pulse_plan).describe()}")
-            print(f"positive: {', '.join(str(e) for e in pattern.positive)}")
-            print(f"negative: {', '.join(str(e) for e in pattern.negative)}")
+        try:
+            with BioCamDevice() as device, Stimulator(
+                device,
+                grid=args.grid,
+                enforce_column_rule=not args.no_column_rule,
+                warn=warn,
+            ) as stimulator:
+                constraints = stimulator.constraints
+                print(f"stimulator constraints: {constraints}")
+                try:
+                    pulse_plan, train_plan = _plan_stimulus(args, constraints)
+                    validate_pattern(
+                        pattern, args.grid,
+                        enforce_column_rule=not args.no_column_rule)
+                except (
+                    PulseValidationError,
+                    TrainValidationError,
+                    PatternValidationError,
+                ) as exc:
+                    print(f"\nrefused: {exc}", file=sys.stderr)
+                    return 2
 
-            if train_plan is None:
-                latency = stimulator.send_now(pulse_plan, pattern)
-                print(f"\nsent. latency {latency} clock cycles "
-                      "(relative to the beginning of the acquisition)")
-            else:
-                stimulator.send_scheduled(train_plan, pattern)
-                print(f"\nqueued {train_plan.count} pulses. Timestamps are "
-                      "relative to the beginning of the acquisition, so this "
-                      "fires only if the acquisition has not passed them.")
+                print(f"\n{(train_plan or pulse_plan).describe()}")
+                print(f"positive: {', '.join(str(e) for e in pattern.positive)}")
+                print(f"negative: {', '.join(str(e) for e in pattern.negative)}")
+
+                if train_plan is None:
+                    latency = stimulator.send_now(pulse_plan, pattern)
+                    print(f"\nsent. latency {latency} clock cycles "
+                          "(relative to the beginning of the acquisition; "
+                          "convert with IBioCam.ClockCyclesToMilliseconds "
+                          "rather than a guessed clock rate)")
+                else:
+                    stimulator.send_scheduled(train_plan, pattern)
+                    print(f"\nqueued {train_plan.count} pulses. Timestamps are "
+                          "relative to the beginning of the acquisition, so "
+                          "this fires only if the acquisition has not passed "
+                          "them.")
+        except StimulatorError as exc:
+            # Reported rather than allowed to traceback: the messages name the
+            # documented cause, and a colleague on the instrument should get
+            # those rather than a stack trace.
+            print(f"\nstimulator error: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     # --dry-run: no device, no DLLs.

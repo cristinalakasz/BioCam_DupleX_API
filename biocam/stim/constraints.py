@@ -104,12 +104,18 @@ class StimConstraints:
     def matches_numerically(self, other: "StimConstraints") -> bool:
         """Whether two constraint sets impose the same limits.
 
-        Ignores `unit` and `is_current`, which describe the numbers rather
-        than bounding them. That distinction matters in practice: the device
-        reports `UnitMeasureString` as 'µA' with a micro sign (U+00B5), while
-        a hand-built `StimConstraints` defaults to the ASCII 'uA'. Comparing
-        whole dataclasses would reject a plan that is numerically identical to
-        what the instrument would accept.
+        Ignores `unit` **only**. The device reports `UnitMeasureString` as
+        'µA' with a micro sign (U+00B5) while a hand-built `StimConstraints`
+        defaults to the ASCII 'uA', so comparing it would reject a plan that
+        is numerically identical to what the instrument would accept.
+
+        `is_current` is *not* ignored, despite also being a label rather than
+        a bound. It decides whether every amplitude is micro-amperes or
+        micro-volts (the XML for `AmplitudeResolutionUM`: "current:
+        micro-Ampere, voltage: micro-Volt"). A plan built assuming a current
+        source and sent to a voltage source is numerically legal and
+        physically wrong, which is precisely the kind of mismatch this check
+        exists to catch.
         """
         return (
             self.time_resolution_us == other.time_resolution_us
@@ -117,6 +123,7 @@ class StimConstraints:
             and self.min_amplitude == other.min_amplitude
             and self.max_amplitude == other.max_amplitude
             and self.max_total_ticks == other.max_total_ticks
+            and self.is_current == other.is_current
         )
 
     @classmethod

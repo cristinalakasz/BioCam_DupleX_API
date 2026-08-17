@@ -109,6 +109,15 @@ def test_constraints_reject_nonsense():
         StimConstraints(1, 1.0, 5.0, -5.0, 10)
 
 
+def test_matches_numerically_does_not_ignore_is_current():
+    # Unlike `unit`, this one is physical: it decides whether an amplitude is
+    # micro-amperes or micro-volts. A current plan sent to a voltage source is
+    # numerically legal and physically wrong.
+    from dataclasses import replace
+
+    assert not DUPLEX.matches_numerically(replace(DUPLEX, is_current=False))
+
+
 def test_matches_numerically_ignores_the_unit_string():
     # The device reports 'µA' (U+00B5); a hand-built StimConstraints defaults
     # to ASCII 'uA'. Comparing whole dataclasses would reject a plan that is
