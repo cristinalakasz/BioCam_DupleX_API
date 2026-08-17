@@ -92,6 +92,28 @@ def _feed_clock(clock, packet, writer):
     return clock
 
 
+def _run_monitor(monitor, packet, writer):
+    """Sample one packet for the activity display. Returns it, or None.
+
+    `LiveMonitor.observe` already refuses to raise, so this is belt and
+    braces - but the belt is the one that matters: an exception escaping the
+    packet loop sets `interrupted`, which skips the backlog drain and
+    `finalise()`, and stamps an intact raw file `failed`. Nobody should lose
+    a recording because a picture could not be drawn.
+    """
+    try:
+        monitor.observe(packet)
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the picture
+        writer.emit(StimulationSuspended(
+            reason=f"the activity display failed ({exc}) and has been "
+                   "disconnected for the rest of this recording; the "
+                   "recording itself is unaffected",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return monitor
+
+
 def _run_service(service, writer):
     """Run the between-packets hook once. Returns it, or None if it failed.
 
@@ -130,7 +152,8 @@ class SessionResult:
 
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
-                   stop_source=None, clock=None, service=None) -> SessionResult:
+                   stop_source=None, clock=None, service=None,
+                   monitor=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -285,6 +308,12 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 payload=packet.payload,
             )
             clock = _feed_clock(clock, packet, writer)
+            if monitor is not None:
+                # The activity display. Decimated internally to a few times a
+                # second and guarded the same way the clock is: a picture is
+                # never worth a recording, so a failure drops the monitor and
+                # the packets keep being written.
+                monitor = _run_monitor(monitor, packet, writer)
             if service is not None:
                 # Stimulation runs here, on the consumer thread, between
                 # packets - the arrangement 3Brain's own sample uses

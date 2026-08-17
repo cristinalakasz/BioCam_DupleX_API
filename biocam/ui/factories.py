@@ -40,6 +40,8 @@ class ReplayFactory:
     name: str = "replay (no instrument)"
     log: object = None
     pace_hz: float = None
+    n_rows: int = 64
+    n_cols: int = 64
 
     def __post_init__(self):
         from biocam.stim import StimulusLog
@@ -61,6 +63,11 @@ class ReplayFactory:
         from biocam.data.clock import AcquisitionClock
 
         return AcquisitionClock(self.params.frame_rate_hz)
+
+    def make_monitor(self):
+        from biocam.data.monitor import LiveMonitor
+
+        return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
 
     def make_writer(self, listener=None):
         from biocam.data.recording import RecordingWriter
@@ -158,6 +165,8 @@ class LiveFactory:
     log: object = None
     listener: object = None
     warn: object = None
+    n_rows: int = 64
+    n_cols: int = 64
     _params: object = field(default=None, init=False)
 
     def __post_init__(self):
@@ -210,6 +219,11 @@ class LiveFactory:
         return AcquisitionClock(
             self.params.frame_rate_hz, cycles_per_us=cycles_per_us
         )
+
+    def make_monitor(self):
+        from biocam.data.monitor import LiveMonitor
+
+        return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
 
     def make_writer(self, listener=None):
         from biocam.data.recording import RecordingWriter

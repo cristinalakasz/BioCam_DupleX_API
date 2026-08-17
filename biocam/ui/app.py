@@ -72,6 +72,15 @@ class BioCamWindow:
         # BioCamDataFormat exposes NChsPerWell and NWells but no row or
         # column count, and the geometry sits behind IMeaPlatePilot.
         self.grid = None
+        # The array's dimensions. BioCamDataFormat exposes NChsPerWell and
+        # NWells but no row or column count, and the geometry sits behind
+        # IMeaPlatePilot - so this is derived from the channel count on the
+        # assumption the array is square, which is true of the 4096-electrode
+        # DupleX. A demo file with fewer channels gets a smaller grid rather
+        # than a blank one.
+        self.n_rows, self.n_cols = self._grid_shape(params)
+        self._activity = None
+        self._syncing = False
         # Messages from other threads. The `warn` callables handed to the
         # factory and the stimulator are invoked on the recording thread
         # and on the consumer thread, and Tkinter is not thread-safe -
@@ -86,7 +95,7 @@ class BioCamWindow:
             "BioCAM DupleX — LIVE INSTRUMENT" if live
             else "BioCAM DupleX — SIMULATION (no instrument)"
         )
-        root.geometry("1080x720")
+        root.geometry("1320x860")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build()
@@ -94,6 +103,22 @@ class BioCamWindow:
         self.root.after(POLL_MS, self._poll)
 
     # -- construction ----------------------------------------------------
+
+    @staticmethod
+    def _grid_shape(params):
+        from biocam.stim import ElectrodeGrid
+
+        channels = getattr(params, "total_channels", None)
+        if not channels:
+            return 64, 64
+        try:
+            grid = ElectrodeGrid.square_from_channel_count(channels)
+        except ValueError:
+            # Not square: show one row per channel rather than guessing a
+            # shape, and let the shape be obviously odd instead of quietly
+            # wrong.
+            return 1, channels
+        return grid.n_rows, grid.n_cols
 
     def _build(self):
         tk, ttk = self.tk, self.ttk
@@ -108,15 +133,18 @@ class BioCamWindow:
         )
         banner.pack(fill="x")
 
-        body = ttk.Frame(self.root, padding=10)
+        body = ttk.Frame(self.root, padding=8)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1, minsize=320)
-        body.columnconfigure(1, weight=1, minsize=320)
+        body.columnconfigure(0, minsize=270)
+        body.columnconfigure(1, weight=1)
+        body.columnconfigure(2, minsize=250)
         body.rowconfigure(1, weight=1)
 
-        self._build_recording(ttk.LabelFrame(body, text="Recording", padding=10))
+        self._build_recording(ttk.LabelFrame(body, text="Recording", padding=8))
+        self._build_array(
+            ttk.LabelFrame(body, text="Electrode array", padding=6))
         self._build_stimulation(
-            ttk.LabelFrame(body, text="Stimulation", padding=10))
+            ttk.LabelFrame(body, text="Stimulus", padding=8))
         self._build_log(ttk.LabelFrame(body, text="Session log", padding=6))
 
     def _build_recording(self, frame):
@@ -180,9 +208,85 @@ class BioCamWindow:
         self.lbl_health.grid(row=row, column=0, columnspan=2, sticky="w",
                              pady=(8, 0))
 
+    def _build_array(self, frame):
+        """The array: what it is picking up, and which electrodes are chosen.
+
+        Both at once, deliberately. Choosing an electrode without seeing what
+        it reads is how a dead one gets stimulated all afternoon, and watching
+        activity without being able to act on it is a screensaver.
+        """
+        tk, ttk = self.tk, self.ttk
+        from biocam.ui.arrayview import (
+            NEGATIVE_COLOUR, POSITIVE_COLOUR, ElectrodeArrayView,
+        )
+
+        frame.grid(row=0, column=1, sticky="nsew", padx=6)
+
+        self.array = ElectrodeArrayView(
+            frame, n_rows=self.n_rows, n_cols=self.n_cols, cell=9,
+            on_change=self._on_array_selection, on_hover=self._on_array_hover,
+        )
+        self.array.canvas.grid(row=0, column=0, columnspan=3)
+
+        legend = ttk.Frame(frame)
+        legend.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        tk.Label(legend, text="  ", bg=POSITIVE_COLOUR,
+                 relief="solid", borderwidth=1).pack(side="left")
+        ttk.Label(legend, text=" left-click: positive   ").pack(side="left")
+        tk.Label(legend, text="  ", bg=NEGATIVE_COLOUR,
+                 relief="solid", borderwidth=1).pack(side="left")
+        ttk.Label(legend, text=" right-click: negative  ").pack(side="left")
+        ttk.Button(legend, text="Clear", width=7,
+                   command=self.array.clear).pack(side="left", padx=6)
+
+        self.lbl_hover = tk.Label(
+            frame, text="Hover an electrode to read it.", anchor="w",
+            font=("Consolas", 9), fg="#333333")
+        self.lbl_hover.grid(row=2, column=0, columnspan=3, sticky="ew",
+                            pady=(4, 0))
+        self.lbl_scale = tk.Label(
+            frame, text="No signal yet - start a recording.", anchor="w",
+            font=("Segoe UI", 9), fg=COLOURS["idle"])
+        self.lbl_scale.grid(row=3, column=0, columnspan=3, sticky="ew")
+
+    def _on_array_selection(self):
+        """The picture is the source of truth; the text fields follow it."""
+        self._syncing = True
+        try:
+            self.var_positive.set(self.array.as_text("positive"))
+            self.var_negative.set(self.array.as_text("negative"))
+        finally:
+            self._syncing = False
+        self._refresh_stim_validity()
+
+    def _on_array_hover(self, found):
+        if found is None:
+            self.lbl_hover.configure(text="Hover an electrode to read it.")
+            return
+        row, col = found
+        reading = self.array.activity_at(row, col, self._activity)
+        text = f"electrode ({row},{col})"
+        if reading is not None:
+            text += f"   {reading:7.0f} uV peak-to-peak"
+        self.lbl_hover.configure(text=text)
+
+    def _sync_array_from_text(self):
+        """Follow the text fields when they are edited directly."""
+        if getattr(self, "_syncing", False):
+            return
+        try:
+            positive = self._electrodes(self.var_positive.get())
+            negative = self._electrodes(self.var_negative.get())
+        except Exception:  # noqa: BLE001 - a half-typed field is not an error
+            return
+        self.array.set_selection(
+            [(e.row, e.col) for e in positive],
+            [(e.row, e.col) for e in negative],
+        )
+
     def _build_stimulation(self, frame):
         tk, ttk = self.tk, self.ttk
-        frame.grid(row=0, column=1, sticky="nsew")
+        frame.grid(row=0, column=2, sticky="nsew")
 
         self.var_amplitude = tk.StringVar(value="100")
         self.var_phase = tk.StringVar(value="200")
@@ -203,7 +307,7 @@ class BioCamWindow:
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
             entry = ttk.Entry(frame, textvariable=var, width=18)
             entry.grid(row=row, column=1, sticky="w", pady=2)
-            var.trace_add("write", lambda *_: self._refresh_stim_validity())
+            var.trace_add("write", lambda *_: self._on_field_edited())
             row += 1
 
         if not self.live:
@@ -233,7 +337,7 @@ class BioCamWindow:
 
     def _build_log(self, frame):
         tk = self.tk
-        frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -325,6 +429,11 @@ class BioCamWindow:
             min_amplitude=-1000.0, max_amplitude=1000.0,
             max_total_ticks=1000,
         )
+
+    def _on_field_edited(self, *_):
+        """A text field changed: mirror it into the picture, then validate."""
+        self._sync_array_from_text()
+        self._refresh_stim_validity()
 
     def _refresh_stim_validity(self, *_):
         """Validate continuously, and say why the button is unavailable.
@@ -578,6 +687,7 @@ class BioCamWindow:
             for event in self.controller.drain_events():
                 self._log(describe(event), self._severity(event))
             self._render(self.controller.snapshot())
+            self._render_activity()
         finally:
             # Rescheduled in a finally so one bad render cannot stop the UI
             # updating forever - a frozen window during a recording is the
@@ -644,6 +754,20 @@ class BioCamWindow:
                       f"verdict {state.verdict}",
                       "ok" if state.verdict == "clean" else "warn")
             self._refresh_stim_validity()
+
+    def _render_activity(self):
+        """Repaint the array. UI thread only, from a copied snapshot."""
+        activity = self.controller.activity()
+        if activity is None or not activity.has_data:
+            return
+        self._activity = activity
+        self.array.set_activity(activity)
+        low, high = activity.range()
+        self.lbl_scale.configure(
+            text=(f"peak-to-peak {low:.0f} - {high:.0f} uV   "
+                  f"({activity.samples} samples, "
+                  f"{activity.max_observe_us:.0f} us slowest)"),
+            fg=COLOURS["ok"])
 
     def _log(self, message, tag=None):
         stamp = time.strftime("%H:%M:%S")
