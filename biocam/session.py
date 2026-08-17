@@ -10,7 +10,6 @@ must never import biocam.interop.
 """
 
 import time
-import warnings
 from dataclasses import dataclass
 from typing import Optional
 
