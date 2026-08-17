@@ -394,6 +394,11 @@ class Stimulator:
         return probe / (milliseconds * 1000.0)
 
     @property
+    def log(self):
+        """The StimulusLog this stimulator records into, if any."""
+        return self._log
+
+    @property
     def is_stimulating(self) -> bool:
         if self._stimulator is None:
             return False
