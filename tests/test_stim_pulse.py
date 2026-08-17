@@ -366,3 +366,47 @@ def test_verify_reports_every_field_that_differs():
         verify_built_pulse(p, FakePulse(50.0, 1, 2, -50.0, 3))
     # five fields wrong, plus the planned-pulse description
     assert len(exc.value.problems) == 6
+
+
+# --------------------------------------------------------------------------
+# the stimulator lifecycle, in two brackets
+# --------------------------------------------------------------------------
+
+def test_the_stimulator_lifecycle_is_split_into_two_brackets():
+    """Initialize/Close bracket the device; Start/Stop bracket the streaming.
+
+    3Brain's sample is explicit: Initialize sits inside TakeBioCamControl
+    (MainForm.cs:111) and Close inside ReleaseBioCamControl (:122), while
+    Start comes after StartDataStreaming (:186 then :192) and Stop before
+    StopDataStreaming (:210 then :213).
+
+    Fusing all four into one context manager - which this did - made that
+    ordering impossible to express: the stimulator was necessarily started
+    before any acquisition existed. This checks the shape of the API rather
+    than its behaviour, which needs the instrument.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    source = pathlib.Path("biocam/interop/stimulator.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(source)
+    stimulator = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Stimulator"
+    )
+    methods = {n.name for n in stimulator.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert {"__enter__", "__exit__", "start", "stop", "stimulating"} <= methods
+
+    def body_of(name):
+        node = next(n for n in stimulator.body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+        return ast.dump(node)
+
+    # __enter__ initializes and must NOT start.
+    assert "Initialize" in body_of("__enter__")
+    assert "'Start'" not in body_of("__enter__")
+    # start() is where Start lives.
+    assert "Start" in body_of("start")

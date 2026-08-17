@@ -9,10 +9,11 @@ on the instrument, not for the person who wrote the code. The author is
 it was wrong on the page, not caught by hand. Report discrepancies rather than
 working around them.
 
-**What is built:** the rebuilt acquisition path (`python -m biocam.cli record`)
-and the stimulation engine (`python -m biocam.cli stim`, §15). **What does not
-exist yet:** combined recording-and-stimulation sessions, a UI, online spike
-detection, spike sorting, and closed-loop stimulation.
+**What is built:** the acquisition path, the stimulation engine, and an
+operator window that records and stimulates together — `python -m biocam.ui`
+(§17). It runs with or without the instrument, so you can learn it before you
+need it. **What does not exist yet:** online spike detection, spike sorting,
+and closed-loop stimulation.
 
 **Built is not the same as proven.** None of this software has ever run on the
 instrument — not one recording, not one stimulus. It was written against the
@@ -41,6 +42,7 @@ each one; #16 is the ten-minute first session, #21 the first stimulation step.
 14. [Roadmap and status](#14-roadmap-and-status)
 15. [Stimulation](#15-stimulation)
 16. [Recording and stimulating together](#16-recording-and-stimulating-together)
+17. [The operator window](#17-the-operator-window)
 
 ---
 
@@ -537,6 +539,8 @@ One line per top-level path:
   - `biocam/data/` — **Layer 2**: pure byte/number logic (payload decoding, frame reassembly, unit conversion, integrity). Fully testable with synthetic buffers.
   - `biocam/stim/` — **Layer 2**: stimulation modelling — pulses, electrode patterns, trains, arbitrary sequences, and the validation that keeps the driver from silently altering any of them (§15). Pure arithmetic; no `clr`, no device.
   - `biocam/analysis/` — **Layer 3**: signal processing (spike detection, sorting). Fully testable against fixtures. Populated starting Phase 5.
+  - `biocam/ui/` — **Layer 2**: the operator window (§17), Tkinter. Runs against the instrument or against a recorded file; the difference is confined to `biocam/ui/factories.py`.
+  - `biocam/control.py` — **Layer 2**: the bounded hand-off that lets a UI request a stimulus without touching the acquisition thread (§16.2)
   - `biocam/cli.py` — the `record`, `convert` and `stim` subcommands
   - `biocam/session.py` — the recording loop that joins a packet source to a writer
   - `biocam/preflight.py` — the environment check run by `python -m biocam.preflight` (§6)
@@ -670,8 +674,8 @@ only:
 | 0 | Setup: `CLAUDE.md`, verifier agents, test scaffolding, this README | **Done** |
 | 1 | Acquisition: recording, saving, data integrity, on the three-layer split | **Done and merged.** Gate 1 clean. Never run on the instrument — issues #11–#18 |
 | 2 | Stimulation engine + manual and scheduled triggering | **Merged** (PR #25), Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
-| 3 | Session control: recording and stimulation together, changing live | **In progress.** The acquisition clock, the stimulus log and the control queue are built (§16). No combined command yet — issues #26, #27 |
-| 4 | UI | Not started |
+| 3 | Session control: recording and stimulation together, changing live | **Merged** (PR #28). Clock, stimulus log and control queue (§16). Driven by the window in §17 — issues #26, #27 |
+| 4 | UI | **In progress.** `python -m biocam.ui` — runs with or without the instrument (§17). Live path untested |
 | 5 | Spike detection | Not started |
 | 6 | Closed-loop stimulation (depends on Phase 5) | Not started |
 
@@ -903,3 +907,68 @@ mechanism is built and tested; driving it — a window with a "stimulate now"
 button, a protocol timeline — is Phase 4. Until then `biocam record` and
 `biocam stim` are separate, and scheduled trains are not usable from the CLI
 at all (§15.5).
+
+---
+
+## 17. The operator window
+
+```
+python -m biocam.ui --live                      # on the lab machine
+```
+
+**Try it first without the instrument.** The same window, the same recorder,
+the same clock and the same stimulation path run against a recorded file:
+
+```
+python tools/make_demo_recording.py demo
+python -m biocam.ui --replay demo.raw --meta demo_meta.json
+```
+
+That is not a toy mode. Only the packets and the stimulator are stand-ins;
+everything else is the code that will run on the instrument. Learn the
+controls this way before spending bench time on them — and if something about
+the window confuses you, say so from here rather than at the BioCAM.
+
+### 17.1 It always tells you which one it is
+
+A red banner and `LIVE INSTRUMENT` in the title bar mean stimuli reach the
+preparation. A blue banner and `SIMULATION` mean nothing leaves the machine.
+If you are ever unsure which you are looking at, look at the banner — a
+simulated run mistaken for a real one is worse than no run at all.
+
+### 17.2 What it will not let you do
+
+| It refuses | Because |
+|---|---|
+| Stimulate with nothing recording | A stimulus with no recording leaves no evidence of what it did |
+| A charge-unbalanced pulse | The second phase is built as the mirror of the first, so this is not expressible |
+| An amplitude or duration outside the stimulator's limits | The driver would silently clamp it (§15.1) |
+| An electrode outside the array, or `0,0` | Coordinates are 1-based and `ChCoord` does not bounds-check |
+| Positive and negative on the same column | The API PDF forbids it |
+
+**Every refusal is written next to the button**, live, as you type. If
+`Stimulate now` is greyed out, the reason is directly beneath it.
+
+### 17.3 Reading the status panel
+
+- **Acquisition time** is what a scheduled stimulus would be timed against,
+  and it names where it came from. `device` means the instrument's own clock
+  with a factor read from the device — the only case where the clock is
+  cross-checked. `device-calibrated` means the factor was derived from the
+  packets, so the cross-check cannot detect anything. `frames` means the
+  device reported no usable timestamp at all.
+- **Frames missing** is data the instrument acquired that never reached the
+  disk. Non-zero means the sidecar's `gaps` list is worth reading.
+- The **coloured line at the bottom of the panel** is the one to watch. Amber
+  is a warning the run survived; red is an error. Both are also in the
+  session log with a timestamp.
+
+### 17.4 What it does not do yet
+
+- **No scheduled trains.** Single pulses only. Trains need a confirmed time
+  origin — issue #24.
+- **No live signal display.** It reports counts and health, not traces.
+  Rendering 4096 channels is a different problem and is not required to run
+  an experiment safely.
+- **Nothing here has run on the instrument.** The whole live path is
+  untested; the simulation path is what the tests cover.

@@ -45,6 +45,29 @@ def load_assemblies(dll_dir=None) -> None:
         clr.AddReference(str(path))
 
 
+def cycles_per_us_of(device):
+    """The instrument's clock cycles per microsecond, or None.
+
+    Derived from `IBioCam.ClockCyclesToMilliseconds(UInt64)` (XML:4667),
+    which the sample uses for exactly this (MainForm.cs:272). This lives on
+    the device rather than the stimulator because that is where the member
+    is: a recording-only session still needs the factor, and without it the
+    acquisition clock has to calibrate its own - which makes its cross-check
+    incapable of failing.
+
+    Returns None rather than raising. A factor that cannot be read is a
+    reason to say the times are unresolved, not to abandon a session.
+    """
+    try:
+        probe = 1_000_000
+        milliseconds = float(device.biocam.ClockCyclesToMilliseconds(probe))
+    except BaseException:  # noqa: BLE001 - an unreadable factor is not fatal
+        return None
+    if milliseconds <= 0:
+        return None
+    return probe / (milliseconds * 1000.0)
+
+
 class BioCamDevice:
     """Claims a BioCAM for the duration of a with-block."""
 

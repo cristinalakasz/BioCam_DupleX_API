@@ -1,0 +1,754 @@
+"""Layer 2 - the window.
+
+Tkinter, because it ships with Python. The lab machine already depends on a
+pythonnet/.NET/DLL arrangement that is delicate enough; adding a GUI toolkit
+that needs its own wheel would be one more thing to go wrong at the worst
+moment, on a machine 600 km away, for no benefit an operator would notice.
+
+Three rules govern everything here, and they come from who uses it: the
+on-site colleague first, the author remotely later. The stricter case governs.
+
+**Nothing off the UI thread touches a widget.** Tkinter is not thread-safe.
+The recording runs on a worker thread and communicates only through
+`SessionController`'s queues, which this polls with `after()`.
+
+**Simulation is never mistakable for the instrument.** The mode is stated in
+the title bar and in a coloured banner, and a simulated stimulus log says so
+in every record. A run that looks real and was not is worse than no run.
+
+**Every refusal explains itself.** A greyed-out button with no reason is the
+thing an operator cannot debug alone mid-experiment, so the reason a control
+is unavailable is always on screen next to it.
+"""
+
+import queue
+import sys
+import time
+from contextlib import ExitStack
+from pathlib import Path
+
+from biocam.data.events import describe
+from biocam.ui.controller import SessionController
+
+POLL_MS = 150
+MAX_LOG_LINES = 400
+
+COLOURS = {
+    "live": "#8b1a1a",
+    "simulation": "#1a4d8b",
+    "ok": "#1a6b2a",
+    "warn": "#8a5a00",
+    "bad": "#8b1a1a",
+    "idle": "#555555",
+}
+
+
+class BioCamWindow:
+    """The operator's window. Build it, then call `run()`."""
+
+    def __init__(self, root, *, live: bool = False, output_dir: str = "recordings",
+                 replay_source: str = None, params=None):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk = tk
+        self.ttk = ttk
+        self.root = root
+        self.live = live
+        self.output_dir = Path(output_dir)
+        self.replay_source = replay_source
+        self.replay_params = params
+        self.controller = SessionController()
+        self._factory = None
+        self._log_lines = 0
+        # Holds the device and the stimulator for a live session. They are
+        # context managers, and nothing else in this window would ever exit
+        # them - a leaked BioCamDevice stays claimed until the process dies,
+        # so the next person to try the instrument finds it held by nothing.
+        self._live_stack = None
+        self._device = None
+        self._stimulator = None
+        # Bounds-checks electrodes. Stated rather than read from the device:
+        # BioCamDataFormat exposes NChsPerWell and NWells but no row or
+        # column count, and the geometry sits behind IMeaPlatePilot.
+        self.grid = None
+        # Messages from other threads. The `warn` callables handed to the
+        # factory and the stimulator are invoked on the recording thread
+        # and on the consumer thread, and Tkinter is not thread-safe -
+        # calling _log() from either would breach this module's own first
+        # rule. SimpleQueue.put is thread-safe and never blocks, which
+        # also matters because one of those callers is the drain.
+        # Bounded, like every other buffer here. Unbounded, a _poll that
+        # stopped draining would let it grow without limit.
+        self._messages = queue.Queue(maxsize=256)
+
+        root.title(
+            "BioCAM DupleX — LIVE INSTRUMENT" if live
+            else "BioCAM DupleX — SIMULATION (no instrument)"
+        )
+        root.geometry("1080x720")
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build()
+        self._refresh_stim_validity()
+        self.root.after(POLL_MS, self._poll)
+
+    # -- construction ----------------------------------------------------
+
+    def _build(self):
+        tk, ttk = self.tk, self.ttk
+
+        banner = tk.Label(
+            self.root,
+            text=("LIVE — stimuli will be delivered to the preparation"
+                  if self.live else
+                  "SIMULATION — no instrument, no stimulus leaves this machine"),
+            bg=COLOURS["live"] if self.live else COLOURS["simulation"],
+            fg="white", font=("Segoe UI", 11, "bold"), pady=6,
+        )
+        banner.pack(fill="x")
+
+        body = ttk.Frame(self.root, padding=10)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1, minsize=320)
+        body.columnconfigure(1, weight=1, minsize=320)
+        body.rowconfigure(1, weight=1)
+
+        self._build_recording(ttk.LabelFrame(body, text="Recording", padding=10))
+        self._build_stimulation(
+            ttk.LabelFrame(body, text="Stimulation", padding=10))
+        self._build_log(ttk.LabelFrame(body, text="Session log", padding=6))
+
+    def _build_recording(self, frame):
+        tk, ttk = self.tk, self.ttk
+        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        self.var_duration = tk.StringVar(value="10")
+        self.var_until_stopped = tk.BooleanVar(value=False)
+        self.var_name = tk.StringVar(value="")
+
+        row = 0
+        ttk.Label(frame, text="Output folder").grid(row=row, column=0, sticky="w")
+        ttk.Label(frame, text=str(self.output_dir), foreground="#333").grid(
+            row=row, column=1, sticky="w")
+        row += 1
+        ttk.Label(frame, text="Name (optional)").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_name, width=22).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+        ttk.Label(frame, text="Duration (s)").grid(row=row, column=0, sticky="w")
+        self.entry_duration = ttk.Entry(
+            frame, textvariable=self.var_duration, width=10)
+        self.entry_duration.grid(row=row, column=1, sticky="w", pady=2)
+        row += 1
+        ttk.Checkbutton(
+            frame, text="Run until I press Stop",
+            variable=self.var_until_stopped, command=self._on_duration_mode,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        row += 1
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+        self.btn_start = ttk.Button(buttons, text="Start recording",
+                                    command=self._on_start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(buttons, text="Stop", command=self._on_stop,
+                                   state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        if self.live:
+            # The instrument is claimed on the first Start and held for the
+            # window's lifetime, so there has to be a way to give it back
+            # without closing - BrainWave cannot open the device while this
+            # holds it.
+            ttk.Button(buttons, text="Release instrument",
+                       command=self._release_live).pack(side="left", padx=6)
+        row += 1
+
+        self.status_vars = {}
+        for label in ("Status", "Elapsed", "Acquisition time", "Frames",
+                      "Frames missing", "Verdict", "Stimuli delivered"):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            var = tk.StringVar(value="—")
+            self.status_vars[label] = var
+            ttk.Label(frame, textvariable=var, font=("Consolas", 10)).grid(
+                row=row, column=1, sticky="w")
+            row += 1
+
+        self.lbl_health = tk.Label(frame, text="Idle", fg=COLOURS["idle"],
+                                   font=("Segoe UI", 10, "bold"),
+                                   wraplength=300, justify="left")
+        self.lbl_health.grid(row=row, column=0, columnspan=2, sticky="w",
+                             pady=(8, 0))
+
+    def _build_stimulation(self, frame):
+        tk, ttk = self.tk, self.ttk
+        frame.grid(row=0, column=1, sticky="nsew")
+
+        self.var_amplitude = tk.StringVar(value="100")
+        self.var_phase = tk.StringVar(value="200")
+        self.var_gap = tk.StringVar(value="100")
+        self.var_positive = tk.StringVar(value="10,10")
+        self.var_negative = tk.StringVar(value="20,30")
+        self.var_resolution = tk.StringVar(value="10")
+
+        fields = [
+            ("Amplitude (µA)", self.var_amplitude),
+            ("Phase duration (µs)", self.var_phase),
+            ("Inter-phase gap (µs)", self.var_gap),
+            ("Positive electrode(s)", self.var_positive),
+            ("Negative electrode(s)", self.var_negative),
+        ]
+        row = 0
+        for label, var in fields:
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(frame, textvariable=var, width=18)
+            entry.grid(row=row, column=1, sticky="w", pady=2)
+            var.trace_add("write", lambda *_: self._refresh_stim_validity())
+            row += 1
+
+        if not self.live:
+            ttk.Label(frame, text="Clock resolution (µs)").grid(
+                row=row, column=0, sticky="w")
+            ttk.Entry(frame, textvariable=self.var_resolution, width=18).grid(
+                row=row, column=1, sticky="w", pady=2)
+            self.var_resolution.trace_add(
+                "write", lambda *_: self._refresh_stim_validity())
+            row += 1
+            ttk.Label(
+                frame, foreground="#8a5a00", wraplength=300, justify="left",
+                text=("Simulation only. On the instrument this is read from "
+                      "the device — guessing it rescales every duration."),
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+            row += 1
+
+        self.btn_stim = ttk.Button(frame, text="Stimulate now",
+                                   command=self._on_stimulate, state="disabled")
+        self.btn_stim.grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
+        row += 1
+
+        self.lbl_stim = tk.Label(frame, text="", fg=COLOURS["idle"],
+                                 wraplength=320, justify="left",
+                                 font=("Segoe UI", 9))
+        self.lbl_stim.grid(row=row, column=0, columnspan=2, sticky="w")
+
+    def _build_log(self, frame):
+        tk = self.tk
+        frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.text = tk.Text(frame, height=12, wrap="word",
+                            font=("Consolas", 9), state="disabled")
+        self.text.grid(row=0, column=0, sticky="nsew")
+        scroll = self.ttk.Scrollbar(frame, command=self.text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=scroll.set)
+        for tag, colour in (("warn", COLOURS["warn"]), ("bad", COLOURS["bad"]),
+                            ("ok", COLOURS["ok"])):
+            self.text.tag_configure(tag, foreground=colour)
+
+    # -- building a stimulus from the fields ------------------------------
+
+    def _electrodes(self, text):
+        from biocam.stim import Electrode
+
+        out = []
+        for chunk in text.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts = chunk.split(",")
+            if len(parts) != 2:
+                raise ValueError(f"{chunk!r} is not a row,col pair")
+            out.append(Electrode(int(parts[0]), int(parts[1])))
+        if not out:
+            raise ValueError("no electrodes given")
+        return tuple(out)
+
+    def _build_stimulus(self):
+        """Return (plan, pattern), or raise with a message fit for a label."""
+        from biocam.stim import (
+            PulseSpec, StimPattern, plan as plan_pulse, validate_pattern,
+        )
+
+        amplitude = float(self.var_amplitude.get())
+        phase_us = float(self.var_phase.get())
+        gap_us = float(self.var_gap.get())
+        pattern = StimPattern(
+            positive=self._electrodes(self.var_positive.get()),
+            negative=self._electrodes(self.var_negative.get()),
+        )
+        # The same grid the stimulator will use, so the window and the
+        # instrument cannot disagree about what is inside the array.
+        validate_pattern(pattern, self.grid)
+
+        constraints = self._constraints()
+        spec = PulseSpec(
+            amplitude1=amplitude, phase1_us=phase_us, inter_us=gap_us,
+            amplitude2=-amplitude, phase2_us=phase_us, name="ui-pulse",
+        )
+        return plan_pulse(spec, constraints), pattern
+
+    def _constraints(self):
+        """The stimulator's limits: the device's in live mode, always.
+
+        This used to fall through to the simulation defaults whenever the
+        instrument was not yet claimed, so before Start was pressed a LIVE
+        window would display "Valid: ..." for a pulse validated against
+        invented limits - durations the operator would read and write down,
+        and not the ones that would fire.
+        """
+        from biocam.stim import StimConstraints
+
+        if self.live:
+            if self._stimulator is None:
+                if self._live_stack is not None:
+                    # Claimed, but the stimulator would not initialize. Start
+                    # will never change that, so saying "press Start" would
+                    # send the operator round a loop.
+                    raise RuntimeError(
+                        "this session is recording only: the stimulator did "
+                        "not initialize when the instrument was claimed. "
+                        "Stimulation is unavailable until the instrument is "
+                        "released and re-claimed - the session log has the "
+                        "reason it gave."
+                    )
+                raise RuntimeError(
+                    "the stimulator's limits are unknown until the instrument "
+                    "is claimed. Press Start; the pulse is validated against "
+                    "the device's own limits before anything is delivered."
+                )
+            return self._stimulator.constraints
+        return StimConstraints(
+            time_resolution_us=int(self.var_resolution.get()),
+            amplitude_resolution=1.0,
+            min_amplitude=-1000.0, max_amplitude=1000.0,
+            max_total_ticks=1000,
+        )
+
+    def _refresh_stim_validity(self, *_):
+        """Validate continuously, and say why the button is unavailable.
+
+        A greyed-out control with no explanation is the thing an operator
+        cannot debug alone in the middle of an experiment.
+        """
+        try:
+            plan, pattern = self._build_stimulus()
+        except Exception as exc:  # noqa: BLE001 - every failure is a message
+            self.btn_stim.configure(state="disabled")
+            self.lbl_stim.configure(
+                text=str(exc).replace("\n", " ")[:400], fg=COLOURS["bad"])
+            return
+
+        if not self.controller.running:
+            self.btn_stim.configure(state="disabled")
+            self.lbl_stim.configure(
+                text=("Valid: " + plan.describe()
+                      + "\n\nStart a recording to enable stimulation — "
+                        "a stimulus with nothing recording it leaves no "
+                        "evidence of what it did."),
+                fg=COLOURS["idle"])
+            return
+
+        self.btn_stim.configure(state="normal")
+        self.lbl_stim.configure(text=plan.describe(), fg=COLOURS["ok"])
+
+    # -- actions ----------------------------------------------------------
+
+    def _on_duration_mode(self):
+        self.entry_duration.configure(
+            state="disabled" if self.var_until_stopped.get() else "normal")
+
+    def _on_start(self):
+        if self.controller.running:
+            return
+        try:
+            self._factory = self._make_factory()
+        except Exception as exc:  # noqa: BLE001 - shown, never swallowed
+            # Deliberately NOT releasing the instrument here. It is held for
+            # the window's lifetime, and a typo in the Duration field should
+            # not force the next Start to re-Activate a deactivated pool.
+            # _ensure_live_instrument cleans up after itself if the claim is
+            # what failed.
+            self._log(f"Cannot start: {exc}", "bad")
+            return
+        try:
+            self.controller.start(self._factory)
+        except Exception as exc:  # noqa: BLE001 - the instrument is already held
+            self._log(f"Could not start the recording: {exc}", "bad")
+            return
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        # No "recording to ..." line here: RecordingStarted arrives through
+        # the event stream a moment later and says the same thing with the
+        # channel count and rate attached.
+        self._refresh_stim_validity()
+
+    def _on_stop(self):
+        self.controller.stop()
+        self.btn_stop.configure(state="disabled")
+        self._log("Stopping — draining whatever is still buffered…")
+
+    def _on_stimulate(self):
+        try:
+            plan, pattern = self._build_stimulus()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Stimulus refused: {exc}", "bad")
+            return
+        if self.controller.request_stimulus(plan, pattern, label="manual"):
+            self._log(f"Requested: {plan.describe()}")
+        else:
+            self._log(
+                "Stimulus NOT queued: the stimulation queue is full. It was "
+                "not delivered.", "bad")
+
+    def _make_factory(self):
+        from biocam.ui.factories import ReplayFactory
+
+        name = self.var_name.get().strip() or time.strftime("%Y%m%d_%H%M%S")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        output = self.output_dir / f"{name}.raw"
+        duration = (None if self.var_until_stopped.get()
+                    else float(self.var_duration.get()))
+
+        if self.live:
+            return self._make_live_factory(output, duration)
+
+        if not self.replay_source:
+            raise RuntimeError(
+                "simulation needs a source recording: pass --replay <file.raw>"
+            )
+        return ReplayFactory(
+            raw_path=self.replay_source, params=self.replay_params,
+            output_path=output, duration_sec=duration,
+            frames_per_packet=200, pace_hz=50.0,
+        )
+
+    def _ensure_live_instrument(self):
+        """Claim the instrument once and keep it until the window closes.
+
+        `BioCamDevice.__enter__` calls `BioCamPool.Activate()` and `__exit__`
+        calls `Deactivate()`, so one device per recording would do
+        Activate -> Deactivate -> Activate across two runs. Nothing in this
+        repository documents whether the pool survives that, and 3Brain's
+        sample never tries: it activates once at form load and deactivates
+        once at form close (MainForm.cs:72, :85), taking and releasing BioCAM
+        control repeatedly in between. The first thing that would have
+        exercised re-activation is the second recording of a lab day.
+        """
+        from biocam.interop.device import BioCamDevice
+        from biocam.interop.stimulator import Stimulator
+        from biocam.stim import StimulusLog
+
+        if self._live_stack is not None:
+            return
+
+        # The same floor record_command enforces. source.POLL_INTERVAL_SEC's
+        # 1 ms only resolves from 3.11 on Windows; below that time.sleep()
+        # rounds up to the ~15.6 ms system timer, silently restoring the
+        # latency that constant exists to remove. The CLI refuses outright,
+        # and there is no reason this window should be more permissive about
+        # the same driver.
+        from biocam.cli import MIN_PYTHON_FOR_POLL_PRECISION
+
+        if sys.version_info < MIN_PYTHON_FOR_POLL_PRECISION:
+            need = ".".join(str(n) for n in MIN_PYTHON_FOR_POLL_PRECISION)
+            raise RuntimeError(
+                f"Python {need}+ is required to drive the instrument; this is "
+                f"{sys.version_info.major}.{sys.version_info.minor}. Below "
+                f"{need}, time.sleep() on Windows rounds up to ~15.6 ms and "
+                "the consumer would poll 15x slower than intended."
+            )
+
+        stack = ExitStack()
+        try:
+            self._device = stack.enter_context(BioCamDevice())
+            try:
+                # Initialize/Close only. Start/Stop bracket the streaming and
+                # happen in LiveFactory.start_source / stop_source_safely.
+                self._stimulator = stack.enter_context(
+                    Stimulator(self._device, log=StimulusLog(),
+                               grid=self.grid,
+                               warn=self._warn_from_any_thread))
+            except Exception as exc:  # noqa: BLE001 - see below
+                # A stimulator that will not initialize must not block
+                # recording. It is a separate module that may not be
+                # installed, or connector.py may already hold it; refusing
+                # the whole session would make a recording-only run
+                # impossible on this window.
+                self._stimulator = None
+                self._log(f"Stimulation unavailable: {exc}", "warn")
+                self._log("Recording will still work.", "warn")
+        except BaseException:
+            stack.close()
+            self._device = self._stimulator = None
+            raise
+        self._live_stack = stack
+
+    def _make_live_factory(self, output, duration):
+        # Imported here, never at module scope: this module must stay
+        # importable on a machine with no 3Brain DLLs.
+        from biocam.ui.factories import LiveFactory
+
+        self._ensure_live_instrument()
+        return LiveFactory(
+            output_path=output, duration_sec=duration,
+            device=self._device, stimulator=self._stimulator,
+            log=self._stimulator.log if self._stimulator else None,
+            listener=self.controller.listener,
+            warn=self._warn_from_any_thread,
+        )
+
+    def _warn_from_any_thread(self, message):
+        """A `warn` callable safe to hand to code running on another thread.
+
+        Never blocks: two of its callers are the recording thread and the
+        consumer thread, and the consumer thread is the drain. A full queue
+        drops rather than waiting.
+        """
+        try:
+            self._messages.put_nowait(message)
+        except queue.Full:
+            pass
+
+    def _release_live(self):
+        """Release the instrument. Safe to call when nothing is held.
+
+        The stack reference is cleared only once the close succeeds. Dropping
+        it first left a failed release unretryable, with the device still
+        claimed and nothing able to try again.
+        """
+        stack = self._live_stack
+        if stack is None:
+            return
+        if self.controller.running:
+            # Releasing now would run ReleaseBioCamControl and Deactivate
+            # while the worker is still streaming, setting device.biocam to
+            # None underneath it - after which source.stop() takes its
+            # "nothing to stop" branch and never calls StopDataStreaming nor
+            # unsubscribes. The slot would go back to the pool still
+            # streaming, with handlers attached.
+            self._log("Not releasing the instrument: a recording is still "
+                      "running. Stop it first.", "bad")
+            return
+        try:
+            stack.close()
+        except Exception as exc:  # noqa: BLE001 - reported, never raised at a UI
+            self._log(f"Releasing the instrument failed: {exc}. It may still "
+                      "be claimed; try again, or restart.", "bad")
+            return
+        self._live_stack = None
+        self._device = None
+        self._stimulator = None
+        self._log("Instrument released.", "ok")
+
+    def _write_stimulus_log(self):
+        """Persist what was stimulated, beside the recording it belongs to.
+
+        Without this the latencies, refusals and rejections die with the
+        process - the one correspondence a later analysis cannot
+        reconstruct. Written at the end of a session rather than during it,
+        because this must not do disk work while the drain is running.
+        """
+        log = getattr(self._factory, "log", None)
+        if log is None or not len(log):
+            return
+        output = Path(self._factory.output_path)
+        path = output.with_name(output.stem + "_stimuli.json")
+        cycles_per_us = None
+        if self._stimulator is not None:
+            cycles_per_us = self._stimulator.cycles_per_us
+        try:
+            log.write(path, cycles_per_us=cycles_per_us)
+        except Exception as exc:  # noqa: BLE001 - never at the cost of the UI
+            self._log(f"Could not write the stimulus log to {path}: {exc}. "
+                      "The recording itself is unaffected.", "bad")
+            return
+        self._log(f"Stimulus log: {path} ({log.describe()})", "ok")
+
+    # -- polling ----------------------------------------------------------
+
+    def _poll(self):
+        try:
+            while True:
+                try:
+                    self._log(self._messages.get_nowait(), "warn")
+                except queue.Empty:
+                    break
+            for event in self.controller.drain_events():
+                self._log(describe(event), self._severity(event))
+            self._render(self.controller.snapshot())
+        finally:
+            # Rescheduled in a finally so one bad render cannot stop the UI
+            # updating forever - a frozen window during a recording is the
+            # worst thing this can do to an operator.
+            self.root.after(POLL_MS, self._poll)
+
+    @staticmethod
+    def _severity(event):
+        from biocam.data.events import (
+            DiskLow, DriverDataLoss, GapDetected, GapSummary, QueueOverflow,
+            StimulationSuspended,
+        )
+
+        if isinstance(event, (QueueOverflow, DiskLow, StimulationSuspended)):
+            return "bad"
+        if isinstance(event, (GapDetected, GapSummary, DriverDataLoss)):
+            return "warn"
+        return None
+
+    def _render(self, state):
+        set_ = lambda k, v: self.status_vars[k].set(v)  # noqa: E731
+        set_("Status", "recording" if state.running
+             else "finished" if state.finished else "idle")
+        set_("Elapsed", f"{state.elapsed_sec:6.1f} s")
+        set_("Acquisition time", f"{state.acquisition_sec:6.3f} s "
+                                 f"({state.clock_source or '—'})")
+        set_("Frames", f"{state.frames:,}")
+        set_("Frames missing", f"{state.frames_missing:,}")
+        set_("Verdict", state.verdict or "—")
+        set_("Stimuli delivered", f"{state.stimuli_delivered}"
+                                  + (f"  ({state.stimuli_failed} not delivered)"
+                                     if state.stimuli_failed else ""))
+
+        if state.error:
+            self.lbl_health.configure(text=f"ERROR: {state.error}",
+                                      fg=COLOURS["bad"])
+        elif state.warnings:
+            self.lbl_health.configure(
+                text="\n\n".join(state.warnings)[:900], fg=COLOURS["warn"])
+        elif state.running:
+            self.lbl_health.configure(text="Recording.", fg=COLOURS["ok"])
+        elif state.finished:
+            self.lbl_health.configure(
+                text=f"Finished: {state.stop_reason}. Nothing to report.",
+                fg=COLOURS["ok"])
+
+        # str(): a ttk widget's option comes back as a Tcl_Obj, and
+        # Tcl_Obj == "disabled" is False even when it prints as "disabled".
+        # Without the conversion this branch never ran, so the Start button
+        # stayed greyed out after the first recording and the only way back
+        # was to restart the application.
+        if state.finished and str(self.btn_start["state"]) == "disabled":
+            # The instrument is deliberately NOT released here. It is held for
+            # the window's lifetime so a second recording need not re-Activate
+            # the pool; use "Release instrument", or close the window.
+            # Buttons first. This branch is guarded on btn_start still
+            # being "disabled", so anything that raises in between made
+            # _render retry it every 150 ms for the life of the window, with
+            # the recording finished and Start greyed out for good.
+            self.btn_start.configure(state="normal")
+            self._write_stimulus_log()
+            self.btn_stop.configure(state="disabled")
+            self._log(f"Finished: {state.stop_reason}, {state.frames:,} frames, "
+                      f"verdict {state.verdict}",
+                      "ok" if state.verdict == "clean" else "warn")
+            self._refresh_stim_validity()
+
+    def _log(self, message, tag=None):
+        stamp = time.strftime("%H:%M:%S")
+        self.text.configure(state="normal")
+        self.text.insert("end", f"{stamp}  {message}\n", tag or ())
+        self._log_lines += 1
+        if self._log_lines > MAX_LOG_LINES:
+            # Bounded, like every other buffer here. A window left open for a
+            # ten-hour recording must not accumulate a ten-hour text widget.
+            self.text.delete("1.0", "2.0")
+            self._log_lines -= 1
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+    def _on_close(self):
+        """Close the window, but never while the instrument is still live.
+
+        `_release_live` refuses while a recording runs - correctly, because
+        releasing mid-stream leaves the slot back in the pool still streaming.
+        But ignoring that refusal and destroying the window anyway is worse
+        than the defect it replaced: the instrument is then never released at
+        all, and the message saying so is written into a widget that is
+        destroyed on the next line.
+
+        So the close waits, generously, and if the worker still will not stop
+        it says what is being left behind rather than pretending otherwise.
+        """
+        if self.controller.running:
+            self._log("Stopping the recording before closing...")
+            self.controller.stop()
+            # Longer than DRAIN_DEADLINE_SEC (5 s), which is only the first
+            # of several steps left after stop() is seen - stop_source, the
+            # backlog drain and finalise() all follow it.
+            if not self.controller.join(20.0):
+                self._log(
+                    "The recording thread has not stopped. Not closing yet - "
+                    "closing now would leave the instrument claimed and "
+                    "streaming, with no way to release it but ending the "
+                    "process. Wait, or kill the process if it never "
+                    "finishes.", "bad")
+                self.root.after(1000, self._on_close)
+                return
+        self._release_live()
+        if self._live_stack is not None:
+            self._log("The instrument could not be released; closing anyway. "
+                      "It will be freed when this process exits.", "bad")
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def main(argv=None) -> int:
+    import argparse
+    import tkinter as tk
+
+    parser = argparse.ArgumentParser(
+        prog="python -m biocam.ui",
+        description=("The BioCAM operator window. Without --live it runs in "
+                     "simulation against a recorded file, which needs no "
+                     "instrument and no 3Brain DLLs."),
+    )
+    parser.add_argument("--live", action="store_true",
+                        help="drive the real instrument (lab machine only)")
+    parser.add_argument("--replay", type=str, default=None,
+                        help="a .raw file to replay in simulation mode")
+    parser.add_argument("--meta", type=str, default=None,
+                        help="the _meta.json beside --replay, for its "
+                             "acquisition parameters")
+    parser.add_argument("--output-dir", type=str, default="recordings")
+    args = parser.parse_args(argv)
+
+    params = None
+    if not args.live:
+        if not args.replay or not args.meta:
+            print("Simulation mode needs --replay <file.raw> and "
+                  "--meta <file_meta.json>. Use tools/make_demo_recording.py "
+                  "to make one if you have no recording to hand.",
+                  file=sys.stderr)
+            return 2
+        params = _params_from_meta(args.meta)
+
+    root = tk.Tk()
+    BioCamWindow(root, live=args.live, output_dir=args.output_dir,
+                 replay_source=args.replay, params=params).run()
+    return 0
+
+
+def _params_from_meta(meta_path):
+    import json
+
+    from biocam.data.recording import AcquisitionParameters
+
+    meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+    return AcquisitionParameters(
+        frame_rate_hz=meta["frame_rate_hz"],
+        total_channels=meta["total_channels"],
+        ch_sample_byte_size=meta["ch_sample_byte_size"],
+        bit_depth=meta["bit_depth"],
+        adc_counts_to_value=meta["adc_counts_to_value"],
+        offset=meta["offset"],
+        min_digital_value=meta["min_digital_value"],
+        max_digital_value=meta["max_digital_value"],
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -69,6 +69,12 @@ class StimulusRecord:
     negative: tuple = ()
     net_charge_pc: float = None
     detail: str = None             # why it was refused or rejected
+    # True when nothing was actually delivered because there was no
+    # instrument - a simulated run. Without this a simulated record is
+    # structurally identical to a real delivery whose clock reading happened
+    # to be absent, and CLAUDE.md is explicit that a run which looks real and
+    # was not is worse than no run.
+    simulated: bool = False
 
     @property
     def delivered(self) -> bool:
@@ -104,6 +110,7 @@ class StimulusLog:
     records: list = field(default_factory=list)
     n_attempted: int = 0
     n_delivered: int = 0
+    n_simulated: int = 0
     records_truncated: int = 0
     _charge_pc: float = 0.0
 
@@ -141,6 +148,8 @@ class StimulusLog:
     def _add(self, **fields) -> StimulusRecord:
         record = StimulusRecord(index=self.n_attempted, **fields)
         self.n_attempted += 1
+        if record.simulated:
+            self.n_simulated += 1
         if record.delivered:
             self.n_delivered += 1
             self._charge_pc += record.net_charge_pc or 0.0
@@ -151,7 +160,8 @@ class StimulusLog:
         return record
 
     def immediate(
-        self, plan, pattern, *, clock_reading=None, latency_cycles=None
+        self, plan, pattern, *, clock_reading=None, latency_cycles=None,
+        simulated: bool = False,
     ) -> StimulusRecord:
         """Record a delivered single pulse."""
         return self._add(
@@ -160,10 +170,12 @@ class StimulusLog:
             clock_us=getattr(clock_reading, "acquisition_us", None),
             clock_source=getattr(clock_reading, "source", None),
             latency_cycles=latency_cycles,
+            simulated=simulated,
             **_describe(plan, pattern),
         )
 
-    def scheduled(self, plan, pattern, *, clock_reading=None) -> StimulusRecord:
+    def scheduled(self, plan, pattern, *, clock_reading=None,
+                  simulated: bool = False) -> StimulusRecord:
         """Record a queued train or sequence."""
         return self._add(
             kind="scheduled",
@@ -171,6 +183,7 @@ class StimulusLog:
             clock_us=getattr(clock_reading, "acquisition_us", None),
             clock_source=getattr(clock_reading, "source", None),
             requested_timestamps_us=tuple(plan.timestamps_us),
+            simulated=simulated,
             **_describe(plan, pattern),
         )
 
@@ -215,6 +228,9 @@ class StimulusLog:
             "n_attempted": self.n_attempted,
             "n_delivered": self.n_delivered,
             "n_failed": self.n_failed,
+            # Non-zero means some or all of this log is a rehearsal.
+            "n_simulated": self.n_simulated,
+            "simulated": self.n_simulated == self.n_attempted > 0,
             "net_charge_pc": self.net_charge_pc,
             # Non-zero means `stimuli` below is not the whole story: the
             # counts and the charge above still are.
@@ -264,6 +280,9 @@ class StimulusLog:
             text += (f"; {self.records_truncated} individual records dropped "
                      f"past the {MAX_RETAINED_RECORDS} retention cap (counts "
                      "and charge above still include them)")
+        if self.n_simulated:
+            text += (f" - {self.n_simulated} SIMULATED (no instrument; "
+                     "nothing was delivered)")
         charge = self.net_charge_pc
         if charge:
             text += f"; net charge delivered {charge:+g} pC"
