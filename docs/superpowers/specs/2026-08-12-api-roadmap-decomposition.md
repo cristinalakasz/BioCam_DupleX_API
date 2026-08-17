@@ -1,7 +1,9 @@
 # API roadmap: decomposition and hardware findings
 
 **Date:** 2026-08-12
-**Status:** Decomposition agreed. Phases 0 and 1 built; Phase 2 is next to spec.
+**Status:** Decomposition agreed. Phases 0 and 1 built and merged; Phase 2 in
+progress. Section 4's open item was closed on 2026-08-17 by reflecting over the
+assembly.
 **Purpose:** Records the build order and the stimulator capabilities discovered
 while decomposing, so that later phases start from findings rather than
 rediscovering them.
@@ -43,7 +45,7 @@ preference, places it last.
 |---|---|---|
 | **0** | Setup: `CLAUDE.md`, verifier agents, test scaffolding, README | Specced 2026-08-03. **Done** (2026-08-12). |
 | **1** | Acquisition: recording, saving, data integrity | Specced and **merged** (2026-08-13). Gate 1 ran afterwards and did **not** come back clean — see `2026-08-13-phase1-followups.md`. Not cleared for the lab. |
-| **2** | Stimulation engine + manual (a) + scheduled (b) | |
+| **2** | Stimulation engine + manual (a) + scheduled (b) | **In progress** (2026-08-17). `biocam/stim/` (Layer 2: pulses, patterns, trains, sequences, validation) and `biocam/interop/stimulator.py` (Layer 1: lifecycle and the three `Send` paths) are written. Not cleared for the lab. |
 | **3** | Session control: recording and stimulation together, changing live | |
 | **4** | UI | |
 | **5** | Spike detection | |
@@ -125,17 +127,34 @@ Costs and limits, to be respected by Phase 2:
 
 ---
 
-## 4. Open item: undocumented pulse parameters
+## 4. Resolved: the undocumented pulse parameters
 
 `RectangularStimPulse` and `StimProperties` belong to the `_3Brain.Common`
-assembly. The repository contains only `3Brain.BioCamDriver.xml`; there is no
-`3Brain.Common.xml`. The actual pulse parameters — amplitude, phase durations,
-polarity — are therefore undocumented in available material.
+assembly, for which this repository holds no XML. This was recorded as an open
+item to be settled by reflection, since loading an assembly needs no device.
 
-**Resolvable without hardware.** The DLLs are present on the development machine,
-and loading an assembly to reflect over its types requires no attached device.
-Phase 2 should begin by introspecting `RectangularStimPulse` and `StimProperties`
-and recording their members, either in the README or as a generated reference.
+**Settled on 2026-08-17.** `python -m biocam.interop.reflect` reads the members
+directly off the DLL; the full surface is recorded in
+`docs/api/stimulation-reference.md`. The pulse is:
+
+```
+RectangularStimPulse(String friendlyName, StimProperties constraints,
+                     Double amplitude1, Int32 width1, Int32 interWidth,
+                     Double amplitude2, Int32 width2)
+```
+
+Amplitudes are µA (`IsCurrentStimulator = True`); widths are integer counts of
+`TimeResolutionMicroSec`, not microseconds.
+
+Reflection settled the shape. Probing settled the behaviour, and the behaviour
+turned out to be the real finding: **the driver adjusts invalid pulses instead
+of rejecting them.** Amplitudes are clamped and rounded; a pulse longer than
+`MaxPulseDuration` has its *later* phases shortened, so `8000/0/8000` comes back
+as `8000/0/2000` — a charge-balanced request silently delivering net DC, with
+`IsBiphasic` still true. Nothing raises.
+
+That is what `biocam/stim/` was built to prevent, and it is why Phase 2 gained a
+validation layer that was not in the original decomposition.
 
 ---
 

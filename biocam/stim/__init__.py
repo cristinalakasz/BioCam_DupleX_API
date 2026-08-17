@@ -10,6 +10,14 @@ The Layer 1 counterpart that actually sends the result is
 """
 
 from biocam.stim.constraints import StimConstraints
+from biocam.stim.electrodes import (
+    Electrode,
+    ElectrodeGrid,
+    PatternValidationError,
+    StimPattern,
+    bipolar_pair,
+    validate_pattern,
+)
 from biocam.stim.pulse import (
     PulsePlan,
     PulseSpec,
@@ -17,12 +25,38 @@ from biocam.stim.pulse import (
     plan,
     verify_built_pulse,
 )
+from biocam.stim.train import (
+    SequencePlan,
+    TrainPlan,
+    TrainSpec,
+    TrainValidationError,
+    plan_sequence,
+    plan_train,
+    ramp,
+)
 
 __all__ = [
+    # constraints
     "StimConstraints",
+    # pulses
     "PulsePlan",
     "PulseSpec",
     "PulseValidationError",
     "plan",
     "verify_built_pulse",
+    # electrodes
+    "Electrode",
+    "ElectrodeGrid",
+    "PatternValidationError",
+    "StimPattern",
+    "bipolar_pair",
+    "validate_pattern",
+    # trains and sequences
+    "SequencePlan",
+    "TrainPlan",
+    "TrainSpec",
+    "TrainValidationError",
+    "plan_sequence",
+    "plan_train",
+    "ramp",
 ]

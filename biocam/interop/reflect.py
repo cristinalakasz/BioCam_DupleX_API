@@ -83,14 +83,23 @@ def describe(t) -> str:
         for ctor in ctors:
             out.append(f"    .ctor({_params(ctor)})")
 
-    props = t.GetProperties(flags)
+    # For an interface, Type.GetProperties/GetMethods return only the members
+    # it declares itself - members inherited from base interfaces are NOT
+    # included, and BindingFlags.FlattenHierarchy does not change that (it
+    # affects statics). Since this tool's output is treated as ground truth,
+    # an under-report reads as "the member does not exist", so base interfaces
+    # are unioned in explicitly. For a class, GetProperties already walks the
+    # base chain and t.GetInterfaces() adds nothing new.
+    sources = [t] + (list(t.GetInterfaces()) if t.IsInterface else [])
+
+    props = _union(sources, lambda s: s.GetProperties(flags))
     if props:
         out.append("  properties:")
         for p in sorted(props, key=lambda x: x.Name):
             access = ("get" if p.CanRead else "") + ("/set" if p.CanWrite else "")
             out.append(f"    {_type_name(p.PropertyType)} {p.Name}  ({access})")
 
-    fields = t.GetFields(flags)
+    fields = _union(sources, lambda s: s.GetFields(flags))
     if fields:
         out.append("  fields:")
         for f in sorted(fields, key=lambda x: x.Name):
@@ -103,7 +112,10 @@ def describe(t) -> str:
             static = " [static]" if f.IsStatic else ""
             out.append(f"    {_type_name(f.FieldType)} {f.Name}{const}{static}")
 
-    methods = [m for m in t.GetMethods(flags) if not m.IsSpecialName]
+    methods = [
+        m for m in _union(sources, lambda s: s.GetMethods(flags))
+        if not m.IsSpecialName
+    ]
     if methods:
         out.append("  methods:")
         for m in sorted(methods, key=lambda x: x.Name):
@@ -112,13 +124,34 @@ def describe(t) -> str:
                 f"    {_type_name(m.ReturnType)} {m.Name}({_params(m)}){static}"
             )
 
-    events = t.GetEvents(flags)
+    events = _union(sources, lambda s: s.GetEvents(flags))
     if events:
         out.append("  events:")
         for e in sorted(events, key=lambda x: x.Name):
             out.append(f"    {_type_name(e.EventHandlerType)} {e.Name}")
 
     return "\n".join(out) + "\n"
+
+
+def _union(sources, get):
+    """Collect members across a type and its base interfaces, de-duplicated.
+
+    Keyed on name plus parameter shape so that genuine overloads survive while
+    a member reachable through two base interfaces is printed once.
+    """
+    seen, members = set(), []
+    for source in sources:
+        for member in get(source):
+            try:
+                key = (member.Name, _params(member))
+            except AttributeError:
+                # Properties, fields and events have no GetParameters().
+                key = (member.Name, None)
+            if key in seen:
+                continue
+            seen.add(key)
+            members.append(member)
+    return members
 
 
 def _params(method) -> str:

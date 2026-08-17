@@ -109,6 +109,39 @@ def test_constraints_reject_nonsense():
         StimConstraints(1, 1.0, 5.0, -5.0, 10)
 
 
+def test_matches_numerically_ignores_the_unit_string():
+    # The device reports 'µA' (U+00B5); a hand-built StimConstraints defaults
+    # to ASCII 'uA'. Comparing whole dataclasses would reject a plan that is
+    # numerically identical to what the instrument would accept.
+    from dataclasses import replace
+
+    device = replace(DUPLEX, unit="µA")
+    assert device != DUPLEX
+    assert DUPLEX.matches_numerically(device)
+
+
+def test_matches_numerically_catches_a_different_time_resolution():
+    from dataclasses import replace
+
+    # The StimProperties.Default trap: 1 us where the device is coarser.
+    assert not DUPLEX.matches_numerically(replace(DUPLEX, time_resolution_us=1))
+
+
+def test_matches_numerically_catches_every_numeric_field():
+    from dataclasses import replace
+
+    for field, value in (
+        ("time_resolution_us", 5),
+        ("amplitude_resolution", 2.0),
+        ("min_amplitude", -500.0),
+        ("max_amplitude", 500.0),
+        ("max_total_ticks", 999),
+    ):
+        assert not DUPLEX.matches_numerically(replace(DUPLEX, **{field: value})), (
+            f"a difference in {field} was not caught"
+        )
+
+
 def test_from_stim_properties_reads_a_live_object():
     class FakeProperties:
         TimeResolutionMicroSec = 10

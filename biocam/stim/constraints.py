@@ -101,11 +101,30 @@ class StimConstraints:
         )
         return float(steps * step)
 
+    def matches_numerically(self, other: "StimConstraints") -> bool:
+        """Whether two constraint sets impose the same limits.
+
+        Ignores `unit` and `is_current`, which describe the numbers rather
+        than bounding them. That distinction matters in practice: the device
+        reports `UnitMeasureString` as 'µA' with a micro sign (U+00B5), while
+        a hand-built `StimConstraints` defaults to the ASCII 'uA'. Comparing
+        whole dataclasses would reject a plan that is numerically identical to
+        what the instrument would accept.
+        """
+        return (
+            self.time_resolution_us == other.time_resolution_us
+            and self.amplitude_resolution == other.amplitude_resolution
+            and self.min_amplitude == other.min_amplitude
+            and self.max_amplitude == other.max_amplitude
+            and self.max_total_ticks == other.max_total_ticks
+        )
+
     @classmethod
     def from_stim_properties(cls, properties) -> "StimConstraints":
         """Build from a live `StimProperties`.
 
-        Pass `biocam.Stim.Properties` - the constraints the *device* reports.
+        Pass `biocam.Stimulator.Properties` - the constraints the *device*
+        reports. The accessor is `Stimulator`, not `Stim`.
 
         Do **not** pass `StimProperties.Default`. That static is a placeholder
         carrying `TimeResolutionMicroSec = 1` where the DupleX stimulator's

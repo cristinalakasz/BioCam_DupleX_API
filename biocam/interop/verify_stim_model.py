@@ -47,6 +47,14 @@ _CONSTRAINTS_COARSE_AMP = StimConstraints(
     time_resolution_us=1, amplitude_resolution=5.0,
     min_amplitude=-1000.0, max_amplitude=1000.0, max_total_ticks=10000,
 )
+# A duration cap that is NOT the 10000 the four-argument StimProperties
+# constructor leaves behind. Without this every case would pass even if
+# `properties.MaxPulseDuration = ...` were a silent no-op, and the whole
+# check would be testing the default rather than what it claims to test.
+_CONSTRAINTS_SHORT_CAP = StimConstraints(
+    time_resolution_us=1, amplitude_resolution=1.0,
+    min_amplitude=-1000.0, max_amplitude=1000.0, max_total_ticks=500,
+)
 
 CASES = [
     (
@@ -107,6 +115,18 @@ CASES = [
         "amplitude off the resolution grid -> driver rounds it",
         PulseSpec(7.0, 100.0, 0.0, -7.0, 100.0),
         _CONSTRAINTS_COARSE_AMP,
+        False,
+    ),
+    (
+        "balanced, at a NON-DEFAULT 500-tick cap",
+        PulseSpec(100.0, 250.0, 0.0, -100.0, 250.0),
+        _CONSTRAINTS_SHORT_CAP,
+        True,
+    ),
+    (
+        "over a NON-DEFAULT 500-tick cap -> proves the cap was really applied",
+        PulseSpec(100.0, 400.0, 0.0, -100.0, 400.0),
+        _CONSTRAINTS_SHORT_CAP,
         False,
     ),
 ]
