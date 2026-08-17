@@ -237,3 +237,91 @@ def test_releasing_the_instrument_is_safe_when_nothing_is_held(
     window = a_window(root, tmp_path, demo)
     window._release_live()
     window._release_live()
+
+
+# --------------------------------------------------------------------------
+# what the review found
+# --------------------------------------------------------------------------
+
+def test_live_mode_will_not_validate_against_invented_limits(root, tmp_path, demo):
+    # Before the instrument is claimed its limits are unknown, and a LIVE
+    # window used to fall through to the simulation defaults - showing
+    # "Valid: ..." for durations that were not the ones that would fire.
+    window = a_window(root, tmp_path, demo, live=True)
+    assert str(window.btn_stim["state"]) == "disabled"
+    assert "unknown until the instrument is claimed" in window.lbl_stim["text"]
+
+
+def test_simulation_mode_still_validates_without_an_instrument(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo, live=False)
+    assert "balanced" in window.lbl_stim["text"]
+
+
+def test_warnings_from_other_threads_reach_the_log(root, tmp_path, demo):
+    # Tkinter is not thread-safe, so the `warn` handed to the factory and the
+    # stimulator must not touch a widget. It queues; the poll renders.
+    import threading
+
+    window = a_window(root, tmp_path, demo)
+    done = threading.Event()
+
+    def other_thread():
+        window._warn_from_any_thread("something happened elsewhere")
+        done.set()
+
+    threading.Thread(target=other_thread).start()
+    assert done.wait(5.0)
+    for _ in range(20):
+        root.update()
+        if "something happened elsewhere" in window.text.get("1.0", "end"):
+            return
+        time.sleep(0.05)
+    raise AssertionError("the message never reached the log")
+
+
+def test_the_stimulus_log_is_written_beside_the_recording(root, tmp_path, demo):
+    # Without it the latencies and refusals die with the process - the one
+    # correspondence a later analysis cannot reconstruct.
+    import json
+
+    window = a_window(root, tmp_path, demo)
+    window.var_duration.set("2")
+    window._on_start()
+    root.update()
+    window._refresh_stim_validity()
+    window._on_stimulate()
+    pump(root, window)
+
+    logs = list((tmp_path / "out").glob("*_stimuli.json"))
+    assert len(logs) == 1
+    payload = json.loads(logs[0].read_text(encoding="utf-8"))
+    assert payload["n_delivered"] == 1
+    # And it is unmistakably a rehearsal.
+    assert payload["simulated"] is True
+    assert payload["stimuli"][0]["simulated"] is True
+
+
+def test_no_stimulus_log_is_written_when_nothing_was_stimulated(
+    root, tmp_path, demo
+):
+    window = a_window(root, tmp_path, demo)
+    window.var_duration.set("1")
+    window._on_start()
+    pump(root, window)
+    assert list((tmp_path / "out").glob("*_stimuli.json")) == []
+
+
+def test_releasing_is_refused_while_a_recording_runs(root, tmp_path, demo):
+    # Releasing mid-recording would deactivate the pool underneath the worker,
+    # after which source.stop() never calls StopDataStreaming.
+    window = a_window(root, tmp_path, demo)
+    window._live_stack = object()          # pretend an instrument is held
+    window.var_until_stopped.set(True)
+    window._on_duration_mode()
+    window._on_start()
+    root.update()
+    window._release_live()
+    assert "still running" in window.text.get("1.0", "end")
+    assert window._live_stack is not None   # not dropped, so it can be retried
+    window.controller.stop()
+    window.controller.join(10.0)

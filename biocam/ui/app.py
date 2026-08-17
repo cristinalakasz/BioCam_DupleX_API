@@ -21,6 +21,7 @@ thing an operator cannot debug alone mid-experiment, so the reason a control
 is unavailable is always on screen next to it.
 """
 
+import queue
 import sys
 import time
 from contextlib import ExitStack
@@ -65,6 +66,19 @@ class BioCamWindow:
         # them - a leaked BioCamDevice stays claimed until the process dies,
         # so the next person to try the instrument finds it held by nothing.
         self._live_stack = None
+        self._device = None
+        self._stimulator = None
+        # Bounds-checks electrodes. Stated rather than read from the device:
+        # BioCamDataFormat exposes NChsPerWell and NWells but no row or
+        # column count, and the geometry sits behind IMeaPlatePilot.
+        self.grid = None
+        # Messages from other threads. The `warn` callables handed to the
+        # factory and the stimulator are invoked on the recording thread
+        # and on the consumer thread, and Tkinter is not thread-safe -
+        # calling _log() from either would breach this module's own first
+        # rule. SimpleQueue.put is thread-safe and never blocks, which
+        # also matters because one of those callers is the drain.
+        self._messages = queue.SimpleQueue()
 
         root.title(
             "BioCAM DupleX — LIVE INSTRUMENT" if live
@@ -139,6 +153,13 @@ class BioCamWindow:
         self.btn_stop = ttk.Button(buttons, text="Stop", command=self._on_stop,
                                    state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+        if self.live:
+            # The instrument is claimed on the first Start and held for the
+            # window's lifetime, so there has to be a way to give it back
+            # without closing - BrainWave cannot open the device while this
+            # holds it.
+            ttk.Button(buttons, text="Release instrument",
+                       command=self._release_live).pack(side="left", padx=6)
         row += 1
 
         self.status_vars = {}
@@ -266,10 +287,24 @@ class BioCamWindow:
         return plan_pulse(spec, constraints), pattern
 
     def _constraints(self):
+        """The stimulator's limits: the device's in live mode, always.
+
+        This used to fall through to the simulation defaults whenever the
+        instrument was not yet claimed, so before Start was pressed a LIVE
+        window would display "Valid: ..." for a pulse validated against
+        invented limits - durations the operator would read and write down,
+        and not the ones that would fire.
+        """
         from biocam.stim import StimConstraints
 
-        if self.live and getattr(self._factory, "stimulator", None) is not None:
-            return self._factory.stimulator.constraints
+        if self.live:
+            if self._stimulator is None:
+                raise RuntimeError(
+                    "the stimulator's limits are unknown until the instrument "
+                    "is claimed. Press Start; the pulse is validated against "
+                    "the device's own limits before anything is delivered."
+                )
+            return self._stimulator.constraints
         return StimConstraints(
             time_resolution_us=int(self.var_resolution.get()),
             amplitude_resolution=1.0,
@@ -319,7 +354,11 @@ class BioCamWindow:
             self._release_live()
             self._log(f"Cannot start: {exc}", "bad")
             return
-        self.controller.start(self._factory)
+        try:
+            self.controller.start(self._factory)
+        except Exception as exc:  # noqa: BLE001 - the instrument is already held
+            self._log(f"Could not start the recording: {exc}", "bad")
+            return
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         # No "recording to ..." line here: RecordingStarted arrives through
@@ -367,52 +406,149 @@ class BioCamWindow:
             frames_per_packet=200, pace_hz=50.0,
         )
 
+    def _ensure_live_instrument(self):
+        """Claim the instrument once and keep it until the window closes.
+
+        `BioCamDevice.__enter__` calls `BioCamPool.Activate()` and `__exit__`
+        calls `Deactivate()`, so one device per recording would do
+        Activate -> Deactivate -> Activate across two runs. Nothing in this
+        repository documents whether the pool survives that, and 3Brain's
+        sample never tries: it activates once at form load and deactivates
+        once at form close (MainForm.cs:72, :85), taking and releasing BioCAM
+        control repeatedly in between. The first thing that would have
+        exercised re-activation is the second recording of a lab day.
+        """
+        from biocam.interop.device import BioCamDevice
+        from biocam.interop.stimulator import Stimulator, StimulatorError
+        from biocam.stim import StimulusLog
+
+        if self._live_stack is not None:
+            return
+
+        # The same floor record_command enforces. source.POLL_INTERVAL_SEC's
+        # 1 ms only resolves from 3.11 on Windows; below that time.sleep()
+        # rounds up to the ~15.6 ms system timer, silently restoring the
+        # latency that constant exists to remove. The CLI refuses outright,
+        # and there is no reason this window should be more permissive about
+        # the same driver.
+        from biocam.cli import MIN_PYTHON_FOR_POLL_PRECISION
+
+        if sys.version_info < MIN_PYTHON_FOR_POLL_PRECISION:
+            need = ".".join(str(n) for n in MIN_PYTHON_FOR_POLL_PRECISION)
+            raise RuntimeError(
+                f"Python {need}+ is required to drive the instrument; this is "
+                f"{sys.version_info.major}.{sys.version_info.minor}. Below "
+                f"{need}, time.sleep() on Windows rounds up to ~15.6 ms and "
+                "the consumer would poll 15x slower than intended."
+            )
+
+        stack = ExitStack()
+        try:
+            self._device = stack.enter_context(BioCamDevice())
+            try:
+                # Initialize/Close only. Start/Stop bracket the streaming and
+                # happen in LiveFactory.start_source / stop_source_safely.
+                self._stimulator = stack.enter_context(
+                    Stimulator(self._device, log=StimulusLog(),
+                               grid=self.grid,
+                               warn=self._warn_from_any_thread))
+            except StimulatorError as exc:
+                # A stimulator that will not initialize must not block
+                # recording. It is a separate module that may not be
+                # installed, or connector.py may already hold it; refusing
+                # the whole session would make a recording-only run
+                # impossible on this window.
+                self._stimulator = None
+                self._log(f"Stimulation unavailable: {exc}", "warn")
+                self._log("Recording will still work.", "warn")
+        except BaseException:
+            stack.close()
+            self._device = self._stimulator = None
+            raise
+        self._live_stack = stack
+
     def _make_live_factory(self, output, duration):
         # Imported here, never at module scope: this module must stay
         # importable on a machine with no 3Brain DLLs.
-        from biocam.interop.device import BioCamDevice
-        from biocam.interop.stimulator import Stimulator
-        from biocam.stim import StimulusLog
         from biocam.ui.factories import LiveFactory
 
-        warn = lambda message: self._log(message, "warn")  # noqa: E731
-        stack = ExitStack()
-        try:
-            device = stack.enter_context(BioCamDevice())
-            # The stimulator is entered here rather than per-stimulus: its
-            # lifecycle is Initialize -> Start -> Stop -> Close, and cycling
-            # that for every pulse would be both slow and wrong. Note it
-            # warns rather than refuses when the device is not yet streaming;
-            # the recording starts moments later.
-            stimulator = stack.enter_context(
-                Stimulator(device, log=StimulusLog(), warn=warn))
-        except BaseException:
-            # Whatever was entered must come back out, or the instrument
-            # stays claimed by a window that failed to open a session.
-            stack.close()
-            raise
-        self._live_stack = stack
+        self._ensure_live_instrument()
         return LiveFactory(
             output_path=output, duration_sec=duration,
-            device=device, stimulator=stimulator, log=stimulator.log,
-            warn=warn,
+            device=self._device, stimulator=self._stimulator,
+            log=self._stimulator.log if self._stimulator else None,
+            listener=self.controller._events.put,
+            warn=self._warn_from_any_thread,
         )
 
+    def _warn_from_any_thread(self, message):
+        """A `warn` callable safe to hand to code running on another thread."""
+        self._messages.put(message)
+
     def _release_live(self):
-        """Release the instrument. Safe to call when nothing is held."""
-        stack, self._live_stack = self._live_stack, None
+        """Release the instrument. Safe to call when nothing is held.
+
+        The stack reference is cleared only once the close succeeds. Dropping
+        it first left a failed release unretryable, with the device still
+        claimed and nothing able to try again.
+        """
+        stack = self._live_stack
         if stack is None:
+            return
+        if self.controller.running:
+            # Releasing now would run ReleaseBioCamControl and Deactivate
+            # while the worker is still streaming, setting device.biocam to
+            # None underneath it - after which source.stop() takes its
+            # "nothing to stop" branch and never calls StopDataStreaming nor
+            # unsubscribes. The slot would go back to the pool still
+            # streaming, with handlers attached.
+            self._log("Not releasing the instrument: a recording is still "
+                      "running. Stop it first.", "bad")
             return
         try:
             stack.close()
-            self._log("Instrument released.", "ok")
         except Exception as exc:  # noqa: BLE001 - reported, never raised at a UI
-            self._log(f"Releasing the instrument failed: {exc}", "bad")
+            self._log(f"Releasing the instrument failed: {exc}. It may still "
+                      "be claimed; try again, or restart.", "bad")
+            return
+        self._live_stack = None
+        self._device = None
+        self._stimulator = None
+        self._log("Instrument released.", "ok")
+
+    def _write_stimulus_log(self):
+        """Persist what was stimulated, beside the recording it belongs to.
+
+        Without this the latencies, refusals and rejections die with the
+        process - the one correspondence a later analysis cannot
+        reconstruct. Written at the end of a session rather than during it,
+        because this must not do disk work while the drain is running.
+        """
+        log = getattr(self._factory, "log", None)
+        if log is None or not len(log):
+            return
+        output = Path(self._factory.output_path)
+        path = output.with_name(output.stem + "_stimuli.json")
+        cycles_per_us = None
+        if self._stimulator is not None:
+            cycles_per_us = self._stimulator.cycles_per_us
+        try:
+            log.write(path, cycles_per_us=cycles_per_us)
+        except OSError as exc:
+            self._log(f"Could not write the stimulus log to {path}: {exc}",
+                      "bad")
+            return
+        self._log(f"Stimulus log: {path} ({log.describe()})", "ok")
 
     # -- polling ----------------------------------------------------------
 
     def _poll(self):
         try:
+            while True:
+                try:
+                    self._log(self._messages.get_nowait(), "warn")
+                except queue.Empty:
+                    break
             for event in self.controller.drain_events():
                 self._log(describe(event), self._severity(event))
             self._render(self.controller.snapshot())
@@ -468,10 +604,10 @@ class BioCamWindow:
         # stayed greyed out after the first recording and the only way back
         # was to restart the application.
         if state.finished and str(self.btn_start["state"]) == "disabled":
-            # The session is over, so the device goes back before anything
-            # else. Held any longer and a second Start would find it claimed
-            # by this same process.
-            self._release_live()
+            # The instrument is deliberately NOT released here. It is held for
+            # the window's lifetime so a second recording need not re-Activate
+            # the pool; use "Release instrument", or close the window.
+            self._write_stimulus_log()
             self.btn_start.configure(state="normal")
             self.btn_stop.configure(state="disabled")
             self._log(f"Finished: {state.stop_reason}, {state.frames:,} frames, "

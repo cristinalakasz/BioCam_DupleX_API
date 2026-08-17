@@ -904,13 +904,16 @@ def stim_command(args) -> int:
         # exists to preserve.
         cycles_per_us = None
         try:
+            # `stimulating()` is the Start/Stop bracket, separate from the
+            # Initialize/Close one that `Stimulator` itself is. There is no
+            # acquisition on this path, so it warns - see issue #22.
             with BioCamDevice() as device, Stimulator(
                 device,
                 grid=args.grid,
                 enforce_column_rule=not args.no_column_rule,
                 warn=warn,
                 log=log,
-            ) as stimulator:
+            ) as stimulator, stimulator.stimulating():
                 constraints = stimulator.constraints
                 cycles_per_us = stimulator.cycles_per_us
                 print(f"stimulator constraints: {constraints}")

@@ -25,8 +25,10 @@ class ReplayFactory:
     """Drives a session from a `.raw` file, or from synthetic packets.
 
     Stimulation is *simulated*: requests are validated and logged exactly as
-    they would be, and then not sent anywhere. Every record it produces is
-    marked so that a simulated log can never be mistaken for a real one.
+    they would be, and then not sent anywhere. Each record is marked
+    `simulated` so that a simulated log cannot be mistaken for a real one -
+    a claim that was in this docstring before it was true, and is now checked
+    by a test.
     """
 
     raw_path: Path
@@ -99,8 +101,15 @@ class ReplayFactory:
         The plan and pattern have already been validated by whoever built
         them, so what this exercises is the whole path either side of the
         driver call: the queue, the dispatch timing, the log, the UI counters.
+
+        `scheduled` is honoured, so a simulated log distinguishes the two the
+        way a live one does. Without it, a scheduled request would be recorded
+        as a delivered immediate pulse.
         """
-        self.log.immediate(request.plan, request.pattern)
+        if request.scheduled:
+            self.log.scheduled(request.plan, request.pattern, simulated=True)
+        else:
+            self.log.immediate(request.plan, request.pattern, simulated=True)
 
 
 @dataclass
@@ -148,6 +157,7 @@ class LiveFactory:
     stimulator: object = None
     log: object = None
     grid: object = None
+    listener: object = None
     warn: object = None
     _params: object = field(default=None, init=False)
 
@@ -168,10 +178,23 @@ class LiveFactory:
 
     @property
     def params(self):
-        if self._params is None:
-            from biocam.cli import _parameters_from
+        """Acquisition parameters, with the diagnostic the CLI prints.
 
-            self._params = _parameters_from(self.device.data_format)
+        Five of the members read here appear nowhere in
+        `3Brain.BioCamDriver.xml`. `_probe_data_format` reads each one
+        separately so that a missing member is reported by name rather than
+        surfacing as whichever `AttributeError` happens to be hit first -
+        which, 600 km away, is the difference between a fixable report and an
+        unusable one.
+        """
+        if self._params is None:
+            from biocam.cli import _parameters_from, _probe_data_format
+
+            data_format = self.device.data_format
+            if self.warn:
+                for line in _probe_data_format(data_format):
+                    self.warn(f"DataFormat: {line}")
+            self._params = _parameters_from(data_format)
         return self._params
 
     def make_clock(self):
@@ -196,12 +219,33 @@ class LiveFactory:
         )
 
     def make_source(self):
+        """Build the driver source, sized the way the CLI sizes it.
+
+        `DriverPacketSource`'s own default is 2000 packets regardless of the
+        acquisition period, which at the full DupleX configuration is several
+        seconds of buffering and well past the 512 MiB ceiling `cli.py`
+        computes for exactly this reason. The listener matters too: without
+        it `QueuePressure` - the warning that precedes an overflow - is
+        emitted to nothing, so the window would see the loss but not the
+        approach to it.
+        """
+        from biocam.cli import _bytes_per_packet, _queue_size_for
         from biocam.interop.source import DriverPacketSource
 
-        return DriverPacketSource(self.device)
+        queue_size = _queue_size_for(
+            self.packet_ms, _bytes_per_packet(self.params, self.packet_ms)
+        )
+        return DriverPacketSource(
+            self.device, queue_size=queue_size, listener=self.listener
+        )
 
     def start_source(self, source):
+        # Streaming first, then the stimulator - MainForm.cs:186 then :192.
+        # The reverse is what the UI used to do, by holding the whole
+        # stimulator lifecycle open across the session.
         source.start(packet_timespan_ms=self.packet_ms)
+        if self.stimulator is not None:
+            self.stimulator.start()
 
     def counters(self, source):
         return source
@@ -210,6 +254,9 @@ class LiveFactory:
         return source.stop
 
     def stop_source_safely(self, source):
+        # Stimulator first, then streaming - MainForm.cs:210 then :213.
+        if self.stimulator is not None:
+            self.stimulator.stop()          # never raises; warns instead
         try:
             source.stop()
         except Exception as exc:  # noqa: BLE001 - must not mask the real failure

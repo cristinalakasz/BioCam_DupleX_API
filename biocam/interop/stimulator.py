@@ -16,7 +16,26 @@ has not been executed is the *call*: an overload selected via
 two-tuple. That needs a live stimulator. Failure would be a loud `TypeError`
 at the call site, not a wrong stimulus.
 
-## The lifecycle is Initialize -> Start -> Stop -> Close
+## The lifecycle is Initialize -> Start -> Stop -> Close, in TWO brackets
+
+Those four calls do not nest inside one another. 3Brain's sample brackets
+them against different things:
+
+    Initialize  <-> device control   (MainForm.cs:111 / :122)
+    Start/Stop  <-> data streaming   (MainForm.cs:186,192 / :210,213)
+
+So `__enter__`/`__exit__` here do Initialize and Close, and `stimulating()`
+does Start and Stop:
+
+    with BioCamDevice() as device, Stimulator(device) as stim:
+        ...StartDataStreaming...
+        with stim.stimulating():
+            stim.send_now(plan, pattern)
+        ...StopDataStreaming...
+
+Folding all four into one context manager - which this used to do - made the
+sample's ordering impossible to express: the stimulator was necessarily
+started before any acquisition existed, on every session.
 
 `connector.py` calls `Initialize()` (line 185) and `Close()` (line 214) and
 never `Start()`. What that actually causes is *not* silent failure, contrary to
@@ -258,26 +277,100 @@ class Stimulator:
                 "stimulator did not initialize; nothing has been started."
             )
         self._initialized = True
+        return self
+
+    # -- the streaming bracket -------------------------------------------
+
+    def start(self) -> None:
+        """Start the stimulator. Call this AFTER data streaming has begun.
+
+        `Start`/`Stop` bracket the acquisition, not the device. 3Brain's
+        sample is explicit about it: `Initialize` sits inside
+        TakeBioCamControl (MainForm.cs:111) and `Close` inside
+        ReleaseBioCamControl (:122), while `Start` comes *after*
+        StartDataStreaming (:186 then :192) and `Stop` *before*
+        StopDataStreaming (:210 then :213).
+
+        This used to be folded into `__enter__` alongside Initialize, which
+        made the sample's ordering structurally impossible to express - the
+        stimulator was necessarily started before any acquisition existed, on
+        every session. Since the latency this reports is measured in clock
+        cycles "relative to the beginning of the acquisition", that origin may
+        not have existed yet.
+        """
+        if self._stimulator is None or not self._initialized:
+            raise StimulatorError(
+                "cannot start: the stimulator is not initialized. Use "
+                "`with Stimulator(device) as stim:` first."
+            )
+        if self._started:
+            return
+
+        if not self._read("IBioCam.IsStreaming",
+                          lambda: self._device.biocam.IsStreaming):
+            # Still a warning rather than a refusal: nothing documents
+            # streaming as a precondition of Start, and `biocam stim` uses
+            # this deliberately for bench work with no recording. But in the
+            # ordinary path it should now never fire, which is the point of
+            # the split - if it does fire during a UI session, the ordering
+            # has regressed.
+            self._warn(
+                "starting the stimulator with no acquisition running. "
+                "3Brain's sample starts it after StartDataStreaming "
+                "(MainForm.cs:186,192). Pulses should still be delivered - "
+                "that is itself untested (issue #22) - but the latency "
+                "send_now reports is measured from the beginning of the "
+                "acquisition and has no reference point."
+            )
 
         # The step connector.py omits.
         try:
-            started = stimulator.Start()
+            started = self._stimulator.Start()
         except BaseException as exc:
-            problems = self._shutdown()
             raise StimulatorError(
-                f"IBioCamStim.Start() raised {exc!r}."
-                + (f" Shutdown also reported: {'; '.join(problems)}." if problems else "")
+                f"IBioCamStim.Start() raised {exc!r}. The XML documents "
+                "InvalidOperationException when the stimulator has already "
+                "started or the protocol type is not supported."
             ) from exc
         if not started:
-            problems = self._shutdown()
             raise StimulatorError(
                 "IBioCamStim.Start() returned false. The stimulator "
                 "initialized but did not start, so every subsequent Send "
                 "would throw InvalidOperationException."
-                + (f" Shutdown also reported: {'; '.join(problems)}." if problems else "")
             )
         self._started = True
-        return self
+
+    def stop(self) -> None:
+        """Stop the stimulator. Call this BEFORE data streaming stops.
+
+        Never raises: it runs on teardown paths where an exception would
+        replace whatever failure is already propagating. Problems are warned.
+        """
+        if self._stimulator is None or not self._started:
+            return
+        try:
+            if not self._stimulator.Stop():
+                self._warn("IBioCamStim.Stop() returned false.")
+        except BaseException as exc:  # noqa: BLE001 - teardown must not raise
+            self._warn(f"IBioCamStim.Stop() raised {exc!r}.")
+        finally:
+            self._started = False
+
+    @contextmanager
+    def stimulating(self):
+        """Bracket the acquisition: `Start` on entry, `Stop` on exit.
+
+            with Stimulator(device) as stim:      # Initialize / Close
+                ...StartDataStreaming...
+                with stim.stimulating():          # Start / Stop
+                    ...
+                ...StopDataStreaming...
+        """
+        self.start()
+        try:
+            yield self
+        finally:
+            self.stop()
 
     def __exit__(self, exc_type, exc, tb):
         problems = self._shutdown()
@@ -320,6 +413,12 @@ class Stimulator:
         # stimulator open. Ctrl+C during teardown is therefore recorded as a
         # problem rather than propagating - the same trade biocam/interop/
         # source.py makes in its own stop path, and for the same reason.
+        #
+        # Stop() normally happened already, in the streaming bracket. This is
+        # the safety net for a caller that never opened one, or that raised
+        # inside it - XML: Close throws when the stimulator has not been
+        # closed cleanly, and Stop throws when it has not started, so both
+        # stay behind their flags.
         try:
             if self._started and not stimulator.Stop():
                 problems.append("IBioCamStim.Stop() returned false")
