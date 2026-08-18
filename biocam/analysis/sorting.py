@@ -494,3 +494,37 @@ def suggest_n_units(spikes, technique: str = "pca", candidates=(1, 2, 3, 4),
             continue
         results.append((n, sorter.separation()))
     return sorted(results, key=lambda pair: pair[1], reverse=True)
+
+
+def sort_by_channel(spikes, technique: str = "pca", n_units: int = 2,
+                    min_waveforms: int = MIN_WAVEFORMS_TO_FIT, **kwargs):
+    """Fit one sorter per channel. Returns {channel: Sorter}.
+
+    **Sorting is per electrode, and this is the function that says so.**
+
+    A unit is a neuron as heard by one electrode. Pooling waveforms from
+    several electrodes and clustering them together does not find neurons -
+    it finds electrodes, because the largest differences in that pool are
+    between recording sites rather than between cells. The clusters look
+    perfectly convincing, and the separation score is high precisely because
+    the structure is real; it is just not the structure anybody wanted.
+
+    Channels with fewer than `min_waveforms` spikes are left out rather than
+    fitted badly, and the caller can see which by comparing the keys against
+    the channels it asked for.
+    """
+    by_channel = {}
+    for spike in spikes:
+        if spike.waveform is not None:
+            by_channel.setdefault(spike.channel, []).append(spike)
+
+    sorters = {}
+    for channel, channel_spikes in sorted(by_channel.items()):
+        if len(channel_spikes) < min_waveforms:
+            continue
+        try:
+            sorters[channel] = make_sorter(
+                technique, n_units=n_units, **kwargs).fit(channel_spikes)
+        except ValueError:
+            continue
+    return sorters

@@ -38,6 +38,12 @@ from dataclasses import dataclass, field
 # rather than merely fallen behind.
 EVENT_RING_CAPACITY = 512
 
+# Waveforms kept for sorting. A sort needs a representative sample, not every
+# spike ever seen, and this runs in the same process that is drawing the
+# array. Past the cap the oldest are dropped and counted - the recording on
+# disk still holds everything.
+MAX_RETAINED_WAVEFORMS = 20_000
+
 
 @dataclass(frozen=True)
 class SessionSnapshot:
@@ -64,6 +70,11 @@ class SessionSnapshot:
     stimuli_pending: int = 0
     stimulation_suspended: bool = False
     events_dropped: int = 0
+    spikes_detected: int = 0
+    spike_rate_hz: float = 0.0
+    loop_stimuli: int = 0
+    loop_refused: int = 0
+    loop_suspended: bool = False
     warnings: tuple = ()
 
     @property
@@ -98,6 +109,37 @@ class _EventRing:
             return items
 
 
+class _DrainingLoop:
+    """A PacketLoop that also hands completed waveforms to the controller.
+
+    Everything it adds after `observe` is bounded work on the consumer
+    thread: one list splice per packet, against a capped deque.
+    """
+
+    def __init__(self, loop, on_packet):
+        self._inner = loop
+        self._on_packet = on_packet
+
+    @property
+    def loop(self):
+        return self._inner.loop
+
+    @property
+    def channels(self):
+        return self._inner.channels
+
+    def observe(self, packet):
+        decision = self._inner.observe(packet)
+        self._on_packet()
+        return decision
+
+    def warnings(self):
+        return self._inner.warnings()
+
+    def summary(self):
+        return self._inner.summary()
+
+
 class SessionController:
     """Runs a recording on a worker thread and mediates between it and a UI.
 
@@ -112,6 +154,8 @@ class SessionController:
 
         self.stim_queue = stim_queue if stim_queue is not None else StimulationQueue()
         self._events = _EventRing(capacity=event_capacity)
+        self._waveforms = deque()
+        self._waveforms_dropped = 0
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -120,6 +164,7 @@ class SessionController:
         self._factory = None
         self._clock = None
         self._monitor = None
+        self._loop = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -143,6 +188,8 @@ class SessionController:
         self._factory = factory
         self._stop.clear()
         self._events.drain()
+        self._waveforms.clear()
+        self._waveforms_dropped = 0
         self._started_at = time.perf_counter()
         with self._lock:
             self._state = SessionSnapshot(
@@ -185,6 +232,18 @@ class SessionController:
             # Built by the factory, because only it knows the acquisition
             # parameters and the array geometry.
             self._monitor = factory.make_monitor()
+            # Optional, and built by the factory because only it knows the
+            # acquisition parameters. None when the operator has not asked
+            # for detection - in which case nothing extra runs on the
+            # acquisition thread at all.
+            self._loop = factory.make_loop()
+            if self._loop is not None:
+                # Waveforms are drained on the consumer thread, right after
+                # the loop has seen the packet, so a sort can be run at any
+                # moment without re-reading the recording. Wrapping rather
+                # than editing PacketLoop keeps biocam.loop unaware that a UI
+                # is watching.
+                self._loop = _DrainingLoop(self._loop, self._drain_waveforms)
             with factory.make_writer(listener=self._events.put) as writer:
                 source = factory.make_source()
                 # start_source is INSIDE the try whose finally stops it.
@@ -205,6 +264,7 @@ class SessionController:
                         stop_source=factory.stop_source(source),
                         clock=clock,
                         monitor=self._monitor,
+                        loop=self._loop,
                         service=lambda: self.stim_queue.service(factory.send),
                     )
                 finally:
@@ -251,6 +311,24 @@ class SessionController:
 
     # -- for the UI thread -----------------------------------------------
 
+    def spikes_with_waveforms(self) -> list:
+        """Every spike whose shape has been collected. UI thread only.
+
+        Drained from the detector as the recording runs and kept here, so a
+        sort can be run at any point without re-reading the recording. The
+        list is capped: sorting needs a sample of waveforms, not all of them,
+        and a long session on a busy culture would otherwise grow without
+        limit on the one machine that also has to keep drawing.
+        """
+        return list(self._waveforms)
+
+    def watched_channels(self) -> list:
+        """The electrode numbers detection is watching, in detector order."""
+        loop = self._loop
+        if loop is None:
+            return []
+        return [int(c) for c in loop.channels]
+
     def activity(self):
         """The latest picture of the array, or None. UI thread only."""
         monitor = self._monitor
@@ -277,7 +355,8 @@ class SessionController:
             state = self._state
         if not state.running:
             return self._replace_on(state, events_dropped=self._events.dropped,
-                                    **self._stim_counts())
+                                    **self._stim_counts(),
+                                    **self._loop_counts())
         started = self._started_at
         return self._replace_on(
             state,
@@ -285,6 +364,7 @@ class SessionController:
             events_dropped=self._events.dropped,
             **self._live_progress(),
             **self._stim_counts(),
+            **self._loop_counts(),
         )
 
     def request_stimulus(self, plan, pattern, *, label: str = "") -> bool:
@@ -314,6 +394,37 @@ class SessionController:
             "frames_missing": reading.frames_lost,
         }
 
+    def _drain_waveforms(self) -> None:
+        """Move completed waveforms out of the detector. Consumer thread.
+
+        Called from the packet loop via the factory's loop hook, so it must
+        stay cheap and must not grow: past the cap, new waveforms replace the
+        oldest rather than accumulating. A sort wants a representative sample,
+        and the recording on disk remains the complete record either way.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        for spike in loop.loop.detector.take_waveforms():
+            if len(self._waveforms) >= MAX_RETAINED_WAVEFORMS:
+                self._waveforms.popleft()
+                self._waveforms_dropped += 1
+            self._waveforms.append(spike)
+
+    def _loop_counts(self) -> dict:
+        loop = self._loop
+        if loop is None:
+            return {}
+        inner = loop.loop
+        elapsed = max(inner.detector._frames_seen, 1) / inner.detector.frame_rate_hz
+        return {
+            "spikes_detected": inner.spikes_seen,
+            "spike_rate_hz": inner.spikes_seen / elapsed,
+            "loop_stimuli": inner.stimuli_sent,
+            "loop_refused": inner.envelope.refused,
+            "loop_suspended": inner.suspended,
+        }
+
     def _stim_counts(self) -> dict:
         queue = self.stim_queue
         return {
@@ -332,6 +443,15 @@ class SessionController:
                 pass
         if self._monitor is not None:
             problems.extend(self._monitor.warnings())
+        if self._loop is not None:
+            problems.extend(self._loop.warnings())
+        if self._waveforms_dropped:
+            problems.append(
+                f"{self._waveforms_dropped} spike waveform(s) were dropped to "
+                f"keep the sorting sample at {MAX_RETAINED_WAVEFORMS}. Sorting "
+                "used a sample rather than everything; the recording on disk "
+                "is unaffected and holds every spike."
+            )
         problems.extend(self.stim_queue.warnings())
         if self._events.dropped:
             problems.append(

@@ -20,6 +20,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class _LoopPlan:
+    """What a simulated closed-loop stimulus records as its pulse.
+
+    A stand-in, and labelled as one: in simulation nothing is delivered, so
+    there is no real pulse to describe. Every such record is marked
+    `simulated` in the log, so it cannot be mistaken for a delivery.
+    """
+
+    net_charge_pc: float = 0.0
+
+    def describe(self) -> str:
+        return "closed-loop stimulus (simulated - nothing was delivered)"
+
+
+@dataclass(frozen=True)
+class _LoopPattern:
+    positive: tuple = ()
+    negative: tuple = ()
+
+
 @dataclass
 class ReplayFactory:
     """Drives a session from a `.raw` file, or from synthetic packets.
@@ -38,6 +59,19 @@ class ReplayFactory:
     frames_per_packet: int = 200
     drop_packets: tuple = ()
     name: str = "replay (no instrument)"
+    # Detection and the closed loop. No channels means both are off, and
+    # nothing extra runs on the acquisition thread at all - which is the
+    # right default, since detection is affordable on a handful of channels
+    # and unaffordable across the array.
+    detect_channels: tuple = ()
+    threshold_sigmas: float = 5.0
+    collect_waveforms: bool = True
+    close_the_loop: bool = False
+    policy_name: str = "echo"
+    target_rate_hz: float = 1.0
+    min_interval_ms: float = 20.0
+    max_rate_hz: float = 10.0
+
     log: object = None
     pace_hz: float = None
     n_rows: int = 64
@@ -63,6 +97,49 @@ class ReplayFactory:
         from biocam.data.clock import AcquisitionClock
 
         return AcquisitionClock(self.params.frame_rate_hz)
+
+    def make_loop(self):
+        """Build the closed-loop runner, or None if detection is off.
+
+        The detector watches only `detect_channels`. That is not a UI
+        convenience: detection over the whole array costs about three times
+        one core, and this runs on the thread that drains the packet queue.
+        """
+        if not self.detect_channels:
+            return None
+        from biocam.analysis.spikes import SpikeDetector
+        from biocam.loop import (
+            ClosedLoop, EchoPolicy, PacketLoop, RatePolicy, SafetyEnvelope,
+        )
+
+        rate = self.params.frame_rate_hz
+        detector = SpikeDetector(
+            len(self.detect_channels), rate,
+            threshold_sigmas=self.threshold_sigmas,
+            collect_waveforms=self.collect_waveforms,
+        )
+        if self.policy_name == "rate":
+            policy = RatePolicy(rate, target_hz=self.target_rate_hz)
+        else:
+            policy = EchoPolicy()
+        envelope = SafetyEnvelope(
+            rate,
+            min_interval_ms=self.min_interval_ms,
+            max_rate_hz=self.max_rate_hz,
+        )
+        loop = ClosedLoop(
+            detector, policy, envelope,
+            send=self.send_loop_stimulus if self.close_the_loop else None,
+        )
+        # Paid here, before acquisition, rather than on the first packet -
+        # see ClosedLoop.warm_up. Ten milliseconds there is about five
+        # dropped packets at the start of every recording.
+        loop.warm_up()
+        return PacketLoop(loop, self.params, self.detect_channels)
+
+    def send_loop_stimulus(self, trigger):
+        """A simulated closed-loop stimulus: recorded, never delivered."""
+        self.log.immediate(_LoopPlan(), _LoopPattern(), simulated=True)
 
     def make_monitor(self):
         from biocam.data.monitor import LiveMonitor
@@ -165,8 +242,22 @@ class LiveFactory:
     log: object = None
     listener: object = None
     warn: object = None
+    loop_plan: object = None
+    loop_pattern: object = None
     n_rows: int = 64
     n_cols: int = 64
+    # Detection and the closed loop. No channels means both are off, and
+    # nothing extra runs on the acquisition thread at all - which is the
+    # right default, since detection is affordable on a handful of channels
+    # and unaffordable across the array.
+    detect_channels: tuple = ()
+    threshold_sigmas: float = 5.0
+    collect_waveforms: bool = True
+    close_the_loop: bool = False
+    policy_name: str = "echo"
+    target_rate_hz: float = 1.0
+    min_interval_ms: float = 20.0
+    max_rate_hz: float = 10.0
     _params: object = field(default=None, init=False)
 
     def __post_init__(self):
@@ -219,6 +310,61 @@ class LiveFactory:
         return AcquisitionClock(
             self.params.frame_rate_hz, cycles_per_us=cycles_per_us
         )
+
+    def make_loop(self):
+        """Build the closed-loop runner, or None if detection is off.
+
+        The detector watches only `detect_channels`. That is not a UI
+        convenience: detection over the whole array costs about three times
+        one core, and this runs on the thread that drains the packet queue.
+        """
+        if not self.detect_channels:
+            return None
+        from biocam.analysis.spikes import SpikeDetector
+        from biocam.loop import (
+            ClosedLoop, EchoPolicy, PacketLoop, RatePolicy, SafetyEnvelope,
+        )
+
+        rate = self.params.frame_rate_hz
+        detector = SpikeDetector(
+            len(self.detect_channels), rate,
+            threshold_sigmas=self.threshold_sigmas,
+            collect_waveforms=self.collect_waveforms,
+        )
+        if self.policy_name == "rate":
+            policy = RatePolicy(rate, target_hz=self.target_rate_hz)
+        else:
+            policy = EchoPolicy()
+        envelope = SafetyEnvelope(
+            rate,
+            min_interval_ms=self.min_interval_ms,
+            max_rate_hz=self.max_rate_hz,
+        )
+        loop = ClosedLoop(
+            detector, policy, envelope,
+            send=self.send_loop_stimulus if self.close_the_loop else None,
+        )
+        # Paid here, before acquisition, rather than on the first packet -
+        # see ClosedLoop.warm_up. Ten milliseconds there is about five
+        # dropped packets at the start of every recording.
+        loop.warm_up()
+        return PacketLoop(loop, self.params, self.detect_channels)
+
+    def send_loop_stimulus(self, trigger):
+        """Deliver a closed-loop stimulus. Runs on the acquisition thread.
+
+        Raising here is caught and counted by ClosedLoop, which reports it
+        rather than stopping the recording. The plan and pattern are fixed
+        for the session: re-planning per spike would put pulse arithmetic on
+        the latency path for no benefit, since the loop decides *whether* to
+        stimulate, not *what with*.
+        """
+        if self.stimulator is None or self.loop_plan is None:
+            raise RuntimeError(
+                "the closed loop has no stimulus to send: either the "
+                "stimulator is unavailable or no pulse was configured"
+            )
+        self.stimulator.send_now(self.loop_plan, self.loop_pattern)
 
     def make_monitor(self):
         from biocam.data.monitor import LiveMonitor

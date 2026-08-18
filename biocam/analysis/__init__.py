@@ -23,6 +23,7 @@ from biocam.analysis.sorting import (
     Sorter,
     TemplateSorter,
     make_sorter,
+    sort_by_channel,
     suggest_n_units,
 )
 from biocam.analysis.spikes import (
@@ -50,5 +51,6 @@ __all__ = [
     "PCAKMeansSorter",
     "TemplateSorter",
     "make_sorter",
+    "sort_by_channel",
     "suggest_n_units",
 ]

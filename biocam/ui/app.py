@@ -135,9 +135,10 @@ class BioCamWindow:
 
         body = ttk.Frame(self.root, padding=8)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, minsize=270)
+        body.columnconfigure(0, minsize=260)
         body.columnconfigure(1, weight=1)
-        body.columnconfigure(2, minsize=250)
+        body.columnconfigure(2, minsize=240)
+        body.columnconfigure(3, minsize=280)
         body.rowconfigure(1, weight=1)
 
         self._build_recording(ttk.LabelFrame(body, text="Recording", padding=8))
@@ -145,6 +146,8 @@ class BioCamWindow:
             ttk.LabelFrame(body, text="Electrode array", padding=6))
         self._build_stimulation(
             ttk.LabelFrame(body, text="Stimulus", padding=8))
+        self._build_analysis(
+            ttk.LabelFrame(body, text="Spikes and closed loop", padding=8))
         self._build_log(ttk.LabelFrame(body, text="Session log", padding=6))
 
     def _build_recording(self, frame):
@@ -258,6 +261,8 @@ class BioCamWindow:
         finally:
             self._syncing = False
         self._refresh_stim_validity()
+        if hasattr(self, "lbl_analysis"):
+            self._refresh_analysis()
 
     def _on_array_hover(self, found):
         if found is None:
@@ -335,9 +340,203 @@ class BioCamWindow:
                                  font=("Segoe UI", 9))
         self.lbl_stim.grid(row=row, column=0, columnspan=2, sticky="w")
 
+    def _build_analysis(self, frame):
+        """Detection, sorting and the closed loop - the things that were
+        built and then had no switch.
+
+        The channels come from the array: whatever is selected for
+        stimulation is what gets watched, because those are the electrodes
+        the experiment is about. That keeps the watched set small, which is
+        not a UI convenience - detection over the whole array costs about
+        three times a core, and this runs on the thread that drains the
+        packet queue.
+        """
+        tk, ttk = self.tk, self.ttk
+        from biocam.analysis.sorting import SORTER_LABELS
+
+        frame.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
+
+        self.var_detect = tk.BooleanVar(value=False)
+        self.var_sigmas = tk.StringVar(value="5")
+        self.var_sort = tk.StringVar(value="(none)")
+        self.var_units = tk.StringVar(value="2")
+        self.var_loop = tk.BooleanVar(value=False)
+        self.var_policy = tk.StringVar(value="echo")
+        self.var_min_interval = tk.StringVar(value="20")
+        self.var_max_rate = tk.StringVar(value="10")
+
+        row = 0
+        ttk.Checkbutton(
+            frame, text="Detect spikes on the selected electrodes",
+            variable=self.var_detect, command=self._refresh_analysis,
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Label(frame, text="Threshold (sigmas)").grid(
+            row=row, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_sigmas, width=8).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        ttk.Label(frame, text="Sorting technique").grid(
+            row=row, column=0, sticky="w")
+        # The techniques, by their own labels. "(none)" first, because
+        # detection without sorting is a complete and often sufficient answer.
+        self.sort_choices = ["(none)"] + list(SORTER_LABELS)
+        combo = ttk.Combobox(
+            frame, textvariable=self.var_sort, width=14, state="readonly",
+            values=[
+                "(none)" if name == "(none)" else SORTER_LABELS[name]
+                for name in self.sort_choices
+            ],
+        )
+        combo.grid(row=row, column=1, sticky="w", pady=2)
+        combo.bind("<<ComboboxSelected>>", lambda _: self._refresh_analysis())
+        self.sort_combo = combo
+        row += 1
+        ttk.Label(frame, text="Units per electrode").grid(
+            row=row, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_units, width=8).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+        self.btn_sort = ttk.Button(
+            frame, text="Sort spikes so far", command=self._on_sort,
+            state="disabled")
+        self.btn_sort.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+        row += 1
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        ttk.Checkbutton(
+            frame, text="Close the loop (stimulate on a spike)",
+            variable=self.var_loop, command=self._refresh_analysis,
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Label(frame, text="Policy").grid(row=row, column=0, sticky="w")
+        policy = ttk.Combobox(frame, textvariable=self.var_policy, width=14,
+                              state="readonly", values=["echo", "rate"])
+        policy.grid(row=row, column=1, sticky="w", pady=2)
+        row += 1
+        ttk.Label(frame, text="Min interval (ms)").grid(
+            row=row, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_min_interval, width=8).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+        ttk.Label(frame, text="Max rate (Hz)").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_max_rate, width=8).grid(
+            row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+        self.lbl_analysis = tk.Label(
+            frame, text="", anchor="w", justify="left", wraplength=270,
+            font=("Segoe UI", 9), fg=COLOURS["idle"])
+        self.lbl_analysis.grid(row=row, column=0, columnspan=2, sticky="ew",
+                               pady=(8, 0))
+        self._refresh_analysis()
+
+    @property
+    def sort_technique(self):
+        """The selected technique's internal name, or None."""
+        label = self.var_sort.get()
+        if label in ("", "(none)"):
+            return None
+        from biocam.analysis.sorting import SORTER_LABELS
+
+        for name, text in SORTER_LABELS.items():
+            if text == label or name == label:
+                return name
+        return None
+
+    def _refresh_analysis(self, *_):
+        """Say what will happen, and what will not, before anything runs."""
+        lines = []
+        selected = len(self.array.positive) + len(self.array.negative)
+        if self.var_detect.get():
+            if not selected:
+                lines.append(
+                    "No electrodes selected. Detection watches the electrodes "
+                    "chosen on the array - click some.")
+            else:
+                lines.append(
+                    f"Detecting on {selected} electrode(s) at "
+                    f"{self.var_sigmas.get()} sigma.")
+        else:
+            lines.append("Detection off.")
+
+        technique = self.sort_technique
+        if technique:
+            lines.append(
+                f"Sorting: {technique}, {self.var_units.get()} units per "
+                "electrode. Sorting happens per electrode - a unit is a "
+                "neuron as heard by one site.")
+        if self.var_loop.get():
+            if not self.var_detect.get():
+                lines.append(
+                    "The closed loop needs detection on: it triggers on "
+                    "spikes.")
+            elif self.live:
+                lines.append(
+                    f"LOOP ARMED: {self.var_policy.get()} policy, at most one "
+                    f"stimulus per {self.var_min_interval.get()} ms and "
+                    f"{self.var_max_rate.get()} Hz sustained. The limits are "
+                    "enforced after the policy decides and cannot be "
+                    "overridden by it.")
+            else:
+                lines.append(
+                    f"Loop armed ({self.var_policy.get()}), but this is "
+                    "simulation - decisions are made and logged, and nothing "
+                    "is delivered anywhere.")
+
+        if self.controller.running:
+            lines.append("Settings apply to the NEXT recording.")
+        self.lbl_analysis.configure(text="\n\n".join(lines))
+        self.btn_sort.configure(
+            state="normal" if (technique and self._sortable()) else "disabled")
+
+    def _sortable(self) -> bool:
+        return bool(self.controller.spikes_with_waveforms())
+
+    def _on_sort(self):
+        from biocam.analysis.sorting import sort_by_channel
+
+        technique = self.sort_technique
+        spikes = self.controller.spikes_with_waveforms()
+        if not technique or not spikes:
+            return
+        try:
+            units = int(self.var_units.get())
+        except ValueError:
+            self._log("Units per electrode must be a whole number.", "bad")
+            return
+        try:
+            sorters = sort_by_channel(spikes, technique=technique,
+                                      n_units=units)
+        except ValueError as exc:
+            self._log(f"Sorting failed: {exc}", "bad")
+            return
+        if not sorters:
+            self._log(
+                f"No electrode had enough spikes to sort ({len(spikes)} in "
+                "total). An under-fitted sorter is worse than none, because "
+                "it still returns labels.", "warn")
+            return
+
+        watched = self.controller.watched_channels()
+        self._log(f"Sorted {len(sorters)} electrode(s) with {technique}:", "ok")
+        for index, sorter in sorted(sorters.items()):
+            name = watched[index] if index < len(watched) else index
+            self._log(f"   electrode {name}: {sorter.describe()}")
+            for warning in sorter.warnings():
+                self._log(f"      {warning}", "warn")
+
     def _build_log(self, frame):
         tk = self.tk
-        frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+        frame.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -531,6 +730,7 @@ class BioCamWindow:
             raw_path=self.replay_source, params=self.replay_params,
             output_path=output, duration_sec=duration,
             frames_per_packet=200, pace_hz=50.0,
+            **self._analysis_settings(),
         )
 
     def _ensure_live_instrument(self):
@@ -594,18 +794,55 @@ class BioCamWindow:
             raise
         self._live_stack = stack
 
+    def _analysis_settings(self) -> dict:
+        """Detection and loop settings, from the panel and the array.
+
+        The watched channels come from the array selection: the electrodes
+        chosen for stimulation are the ones the experiment is about, and
+        keeping the set small is a requirement rather than a preference -
+        detection over the whole array is unaffordable on the thread that
+        drains the packet queue.
+        """
+        from biocam.ui.arrayview import channel_index
+
+        if not self.var_detect.get():
+            return {}
+        chosen = list(self.array.positive) + list(self.array.negative)
+        channels = sorted({channel_index(row, col, self.n_cols)
+                           for row, col in chosen})
+        if not channels:
+            return {}
+        return {
+            "detect_channels": tuple(channels),
+            "threshold_sigmas": _as_float(self.var_sigmas, 5.0),
+            "collect_waveforms": self.sort_technique is not None,
+            "close_the_loop": bool(self.var_loop.get()),
+            "policy_name": self.var_policy.get(),
+            "min_interval_ms": _as_float(self.var_min_interval, 20.0),
+            "max_rate_hz": _as_float(self.var_max_rate, 10.0),
+        }
+
     def _make_live_factory(self, output, duration):
         # Imported here, never at module scope: this module must stay
         # importable on a machine with no 3Brain DLLs.
         from biocam.ui.factories import LiveFactory
 
         self._ensure_live_instrument()
+        plan = pattern = None
+        if self.var_loop.get():
+            try:
+                plan, pattern = self._build_stimulus()
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                self._log(f"The closed loop has no valid stimulus: {exc}. "
+                          "It will detect but not stimulate.", "warn")
         return LiveFactory(
             output_path=output, duration_sec=duration,
             device=self._device, stimulator=self._stimulator,
             log=self._stimulator.log if self._stimulator else None,
             listener=self.controller.listener,
             warn=self._warn_from_any_thread,
+            loop_plan=plan, loop_pattern=pattern,
+            **self._analysis_settings(),
         )
 
     def _warn_from_any_thread(self, message):
@@ -854,6 +1091,18 @@ def main(argv=None) -> int:
     BioCamWindow(root, live=args.live, output_dir=args.output_dir,
                  replay_source=args.replay, params=params).run()
     return 0
+
+
+def _as_float(variable, fallback: float) -> float:
+    """Read a Tk entry as a number, falling back rather than raising.
+
+    A half-typed field must not stop a recording from starting; the panel
+    already shows what will be used.
+    """
+    try:
+        return float(variable.get())
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _params_from_meta(meta_path):
