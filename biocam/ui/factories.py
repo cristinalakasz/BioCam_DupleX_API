@@ -139,9 +139,20 @@ class ReplayFactory:
             send=self.send_loop_stimulus if self.close_the_loop else None,
         )
         # Paid here, before acquisition, rather than on the first packet -
-        # see ClosedLoop.warm_up. Ten milliseconds there is about five
-        # dropped packets at the start of every recording.
+        # see ClosedLoop.warm_up. Measured at 18-25 ms without it, which at a
+        # 1 ms packet period is 18-25 dropped packets at the start of every
+        # closed-loop recording.
         loop.warm_up()
+        # And the logging a real send performs, which ClosedLoop.warm_up
+        # cannot reach: it swaps `send` for a sentinel precisely so nothing is
+        # delivered. Only possible when there is a stimulus to warm with. The
+        # driver call itself stays cold - see issue #39.
+        plan = getattr(self, "loop_plan", None)
+        if self.close_the_loop and plan is not None and self.log is not None:
+            try:
+                self.log.warm_up(plan, getattr(self, "loop_pattern", None))
+            except Exception:  # noqa: BLE001 - never at a session's cost
+                pass
         return PacketLoop(loop, self.params, self.detect_channels)
 
     def send_loop_stimulus(self, trigger):
@@ -374,9 +385,20 @@ class LiveFactory:
             send=self.send_loop_stimulus if self.close_the_loop else None,
         )
         # Paid here, before acquisition, rather than on the first packet -
-        # see ClosedLoop.warm_up. Ten milliseconds there is about five
-        # dropped packets at the start of every recording.
+        # see ClosedLoop.warm_up. Measured at 18-25 ms without it, which at a
+        # 1 ms packet period is 18-25 dropped packets at the start of every
+        # closed-loop recording.
         loop.warm_up()
+        # And the logging a real send performs, which ClosedLoop.warm_up
+        # cannot reach: it swaps `send` for a sentinel precisely so nothing is
+        # delivered. Only possible when there is a stimulus to warm with. The
+        # driver call itself stays cold - see issue #39.
+        plan = getattr(self, "loop_plan", None)
+        if self.close_the_loop and plan is not None and self.log is not None:
+            try:
+                self.log.warm_up(plan, getattr(self, "loop_pattern", None))
+            except Exception:  # noqa: BLE001 - never at a session's cost
+                pass
         return PacketLoop(loop, self.params, self.detect_channels)
 
     def send_loop_stimulus(self, trigger):

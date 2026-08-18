@@ -121,12 +121,18 @@ not buy the ~10 ms the review implied. Both are worth knowing.
 
 ### What warm-up does not cover
 
-`send` is swapped out for the duration, so **the send path is not warmed**.
-On the instrument that path is a `StimulusLog` write and pythonnet marshalling
-into the driver — plausibly the most expensive first touch on this whole
-sequence — and it is still paid on the acquisition thread at the moment the
-loop first decides to fire. Expect the *first delivered stimulus* of a session
-to be slower than every one after it, and report how much.
+`send` is replaced by a **sentinel** for the duration, so everything around
+the call is warmed — the branch, the sent-stimulus `Decision`, the guard — but
+the real `send` is never invoked, because invoking it would deliver a stimulus.
+
+The Python side of that real send is warmed separately: `StimulusLog.warm_up()`
+runs a record through a throwaway log before acquisition starts. Measured, that
+cuts the first log write from **108 µs to 47 µs**, against 34 µs steady state.
+
+**What is still cold is the driver call itself** — pythonnet marshalling into
+`Send`. Nothing off the instrument can warm it. Expect the *first delivered
+stimulus* of a session to be slower than every one after it, and report by how
+much (issue #39).
 
 ---
 

@@ -159,6 +159,31 @@ class StimulusLog:
             self.records_truncated += 1
         return record
 
+    def warm_up(self, plan, pattern) -> float:
+        """Run one record through and throw it away. Returns the cost in us.
+
+        The closed loop's own warm-up cannot cover this: it replaces `send`
+        with a sentinel, precisely so that nothing is delivered, which means
+        the logging that a real `send` performs is never touched. The first
+        stimulus of a session therefore pays for `_describe`'s first walk over
+        a plan and a pattern, dataclass construction, and every import behind
+        them - on the acquisition thread, at the moment the loop first decides
+        to fire.
+
+        This is paid here instead, into a throwaway log. It does **not** cover
+        the driver call itself; nothing off the instrument can (issue #39).
+        """
+        import time as _time
+
+        scratch = StimulusLog()
+        started = _time.perf_counter()
+        try:
+            scratch.immediate(plan, pattern)
+            scratch.failure("immediate", "warm-up", plan=plan, pattern=pattern)
+        except Exception:  # noqa: BLE001 - a warm-up is never worth a session
+            pass
+        return (_time.perf_counter() - started) * 1e6
+
     def immediate(
         self, plan, pattern, *, clock_reading=None, latency_cycles=None,
         simulated: bool = False,

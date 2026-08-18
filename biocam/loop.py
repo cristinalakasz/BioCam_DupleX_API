@@ -414,15 +414,18 @@ class ClosedLoop:
         estimator rather than assumed, and a synthetic excursion is injected
         so a crossing, a delivery and a refusal all execute here.
 
-        **The send path is not warmed.** `send` is swapped out for the
-        duration, so nothing is delivered - which means the first real
-        stimulus still pays the first-touch cost of whatever `send` does, and
-        on the instrument that is a `StimulusLog` write and pythonnet
-        marshalling into the driver. That is plausibly the most expensive
-        first touch on this whole path, and it lands on the acquisition thread
-        at the moment the loop first decides to fire. Said plainly here
-        because a colleague reading this 600 km away would otherwise take
-        "warmed" for coverage it does not have.
+        **The delivery path is warmed; the driver call is not.** `send` is
+        replaced by a sentinel, so everything around the call runs - the
+        branch, the sent-stimulus `Decision`, the guard - but the real `send`
+        is never invoked, because invoking it would deliver a stimulus. On the
+        instrument the real one is a `StimulusLog` write and pythonnet
+        marshalling into the driver, and **that** cost is still paid on the
+        first stimulus of a session. `StimulusLog.warm_up()` covers the
+        log; nothing here can cover the marshalling without the instrument.
+        Said plainly because a colleague reading this 600 km away would
+        otherwise take "warmed" for coverage it does not have - expect the
+        first delivered stimulus to be slower than every one after it, and
+        report by how much (issue #39).
 
         Everything else is undone afterwards: the detector, the policy and the
         envelope are reset, so the synthetic blocks leave nothing behind. A
@@ -457,7 +460,20 @@ class ClosedLoop:
                            max(8, int(needed // block_frames) + 2))
 
         rng = np.random.default_rng(0)
-        send, self.send = self.send, None      # nothing goes out during this
+        # A sentinel rather than None. With None, `_process` takes its
+        # "no send configured" branch and the delivery half of the loop -
+        # the `if self.send is not None` test, the sent-stimulus `Decision`,
+        # the try/except around the call - is never touched, so it pays its
+        # first cost on the first real stimulus. The sentinel exercises all of
+        # that while guaranteeing nothing leaves the machine.
+        sent_here = []
+        send, self.send = self.send, sent_here.append
+        # Recorded, because "the delivery branch was warmed" is otherwise not
+        # observable from outside: with `send = None` the loop still records
+        # the envelope, counts the stimulus and returns Decision(True), so a
+        # test asserting on the decision cannot tell a warmed send path from a
+        # skipped one. This counter is the difference.
+        self.warm_up_deliveries = 0
         channels = self.detector.n_channels
         try:
             for i in range(n_blocks):
@@ -472,6 +488,7 @@ class ClosedLoop:
                 self.process(block)
         finally:
             self.send = send
+            self.warm_up_deliveries = len(sent_here)
 
         cost = self.max_decision_us
         # Everything the warm-up did is undone - except a suspension, which is
