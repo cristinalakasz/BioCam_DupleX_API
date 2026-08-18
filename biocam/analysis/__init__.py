@@ -1,6 +1,6 @@
 """Layer 3 - signal processing.
 
-Spike detection, and later spike sorting and closed-loop decision logic.
+Spike detection, spike sorting, and the decision logic a closed loop needs.
 Fully testable here, and tested against the real recordings in
 tests/fixtures/ as well as against synthetic signal with known answers.
 
@@ -15,6 +15,16 @@ not.
 """
 
 from biocam.analysis.filters import Biquad, HighPass, highpass_coefficients
+from biocam.analysis.sorting import (
+    SORTER_LABELS,
+    SORTERS,
+    AmplitudeSorter,
+    PCAKMeansSorter,
+    Sorter,
+    TemplateSorter,
+    make_sorter,
+    suggest_n_units,
+)
 from biocam.analysis.spikes import (
     NoiseEstimator,
     Spike,
@@ -23,11 +33,22 @@ from biocam.analysis.spikes import (
 )
 
 __all__ = [
+    # filtering
     "Biquad",
     "HighPass",
     "highpass_coefficients",
+    # detection
     "NoiseEstimator",
     "Spike",
     "SpikeDetector",
     "detect_all",
+    # sorting
+    "SORTERS",
+    "SORTER_LABELS",
+    "Sorter",
+    "AmplitudeSorter",
+    "PCAKMeansSorter",
+    "TemplateSorter",
+    "make_sorter",
+    "suggest_n_units",
 ]
