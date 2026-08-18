@@ -114,6 +114,28 @@ def _run_monitor(monitor, packet, writer):
     return monitor
 
 
+def _run_loop(loop, packet, writer):
+    """Run one closed-loop decision. Returns the loop, or None if it failed.
+
+    `PacketLoop.observe` already refuses to raise, so this is the second
+    guard rather than the first - and the second is the one that matters:
+    an exception escaping the packet loop skips the backlog drain and
+    `finalise()` and stamps an intact raw file `failed`. No experiment is
+    worth losing a recording to.
+    """
+    try:
+        loop.observe(packet)
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the loop
+        writer.emit(StimulationSuspended(
+            reason=f"the closed loop failed ({exc}) and has been "
+                   "disconnected for the rest of this recording; no further "
+                   "stimuli will be delivered by it",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return loop
+
+
 def _run_service(service, writer):
     """Run the between-packets hook once. Returns it, or None if it failed.
 
@@ -153,7 +175,7 @@ class SessionResult:
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
                    stop_source=None, clock=None, service=None,
-                   monitor=None) -> SessionResult:
+                   monitor=None, loop=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -314,6 +336,14 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 # never worth a recording, so a failure drops the monitor and
                 # the packets keep being written.
                 monitor = _run_monitor(monitor, packet, writer)
+            if loop is not None:
+                # The closed loop: detect, decide, stimulate, all on this
+                # thread and between packets - the arrangement 3Brain's own
+                # sample uses, and the only one that reaches the ~1.5 ms the
+                # hardware allows. Guarded like the clock and the monitor: a
+                # loop that has broken must stop being a loop, not stop the
+                # recording.
+                loop = _run_loop(loop, packet, writer)
             if service is not None:
                 # Stimulation runs here, on the consumer thread, between
                 # packets - the arrangement 3Brain's own sample uses
