@@ -63,6 +63,23 @@ machine** — they establish shape and order of magnitude, not the lab's answer.
 every width; the tail does not. At 32 channels the p99 alone consumes the whole
 1 ms budget before the disk write is counted.
 
+### The trace strip
+
+Drawing traces for selected electrodes costs, per packet:
+
+| frames/packet | 1 channel | 4 channels | 8 channels | share of budget |
+|---|---|---|---|---|
+| 19 (1 ms) | 32 µs | 52 µs | 56 µs | 3–6% |
+| 37 (2 ms) | 39 µs | 71 µs | 58 µs | 2–4% |
+| 186 (10 ms) | 50 µs | 74 µs | 85 µs | <1% |
+
+Cheap enough to leave on. It is capped at eight electrodes — past that the
+lanes are unreadable anyway, and the cap is enforced rather than trusted.
+
+Unlike the activity display, traces are **not** decimated in time: every
+packet is folded in, because a trace with gaps lies about what the electrode
+did. What bounds the cost is the channel count.
+
 ### Recommendation
 
 - **1–4 watched channels at 1 ms** — plausible, not demonstrated. See §4.
@@ -104,12 +121,18 @@ not buy the ~10 ms the review implied. Both are worth knowing.
 
 ### What warm-up does not cover
 
-`send` is swapped out for the duration, so **the send path is not warmed**.
-On the instrument that path is a `StimulusLog` write and pythonnet marshalling
-into the driver — plausibly the most expensive first touch on this whole
-sequence — and it is still paid on the acquisition thread at the moment the
-loop first decides to fire. Expect the *first delivered stimulus* of a session
-to be slower than every one after it, and report how much.
+`send` is replaced by a **sentinel** for the duration, so everything around
+the call is warmed — the branch, the sent-stimulus `Decision`, the guard — but
+the real `send` is never invoked, because invoking it would deliver a stimulus.
+
+The Python side of that real send is warmed separately: `StimulusLog.warm_up()`
+runs a record through a throwaway log before acquisition starts. Measured, that
+cuts the first log write from **108 µs to 47 µs**, against 34 µs steady state.
+
+**What is still cold is the driver call itself** — pythonnet marshalling into
+`Send`. Nothing off the instrument can warm it. Expect the *first delivered
+stimulus* of a session to be slower than every one after it, and report by how
+much (issue #39).
 
 ---
 

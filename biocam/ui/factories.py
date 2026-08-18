@@ -75,6 +75,9 @@ class ReplayFactory:
     target_rate_hz: float = 1.0
     min_interval_ms: float = 20.0
     max_rate_hz: float = 10.0
+    # Electrodes whose signal is drawn as a rolling trace. Empty means the
+    # trace panel does no work at all on the acquisition thread.
+    trace_channels: tuple = ()
 
     log: object = None
     pace_hz: float = None
@@ -136,9 +139,20 @@ class ReplayFactory:
             send=self.send_loop_stimulus if self.close_the_loop else None,
         )
         # Paid here, before acquisition, rather than on the first packet -
-        # see ClosedLoop.warm_up. Ten milliseconds there is about five
-        # dropped packets at the start of every recording.
+        # see ClosedLoop.warm_up. Measured at 18-25 ms without it, which at a
+        # 1 ms packet period is 18-25 dropped packets at the start of every
+        # closed-loop recording.
         loop.warm_up()
+        # And the logging a real send performs, which ClosedLoop.warm_up
+        # cannot reach: it swaps `send` for a sentinel precisely so nothing is
+        # delivered. Only possible when there is a stimulus to warm with. The
+        # driver call itself stays cold - see issue #39.
+        plan = getattr(self, "loop_plan", None)
+        if self.close_the_loop and plan is not None and self.log is not None:
+            try:
+                self.log.warm_up(plan, getattr(self, "loop_pattern", None))
+            except Exception:  # noqa: BLE001 - never at a session's cost
+                pass
         return PacketLoop(loop, self.params, self.detect_channels)
 
     def send_loop_stimulus(self, trigger):
@@ -149,6 +163,21 @@ class ReplayFactory:
         from biocam.data.monitor import LiveMonitor
 
         return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
+
+    def make_traces(self):
+        """Build the rolling trace window, or None if no electrode is chosen.
+
+        None means nothing extra runs on the acquisition thread. Traces are
+        not decimated in time - a trace with gaps lies about what the
+        electrode did - so what keeps the cost down is watching few channels,
+        which `TraceRecorder` enforces rather than trusts.
+        """
+        if not self.trace_channels:
+            return None
+        from biocam.data.traces import TraceRecorder
+
+        return TraceRecorder(self.params, self.trace_channels)
+
 
     def make_writer(self, listener=None):
         from biocam.data.recording import RecordingWriter
@@ -266,6 +295,9 @@ class LiveFactory:
     target_rate_hz: float = 1.0
     min_interval_ms: float = 20.0
     max_rate_hz: float = 10.0
+    # Electrodes whose signal is drawn as a rolling trace. Empty means the
+    # trace panel does no work at all on the acquisition thread.
+    trace_channels: tuple = ()
     _params: object = field(default=None, init=False)
 
     def __post_init__(self):
@@ -353,9 +385,20 @@ class LiveFactory:
             send=self.send_loop_stimulus if self.close_the_loop else None,
         )
         # Paid here, before acquisition, rather than on the first packet -
-        # see ClosedLoop.warm_up. Ten milliseconds there is about five
-        # dropped packets at the start of every recording.
+        # see ClosedLoop.warm_up. Measured at 18-25 ms without it, which at a
+        # 1 ms packet period is 18-25 dropped packets at the start of every
+        # closed-loop recording.
         loop.warm_up()
+        # And the logging a real send performs, which ClosedLoop.warm_up
+        # cannot reach: it swaps `send` for a sentinel precisely so nothing is
+        # delivered. Only possible when there is a stimulus to warm with. The
+        # driver call itself stays cold - see issue #39.
+        plan = getattr(self, "loop_plan", None)
+        if self.close_the_loop and plan is not None and self.log is not None:
+            try:
+                self.log.warm_up(plan, getattr(self, "loop_pattern", None))
+            except Exception:  # noqa: BLE001 - never at a session's cost
+                pass
         return PacketLoop(loop, self.params, self.detect_channels)
 
     def send_loop_stimulus(self, trigger):
@@ -378,6 +421,21 @@ class LiveFactory:
         from biocam.data.monitor import LiveMonitor
 
         return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
+
+    def make_traces(self):
+        """Build the rolling trace window, or None if no electrode is chosen.
+
+        None means nothing extra runs on the acquisition thread. Traces are
+        not decimated in time - a trace with gaps lies about what the
+        electrode did - so what keeps the cost down is watching few channels,
+        which `TraceRecorder` enforces rather than trusts.
+        """
+        if not self.trace_channels:
+            return None
+        from biocam.data.traces import TraceRecorder
+
+        return TraceRecorder(self.params, self.trace_channels)
+
 
     def make_writer(self, listener=None):
         from biocam.data.recording import RecordingWriter

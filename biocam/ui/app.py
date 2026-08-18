@@ -231,6 +231,16 @@ class BioCamWindow:
         )
         self.array.canvas.grid(row=0, column=0, columnspan=3)
 
+        from biocam.ui.traceview import TraceStripView
+
+        # Directly under the array, because the electrodes it draws are the
+        # ones just clicked on it. Two panels apart would make the connection
+        # something the operator has to remember rather than see.
+        self.traces = TraceStripView(
+            frame, tk, width=self.n_cols * self.array.cell, height=200)
+        self.traces.canvas.grid(row=3, column=0, columnspan=3,
+                                sticky="ew", pady=(8, 0))
+
         legend = ttk.Frame(frame)
         legend.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         tk.Label(legend, text="  ", bg=POSITIVE_COLOUR,
@@ -335,6 +345,36 @@ class BioCamWindow:
         self.btn_stim.grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
         row += 1
 
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+        ttk.Label(frame, text="Train", font=("Segoe UI", 9, "bold")).grid(
+            row=row, column=0, sticky="w")
+        row += 1
+
+        self.var_train_count = tk.StringVar(value="10")
+        self.var_train_rate = tk.StringVar(value="10")
+        self.var_train_delay = tk.StringVar(value="100")
+        for label_text, var in (("Pulses", self.var_train_count),
+                                ("Rate (Hz)", self.var_train_rate),
+                                ("Starts in (ms)", self.var_train_delay)):
+            ttk.Label(frame, text=label_text).grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(frame, textvariable=var, width=18)
+            entry.grid(row=row, column=1, sticky="w", pady=2)
+            var.trace_add("write", self._on_train_edited)
+            row += 1
+
+        self.btn_train = ttk.Button(frame, text="Send train",
+                                    command=self._on_train, state="disabled")
+        self.btn_train.grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
+        row += 1
+
+        self.lbl_train = tk.Label(frame, text="", fg=COLOURS["idle"],
+                                  wraplength=320, justify="left",
+                                  font=("Segoe UI", 9))
+        self.lbl_train.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
         self.lbl_stim = tk.Label(frame, text="", fg=COLOURS["idle"],
                                  wraplength=320, justify="left",
                                  font=("Segoe UI", 9))
@@ -357,6 +397,7 @@ class BioCamWindow:
         frame.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
 
         self.var_detect = tk.BooleanVar(value=False)
+        self.var_traces = tk.BooleanVar(value=True)
         self.var_sigmas = tk.StringVar(value="5")
         self.var_sort = tk.StringVar(value="(none)")
         self.var_units = tk.StringVar(value="2")
@@ -369,6 +410,11 @@ class BioCamWindow:
         ttk.Checkbutton(
             frame, text="Detect spikes on the selected electrodes",
             variable=self.var_detect, command=self._refresh_analysis,
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Checkbutton(
+            frame, text="Draw traces for the selected electrodes",
+            variable=self.var_traces, command=self._refresh_analysis,
         ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         ttk.Label(frame, text="Threshold (sigmas)").grid(
@@ -467,6 +513,22 @@ class BioCamWindow:
                     f"{self.var_sigmas.get()} sigma.")
         else:
             lines.append("Detection off.")
+
+        if self.var_traces.get():
+            from biocam.data.traces import MAX_TRACE_CHANNELS
+
+            if not selected:
+                lines.append(
+                    "Traces on, but no electrodes are selected - click some.")
+            elif selected > MAX_TRACE_CHANNELS:
+                lines.append(
+                    f"Traces: the first {MAX_TRACE_CHANNELS} of {selected} "
+                    "selected. A trace is for looking at closely, and this "
+                    "costs time on the thread draining the packet queue.")
+            else:
+                lines.append(
+                    f"Traces: {selected} electrode(s), peak-preserving so a "
+                    "spike cannot fall between samples.")
 
         technique = self.sort_technique
         if technique:
@@ -593,12 +655,9 @@ class BioCamWindow:
     def _build_stimulus(self):
         """Return (plan, pattern), or raise with a message fit for a label."""
         from biocam.stim import (
-            PulseSpec, StimPattern, plan as plan_pulse, validate_pattern,
+            StimPattern, plan as plan_pulse, validate_pattern,
         )
 
-        amplitude = float(self.var_amplitude.get())
-        phase_us = float(self.var_phase.get())
-        gap_us = float(self.var_gap.get())
         pattern = StimPattern(
             positive=self._electrodes(self.var_positive.get()),
             negative=self._electrodes(self.var_negative.get()),
@@ -606,13 +665,25 @@ class BioCamWindow:
         # The same grid the stimulator will use, so the window and the
         # instrument cannot disagree about what is inside the array.
         validate_pattern(pattern, self.grid)
+        return plan_pulse(self._pulse_spec(), self._constraints()), pattern
 
-        constraints = self._constraints()
-        spec = PulseSpec(
-            amplitude1=amplitude, phase1_us=phase_us, inter_us=gap_us,
+    def _pulse_spec(self):
+        """The pulse the fields describe, before planning.
+
+        Shared by the single-pulse and train paths so the two can never
+        describe different pulses - a train that quietly used a different
+        amplitude from the one shown would be very hard to notice and very
+        easy to write.
+        """
+        from biocam.stim import PulseSpec
+
+        amplitude = float(self.var_amplitude.get())
+        phase_us = float(self.var_phase.get())
+        return PulseSpec(
+            amplitude1=amplitude, phase1_us=phase_us,
+            inter_us=float(self.var_gap.get()),
             amplitude2=-amplitude, phase2_us=phase_us, name="ui-pulse",
         )
-        return plan_pulse(spec, constraints), pattern
 
     def _constraints(self):
         """The stimulator's limits: the device's in live mode, always.
@@ -714,6 +785,7 @@ class BioCamWindow:
         # channel count and rate attached.
         self._refresh_stim_validity()
         self._refresh_analysis()   # greys out Sort for the recording's duration
+        self._on_train_edited()    # and un-greys Send train
 
     def _on_stop(self):
         self.controller.stop()
@@ -732,6 +804,90 @@ class BioCamWindow:
             self._log(
                 "Stimulus NOT queued: the stimulation queue is full. It was "
                 "not delivered.", "bad")
+
+    def _build_train(self):
+        """Return a TrainPlan positioned in acquisition time, or raise.
+
+        The positioning is the part worth reading. Stimulation timestamps are
+        counted **from the beginning of the acquisition**, not from now
+        (`Stimulator.send_scheduled`, and issue #24). A train built with
+        `delay_us=0` and sent ten minutes into a recording therefore has every
+        timestamp ten minutes in the past, and what the instrument does with a
+        past timestamp is untested. So the plan is shifted by the acquisition
+        clock's current reading before it goes anywhere, and if that reading
+        is unavailable the train is refused rather than sent to an unknown
+        point in time.
+        """
+        from biocam.stim import TrainSpec, plan_train
+
+        pulse_plan, pattern = self._build_stimulus()
+
+        count = int(self.var_train_count.get())
+        rate_hz = float(self.var_train_rate.get())
+        delay_ms = float(self.var_train_delay.get())
+        if count < 2:
+            raise ValueError(
+                "a train needs at least two pulses - use \"Stimulate now\" "
+                "for a single one")
+        if rate_hz <= 0:
+            raise ValueError("the train rate must be above zero")
+        if delay_ms < 0:
+            raise ValueError("a train cannot start in the past")
+
+        spec = TrainSpec.at_rate(
+            self._pulse_spec(), count=count, rate_hz=rate_hz,
+            delay_us=delay_ms * 1000.0, name="ui-train")
+        train = plan_train(spec, self._constraints())
+        return train, pattern
+
+    def _positioned_train(self):
+        """The train shifted into acquisition time. Raises if that is unknown."""
+        train, pattern = self._build_train()
+        now_us = self.controller.acquisition_us()
+        if now_us is None:
+            raise RuntimeError(
+                "the acquisition clock has no reading yet, so there is no way "
+                "to say when this train should fire. Timestamps are counted "
+                "from the beginning of the acquisition, not from now - "
+                "sending without shifting them would schedule the train into "
+                "the past. Start the recording first.")
+        return train.shifted_by(now_us), pattern, train
+
+    def _on_train_edited(self, *_):
+        """Say what the train will do, before it does it."""
+        if not hasattr(self, "lbl_train"):
+            return
+        try:
+            train, _pattern = self._build_train()
+        except Exception as exc:  # noqa: BLE001 - shown, not raised
+            self.lbl_train.configure(text=str(exc), fg=COLOURS["bad"])
+            self.btn_train.configure(state="disabled")
+            return
+        self.lbl_train.configure(text=train.describe(), fg=COLOURS["ok"])
+        self.btn_train.configure(
+            state="normal" if self.controller.running else "disabled")
+
+    def _on_train(self):
+        try:
+            plan, pattern, train = self._positioned_train()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Train refused: {exc}", "bad")
+            return
+        if self.controller.request_stimulus(plan, pattern, scheduled=True,
+                                            label="train"):
+            first = plan.timestamps_us[0] / 1e6
+            self._log(
+                f"Train queued: {train.describe()}. First pulse at "
+                f"{first:.3f} s of acquisition time, which is "
+                f"{self.var_train_delay.get()} ms from now.")
+            self._log(
+                "Scheduled trains are queued by the instrument, not delivered "
+                "pulse by pulse from here. Whether it honours the schedule is "
+                "untested - issue #24.", "warn")
+        else:
+            self._log(
+                "Train NOT queued: the stimulation queue is full. It was not "
+                "delivered.", "bad")
 
     def _make_factory(self):
         from biocam.ui.factories import ReplayFactory
@@ -836,6 +992,7 @@ class BioCamWindow:
         if not channels:
             return {}
         return {
+            "trace_channels": self._trace_channels(),
             "detect_channels": tuple(channels),
             "threshold_sigmas": _as_float(self.var_sigmas, 5.0),
             "collect_waveforms": self.sort_technique is not None,
@@ -844,6 +1001,32 @@ class BioCamWindow:
             "min_interval_ms": _as_float(self.var_min_interval, 20.0),
             "max_rate_hz": _as_float(self.var_max_rate, 10.0),
         }
+
+    def _trace_channels(self) -> tuple:
+        """The electrodes whose signal is drawn, in array order.
+
+        The array selection again, capped: a trace is for looking at closely
+        and the cost lands on the thread draining the packet queue, so past
+        `MAX_TRACE_CHANNELS` the extras are dropped and the operator is told.
+        Silently drawing eight of twenty would be worse - it reads as "these
+        are the ones you chose".
+        """
+        from biocam.data.traces import MAX_TRACE_CHANNELS
+        from biocam.ui.arrayview import channel_index
+
+        if not self.var_traces.get():
+            return ()
+        chosen = list(self.array.positive) + list(self.array.negative)
+        channels = sorted({channel_index(row, col, self.n_cols)
+                           for row, col in chosen})
+        if len(channels) > MAX_TRACE_CHANNELS:
+            self._log(
+                f"{len(channels)} electrodes are selected but only "
+                f"{MAX_TRACE_CHANNELS} can be traced at once; tracing the "
+                f"first {MAX_TRACE_CHANNELS}. Detection still watches all of "
+                "them.", "warn")
+            channels = channels[:MAX_TRACE_CHANNELS]
+        return tuple(channels)
 
     def _make_live_factory(self, output, duration):
         # Imported here, never at module scope: this module must stay
@@ -948,6 +1131,7 @@ class BioCamWindow:
                 self._log(describe(event), self._severity(event))
             self._render(self.controller.snapshot())
             self._render_activity()
+            self._render_traces()
         finally:
             # Rescheduled in a finally so one bad render cannot stop the UI
             # updating forever - a frozen window during a recording is the
@@ -1014,11 +1198,12 @@ class BioCamWindow:
                       f"verdict {state.verdict}",
                       "ok" if state.verdict == "clean" else "warn")
             self._refresh_stim_validity()
-            # The recording has stopped, so sorting is allowed again - and it
-            # is only ever refreshed by a widget command otherwise, which
-            # would leave the button greyed out until the operator happened to
-            # touch something.
+            # The recording has stopped, so sorting is allowed again and a
+            # train is not. Both are only ever refreshed by a widget command
+            # otherwise, which would leave a button in the wrong state until
+            # the operator happened to touch something.
             self._refresh_analysis()
+            self._on_train_edited()
 
     def _render_activity(self):
         """Repaint the array. UI thread only, from a copied snapshot."""
@@ -1033,6 +1218,21 @@ class BioCamWindow:
                   f"({activity.samples} samples, "
                   f"{activity.max_observe_us:.0f} us slowest)"),
             fg=COLOURS["ok"])
+
+    def _render_traces(self):
+        """Repaint the trace strip. UI thread only, from a copied snapshot."""
+        if not hasattr(self, "traces"):
+            return
+        snapshot = self.controller.traces()
+        if snapshot is None:
+            self.traces.set_message(
+                "Traces are off. Tick \"Draw traces\" and select electrodes "
+                "on the array.")
+            return
+        if not snapshot.has_data:
+            self.traces.set_message("Waiting for the first packet...")
+            return
+        self.traces.set_snapshot(snapshot)
 
     def _log(self, message, tag=None):
         stamp = time.strftime("%H:%M:%S")

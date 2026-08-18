@@ -592,3 +592,73 @@ def test_a_gap_does_not_grant_the_noise_estimator_readiness():
     assert not d.ready, (
         "skipping time the estimator never observed made it claim readiness"
     )
+
+
+# --------------------------------------------------------------------------
+# Issue #39: the delivery path is warmed, the driver call is not
+# --------------------------------------------------------------------------
+
+def test_warm_up_exercises_the_delivery_branch():
+    # With `send = None`, `_process` takes its "no send configured" branch and
+    # the whole delivery half - the test, the sent-stimulus Decision, the
+    # guard around the call - is never touched, so it costs its first touch on
+    # the first real stimulus.
+    #
+    # Asserting on the Decision cannot show this: with `send = None` the loop
+    # still records the envelope, counts the stimulus and returns
+    # Decision(True, "stimulated"). Only the call itself is skipped. The first
+    # version of this test asserted on the decision and passed either way.
+    d = detector(1)
+    loop = ClosedLoop(d, EchoPolicy(), SafetyEnvelope(RATE, min_interval_ms=20.0),
+                      send=lambda t: None)
+    loop.warm_up()
+    assert loop.warm_up_deliveries > 0, (
+        "warm-up never actually called send, so the delivery path is cold"
+    )
+
+
+def test_nothing_escapes_during_warm_up():
+    delivered = []
+    d = detector(1)
+    loop = ClosedLoop(d, EchoPolicy(), SafetyEnvelope(RATE),
+                      send=delivered.append)
+    loop.warm_up()
+    assert delivered == [], "a stimulus escaped during warm-up"
+
+
+def test_warm_up_restores_the_real_send():
+    delivered = []
+    d = detector(1)
+    loop = ClosedLoop(d, EchoPolicy(), SafetyEnvelope(RATE),
+                      send=delivered.append)
+    loop.warm_up()
+    assert loop.send is delivered.append or loop.send == delivered.append
+
+
+def test_the_stimulus_log_warm_up_leaves_the_real_log_empty():
+    # It runs its records through a throwaway. A warm-up that appeared in the
+    # session log would be indistinguishable from a stimulus that fired.
+    from biocam.stim import (
+        PulseSpec, StimConstraints, StimPattern, plan as plan_pulse,
+    )
+    from biocam.stim.log import StimulusLog
+
+    constraints = StimConstraints(
+        time_resolution_us=10, amplitude_resolution=1.0,
+        min_amplitude=-1000.0, max_amplitude=1000.0, max_total_ticks=1000)
+    plan = plan_pulse(
+        PulseSpec(100.0, 200.0, 100.0, -100.0, 200.0, name="p"), constraints)
+    pattern = StimPattern(positive=((10, 10),), negative=((20, 30),))
+
+    log = StimulusLog()
+    log.warm_up(plan, pattern)
+    assert log.records == []
+    assert log.delivered == []
+
+
+def test_the_stimulus_log_warm_up_never_raises():
+    from biocam.stim.log import StimulusLog
+
+    log = StimulusLog()
+    log.warm_up(None, None)      # nonsense in, no exception out
+    assert log.records == []

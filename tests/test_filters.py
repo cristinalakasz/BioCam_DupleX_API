@@ -226,3 +226,67 @@ def test_the_channel_count_decides_which_path_runs():
     large = HighPass(SCALAR_CHANNEL_LIMIT + 1, RATE)
     assert small.n_channels <= SCALAR_CHANNEL_LIMIT
     assert large.n_channels > SCALAR_CHANNEL_LIMIT
+
+
+# --------------------------------------------------------------------------
+# The scalar path keeps its own state and its own scratch buffer. Both are
+# reuse, and reuse is where a filter silently starts returning the wrong data.
+# --------------------------------------------------------------------------
+
+def test_each_block_gets_its_own_output_array():
+    # `process` hands its array to the caller, and the detector holds the
+    # previous block's output across calls (it needs the last sample of it).
+    # Returning the same buffer every time would rewrite data still being read
+    # - and the corruption would look like signal, not like an error.
+    import numpy as np
+
+    from biocam.analysis.filters import HighPass
+
+    hp = HighPass(4, 18557.720703125)
+    rng = np.random.default_rng(0)
+    first = hp.process(rng.normal(size=(19, 4)))
+    kept = first.copy()
+    second = hp.process(rng.normal(size=(19, 4)))
+    assert first is not second
+    assert np.array_equal(first, kept), "the first block was overwritten"
+
+
+def test_the_two_state_representations_never_disagree():
+    # The scalar path carries its state as Python lists and the vector path as
+    # arrays. `reset` and `warm_up` write both; nothing else may let them drift.
+    import numpy as np
+
+    from biocam.analysis.filters import HighPass
+
+    hp = HighPass(4, 18557.720703125)
+    hp.warm_up(np.full(4, 2048.0))
+    assert np.allclose(hp._z1, hp._z1_list)
+    assert np.allclose(hp._z2, hp._z2_list)
+
+    hp.process(np.random.default_rng(1).normal(size=(19, 4)) + 2048.0)
+    assert np.allclose(hp._z1, hp._z1_list), "state diverged during processing"
+    assert np.allclose(hp._z2, hp._z2_list)
+
+    hp.reset()
+    assert np.allclose(hp._z1, 0.0)
+    assert np.allclose(hp._z1_list, 0.0)
+    assert np.allclose(hp._z2_list, 0.0)
+
+
+def test_a_changing_block_size_regrows_the_scratch_buffer():
+    # A recording has one packet size, but a final short block is normal and
+    # a scratch list sized for the previous one would truncate or overrun.
+    import numpy as np
+
+    from biocam.analysis.filters import HighPass
+
+    wide = HighPass(3, 18557.720703125)
+    narrow = HighPass(3, 18557.720703125)
+    rng = np.random.default_rng(2)
+    blocks = [rng.normal(size=(n, 3)) for n in (19, 7, 19, 40, 1)]
+
+    # One filter fed varying sizes must equal one fed the same samples in one
+    # go, which is the property block size must never affect.
+    varied = np.concatenate([wide.process(b) for b in blocks])
+    whole = narrow.process(np.concatenate(blocks))
+    assert np.array_equal(varied, whole)

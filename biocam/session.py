@@ -160,6 +160,26 @@ def _skip_loop(loop, packet, writer):
     return loop
 
 
+def _run_traces(traces, packet, writer):
+    """Fold one packet into the trace window. Returns it, or None.
+
+    `TraceRecorder.observe` already refuses to raise; this is the guard that
+    matters, for the reason `_run_monitor` gives. A trace is a picture, and no
+    picture is worth a recording.
+    """
+    try:
+        traces.observe(packet)
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the picture
+        writer.emit(StimulationSuspended(
+            reason=f"the trace display failed ({exc}) and has been "
+                   "disconnected for the rest of this recording; the "
+                   "recording itself is unaffected",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return traces
+
+
 def _run_service(service, writer):
     """Run the between-packets hook once. Returns it, or None if it failed.
 
@@ -199,7 +219,7 @@ class SessionResult:
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
                    stop_source=None, clock=None, service=None,
-                   monitor=None, loop=None) -> SessionResult:
+                   monitor=None, loop=None, traces=None) -> SessionResult:
     """Consume packets into the writer until a stop condition is met.
 
     Stops when the source runs out, when duration_sec of recorded signal has
@@ -219,6 +239,12 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     stop_event are not consulted while draining; the only stop conditions are
     the source running out, or DRAIN_DEADLINE_SEC elapsing (stop_reason
     becomes "drain_deadline_exceeded" in that case).
+
+    `traces`, if given, is a `TraceRecorder` for a few selected electrodes.
+    Unlike the activity display it is not decimated in time - every packet is
+    folded in, because a trace with gaps in it is a trace that lies about what
+    the electrode did. What bounds its cost instead is the number of channels,
+    which `TraceRecorder` refuses to let grow past a handful.
 
     `loop`, if given, is a closed-loop runner. Its contract is two methods:
     `observe(packet)`, called for each packet while recording normally, and
@@ -374,6 +400,12 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 # never worth a recording, so a failure drops the monitor and
                 # the packets keep being written.
                 monitor = _run_monitor(monitor, packet, writer)
+            if traces is not None:
+                # Rolling traces for a handful of selected electrodes. Costs
+                # in proportion to how many were chosen, and nothing at all
+                # when none were - see biocam/data/traces.py. Guarded like the
+                # activity display, and for the same reason.
+                traces = _run_traces(traces, packet, writer)
             if loop is not None:
                 # The closed loop: detect, decide, stimulate, all on this
                 # thread and between packets - the arrangement 3Brain's own
