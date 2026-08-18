@@ -70,6 +70,22 @@ NULL_SURROGATES = 5
 # Below this much separation above the null, the units are not to be trusted.
 WEAK_SEPARATION = 0.10
 
+# Waveforms used to compute a silhouette. The score is a mean over points, so
+# a random sample estimates it perfectly well - and the full computation is
+# quadratic in memory:
+#
+#     waveforms   features   diff array
+#         2 000         38      1.2 GB
+#        20 000          3      9.6 GB
+#        20 000         38    121.6 GB
+#
+# The UI's retention cap is the first line of defence and is far lower now,
+# but this is the bound that has to hold: `sort_by_channel` fits every
+# waveform on a channel, an offline caller has no cap at all, and without this
+# a sort allocates until the machine gives up - on the machine that may also
+# be streaming 150 MB/s to disk.
+SILHOUETTE_SAMPLE = 500
+
 
 def waveform_matrix(spikes):
     """Stack the waveforms of a list of spikes into (n_spikes, n_samples).
@@ -91,16 +107,27 @@ def waveform_matrix(spikes):
     return np.asarray(shapes, dtype=np.float64)
 
 
-def _silhouette(features, labels) -> float:
+def _silhouette(features, labels, seed: int = DEFAULT_SEED) -> float:
     """Mean silhouette score: how well-separated the clusters are, in [-1, 1].
 
     Above ~0.5 the clusters are convincing; near 0 the boundaries are
     arbitrary; below 0 the labels are worse than not splitting at all.
 
+    Computed over at most `SILHOUETTE_SAMPLE` points. The score is a mean, so
+    a sample estimates it; the full computation builds an N x N x F array,
+    which at the UI's retention cap is over a hundred gigabytes. Sampled
+    rather than refused, because a capped estimate is the right answer and an
+    error message is not.
+
     Written out rather than imported because this project depends on numpy
     alone, and it is a dozen lines.
     """
+    features = np.asarray(features)
     labels = np.asarray(labels)
+    if len(labels) > SILHOUETTE_SAMPLE:
+        rng = np.random.default_rng(seed)
+        keep = rng.choice(len(labels), SILHOUETTE_SAMPLE, replace=False)
+        features, labels = features[keep], labels[keep]
     units = np.unique(labels)
     if len(units) < 2 or len(labels) < 3:
         return 0.0

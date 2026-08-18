@@ -39,10 +39,18 @@ from dataclasses import dataclass, field
 EVENT_RING_CAPACITY = 512
 
 # Waveforms kept for sorting. A sort needs a representative sample, not every
-# spike ever seen, and this runs in the same process that is drawing the
-# array. Past the cap the oldest are dropped and counted - the recording on
-# disk still holds everything.
-MAX_RETAINED_WAVEFORMS = 20_000
+# spike ever seen, and this runs in the same process that is drawing the array
+# and draining the packet queue. Past the cap the oldest are dropped and
+# counted - the recording on disk still holds everything.
+#
+# The number is set by garbage collection, not by memory. Every retained
+# waveform is two gc-tracked objects, and a full collection walks all of them
+# while holding the GIL - during which the .NET acquisition callback cannot
+# execute a bytecode. This repo has already measured a `gc.collect(1)` at
+# 31.8 ms, which at a 1 ms packet period is 32 dropped packets. 2,000 is far
+# more than any sorter needs (the silhouette itself samples 500) and keeps the
+# tracked-object count in the thousands rather than the tens of thousands.
+MAX_RETAINED_WAVEFORMS = 2_000
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,7 @@ class _DrainingLoop:
     def __init__(self, loop, on_packet):
         self._inner = loop
         self._on_packet = on_packet
+        self.drain_errors = 0
 
     @property
     def loop(self):
@@ -130,11 +139,31 @@ class _DrainingLoop:
 
     def observe(self, packet):
         decision = self._inner.observe(packet)
-        self._on_packet()
+        # Guarded separately. `PacketLoop.observe` and `ClosedLoop.process`
+        # both genuinely refuse to raise, but this hook is outside both of
+        # them, and anything escaping here reaches `_run_loop`, which responds
+        # by setting `loop = None` - silently disabling stimulation for the
+        # rest of the recording while everything else carries on looking fine.
+        # A waveform-drain failure should cost waveforms, not the loop.
+        try:
+            self._on_packet()
+        except Exception:  # noqa: BLE001
+            self.drain_errors += 1
         return decision
 
+    def skip(self, packet):
+        """Delegated, so a drain can account for frames through the wrapper."""
+        self._inner.skip(packet)
+
     def warnings(self):
-        return self._inner.warnings()
+        problems = list(self._inner.warnings())
+        if self.drain_errors:
+            problems.append(
+                f"collecting spike waveforms failed on {self.drain_errors} "
+                "packet(s). The closed loop kept running and the recording is "
+                "unaffected; some spike shapes are missing from the sort."
+            )
+        return problems
 
     def summary(self):
         return self._inner.summary()
@@ -154,8 +183,13 @@ class SessionController:
 
         self.stim_queue = stim_queue if stim_queue is not None else StimulationQueue()
         self._events = _EventRing(capacity=event_capacity)
-        self._waveforms = deque()
-        self._waveforms_dropped = 0
+        # maxlen, so appending IS the eviction - one atomic C call instead
+        # of len() then popleft() then append(). The UI thread reads this
+        # deque while the consumer thread writes it, and three mutations per
+        # spike is three times the window in which `list(deque)` could see it
+        # change. The drop count is derived rather than incremented.
+        self._waveforms = deque(maxlen=MAX_RETAINED_WAVEFORMS)
+        self._waveforms_seen = 0
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -189,7 +223,7 @@ class SessionController:
         self._stop.clear()
         self._events.drain()
         self._waveforms.clear()
-        self._waveforms_dropped = 0
+        self._waveforms_seen = 0
         self._started_at = time.perf_counter()
         with self._lock:
             self._state = SessionSnapshot(
@@ -311,6 +345,10 @@ class SessionController:
 
     # -- for the UI thread -----------------------------------------------
 
+    def n_waveforms(self) -> int:
+        """How many waveforms are retained, without building a list of them."""
+        return len(self._waveforms)
+
     def spikes_with_waveforms(self) -> list:
         """Every spike whose shape has been collected. UI thread only.
 
@@ -405,18 +443,23 @@ class SessionController:
         loop = self._loop
         if loop is None:
             return
-        for spike in loop.loop.detector.take_waveforms():
-            if len(self._waveforms) >= MAX_RETAINED_WAVEFORMS:
-                self._waveforms.popleft()
-                self._waveforms_dropped += 1
-            self._waveforms.append(spike)
+        ready = loop.loop.detector.take_waveforms()
+        if not ready:
+            return
+        self._waveforms_seen += len(ready)
+        self._waveforms.extend(ready)   # maxlen evicts the oldest for us
 
     def _loop_counts(self) -> dict:
         loop = self._loop
         if loop is None:
             return {}
         inner = loop.loop
-        elapsed = max(inner.detector._frames_seen, 1) / inner.detector.frame_rate_hz
+        # frames_analysed, not _frames_seen: the latter includes frames that
+        # were recorded but never detected on, and dividing by those makes a
+        # suspended loop's rate decay towards zero looking like a quietening
+        # culture rather than a deaf detector.
+        analysed = max(inner.detector.frames_analysed, 1)
+        elapsed = analysed / inner.detector.frame_rate_hz
         return {
             "spikes_detected": inner.spikes_seen,
             "spike_rate_hz": inner.spikes_seen / elapsed,
@@ -445,12 +488,13 @@ class SessionController:
             problems.extend(self._monitor.warnings())
         if self._loop is not None:
             problems.extend(self._loop.warnings())
-        if self._waveforms_dropped:
+        dropped = self._waveforms_seen - len(self._waveforms)
+        if dropped > 0:
             problems.append(
-                f"{self._waveforms_dropped} spike waveform(s) were dropped to "
-                f"keep the sorting sample at {MAX_RETAINED_WAVEFORMS}. Sorting "
-                "used a sample rather than everything; the recording on disk "
-                "is unaffected and holds every spike."
+                f"{dropped} spike waveform(s) were dropped to keep the sorting "
+                f"sample at {MAX_RETAINED_WAVEFORMS} - the most recent were "
+                "kept. Sorting used a sample rather than everything; the "
+                "recording on disk is unaffected and holds every spike."
             )
         problems.extend(self.stim_queue.warnings())
         if self._events.dropped:

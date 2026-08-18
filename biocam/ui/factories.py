@@ -65,7 +65,11 @@ class ReplayFactory:
     # and unaffordable across the array.
     detect_channels: tuple = ()
     threshold_sigmas: float = 5.0
-    collect_waveforms: bool = True
+    # Off unless asked for. Collecting waveforms allocates per spike on
+    # the acquisition thread and retains them until someone drains, and
+    # the obvious headless script - record_session(loop=f.make_loop()) -
+    # never drains. Only the UI, which does, turns this on.
+    collect_waveforms: bool = False
     close_the_loop: bool = False
     policy_name: str = "echo"
     target_rate_hz: float = 1.0
@@ -252,7 +256,11 @@ class LiveFactory:
     # and unaffordable across the array.
     detect_channels: tuple = ()
     threshold_sigmas: float = 5.0
-    collect_waveforms: bool = True
+    # Off unless asked for. Collecting waveforms allocates per spike on
+    # the acquisition thread and retains them until someone drains, and
+    # the obvious headless script - record_session(loop=f.make_loop()) -
+    # never drains. Only the UI, which does, turns this on.
+    collect_waveforms: bool = False
     close_the_loop: bool = False
     policy_name: str = "echo"
     target_rate_hz: float = 1.0

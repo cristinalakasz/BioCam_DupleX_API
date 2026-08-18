@@ -495,15 +495,37 @@ class BioCamWindow:
         if self.controller.running:
             lines.append("Settings apply to the NEXT recording.")
         self.lbl_analysis.configure(text="\n\n".join(lines))
+        if self.controller.running:
+            # Sorting is not a background job. It fits k-means and a silhouette
+            # on the same thread that draws, in the same process whose
+            # consumer thread is the only thing draining the packet queue -
+            # and a stalled consumer is dropped packets, silently, in a
+            # recording that afterwards looks like real signal. It waits.
+            #
+            # This guard is also load-bearing for thread safety, not only for
+            # CPU contention: `spikes_with_waveforms()` does `list(deque)` on
+            # the UI thread while the consumer thread appends to it. That is
+            # safe on CPython because the whole copy runs inside one bytecode,
+            # but `deque` documents `RuntimeError` on mutation during
+            # iteration and this guard is what keeps the two threads from
+            # overlapping at all. Do not relax it without replacing the copy.
+            self.btn_sort.configure(state="disabled")
+            return
         self.btn_sort.configure(
             state="normal" if (technique and self._sortable()) else "disabled")
 
     def _sortable(self) -> bool:
-        return bool(self.controller.spikes_with_waveforms())
+        return self.controller.n_waveforms() > 0
 
     def _on_sort(self):
         from biocam.analysis.sorting import sort_by_channel
 
+        if self.controller.running:
+            self._log(
+                "Sorting waits until the recording stops - it would compete "
+                "with the thread draining the packet queue, and losing that "
+                "race costs packets.", "warn")
+            return
         technique = self.sort_technique
         spikes = self.controller.spikes_with_waveforms()
         if not technique or not spikes:
@@ -691,6 +713,7 @@ class BioCamWindow:
         # the event stream a moment later and says the same thing with the
         # channel count and rate attached.
         self._refresh_stim_validity()
+        self._refresh_analysis()   # greys out Sort for the recording's duration
 
     def _on_stop(self):
         self.controller.stop()
@@ -991,6 +1014,11 @@ class BioCamWindow:
                       f"verdict {state.verdict}",
                       "ok" if state.verdict == "clean" else "warn")
             self._refresh_stim_validity()
+            # The recording has stopped, so sorting is allowed again - and it
+            # is only ever refreshed by a widget command otherwise, which
+            # would leave the button greyed out until the operator happened to
+            # touch something.
+            self._refresh_analysis()
 
     def _render_activity(self):
         """Repaint the array. UI thread only, from a copied snapshot."""
