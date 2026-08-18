@@ -69,6 +69,7 @@ import warnings
 from pathlib import Path
 
 from biocam.data.clock import AcquisitionClock
+from biocam.data.frames import DTYPE_BY_BYTE_SIZE
 from biocam.data.events import DiskLow, DriverDataLoss, QueueOverflow, describe
 from biocam.data.recording import AcquisitionParameters, RecordingWriter
 from biocam.preflight import bytes_per_second, check_disk_space
@@ -232,6 +233,47 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("meta")
     convert.add_argument("out")
 
+    analyse = sub.add_parser(
+        "analyse",
+        help="find spikes in a recording, and optionally sort them",
+        description=(
+            "Runs the same streaming detector the closed loop uses, over a "
+            "recording that has already been written. The numbers it reports "
+            "are what an online session would have seen."
+        ),
+    )
+    analyse.add_argument("raw", help="the .raw file")
+    analyse.add_argument("meta", help="its _meta.json")
+    analyse.add_argument(
+        "--channels", type=str, default=None,
+        help="channels to analyse, e.g. '0-31' or '4,9,17'. Default: all of "
+             "them, which for a 4096-channel recording is slow - detection "
+             "costs about 300%% of one core at that width")
+    analyse.add_argument(
+        "--threshold-sigmas", type=float, default=5.0,
+        help="detection threshold in noise sigmas (default 5). Four finds "
+             "more, with more false positives")
+    analyse.add_argument(
+        "--refractory-ms", type=float, default=1.0,
+        help="minimum gap between two detections on one channel (default 1)")
+    analyse.add_argument(
+        "--cutoff-hz", type=float, default=300.0,
+        help="high-pass cutoff (default 300)")
+    analyse.add_argument(
+        "--sort", type=str, default=None, metavar="TECHNIQUE",
+        help="also sort the spikes. " + _sorter_help())
+    analyse.add_argument(
+        "--units", type=int, default=2,
+        help="how many units to sort into (default 2). Ignored without "
+             "--sort; see --suggest-units before trusting a number here")
+    analyse.add_argument(
+        "--suggest-units", action="store_true",
+        help="fit several unit counts and report which separates best, "
+             "rather than assuming the number given")
+    analyse.add_argument(
+        "--out", type=str, default=None,
+        help="write the spike list to this JSON file")
+
     stim = sub.add_parser(
         "stim",
         help="send a stimulus, or plan one without an instrument (--dry-run)",
@@ -317,6 +359,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="MaxPulseDuration in ticks, for --dry-run only (default 1000)")
 
     return parser
+
+
+def _sorter_help() -> str:
+    from biocam.analysis.sorting import SORTER_LABELS
+
+    return "One of: " + "; ".join(
+        f"{name} ({label})" for name, label in SORTER_LABELS.items())
+
+
+def _channel_list(value: str, total: int) -> list:
+    """Parse '0-31' or '4,9,17' or '0-7,64' into channel indices."""
+    channels = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low, high = part.split("-", 1)
+            channels.extend(range(int(low), int(high) + 1))
+        else:
+            channels.append(int(part))
+    if not channels:
+        raise ValueError(f"no channels in {value!r}")
+    outside = [c for c in channels if not 0 <= c < total]
+    if outside:
+        raise ValueError(
+            f"channel(s) {outside} are outside the {total}-channel recording"
+        )
+    return channels
 
 
 def _electrode_list(value: str):
@@ -1015,12 +1086,180 @@ def stim_command(args) -> int:
     return 0
 
 
+def analyse_command(args) -> int:
+    """Detect, and optionally sort, over a recording already on disk.
+
+    Deliberately the same `SpikeDetector` the closed loop runs, fed in blocks
+    rather than all at once, so that what this reports is what an online
+    session would have seen rather than a second implementation that agrees
+    until it does not.
+    """
+    import json
+
+    import numpy as np
+
+    from biocam.analysis.spikes import SpikeDetector
+
+    meta = json.loads(Path(args.meta).read_text(encoding="utf-8"))
+    total = meta["total_channels"]
+    frame_rate = meta["frame_rate_hz"]
+
+    try:
+        channels = (_channel_list(args.channels, total) if args.channels
+                    else list(range(total)))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    raw = np.fromfile(args.raw, dtype=DTYPE_BY_BYTE_SIZE[
+        meta["ch_sample_byte_size"]])
+    frames = raw.size // total
+    data = raw[:frames * total].reshape(frames, total)[:, channels]
+    # Into microvolts, because the thresholds are in sigmas of a microvolt
+    # noise estimate and mixing the two would compare different quantities
+    # that both look like numbers.
+    data = meta["offset"] + data.astype(np.float64) * meta["adc_counts_to_value"]
+
+    print(f"{args.raw}: {frames:,} frames of {total} channels at "
+          f"{frame_rate:.1f} Hz ({frames / frame_rate:.2f} s)")
+    print(f"analysing {len(channels)} channel(s) at "
+          f"{args.threshold_sigmas:g} sigma")
+
+    detector = SpikeDetector(
+        len(channels), frame_rate,
+        cutoff_hz=args.cutoff_hz,
+        threshold_sigmas=args.threshold_sigmas,
+        refractory_ms=args.refractory_ms,
+        collect_waveforms=bool(args.sort),
+    )
+    spikes, shaped = [], []
+    for start in range(0, frames, 512):
+        spikes.extend(detector.detect(data[start:start + 512]))
+        if args.sort:
+            shaped.extend(detector.take_waveforms())
+
+    print()
+    print(f"{len(spikes)} spikes, {detector.rates_hz():.1f} Hz across "
+          f"{len(channels)} channel(s)")
+    if spikes:
+        counts = np.bincount([s.channel for s in spikes],
+                             minlength=len(channels))
+        busiest = int(counts.argmax())
+        print(f"busiest: channel {channels[busiest]} with {counts[busiest]}")
+    print(f"noise per channel (uV): min {detector.noise.sigma.min():.1f}, "
+          f"median {np.median(detector.noise.sigma):.1f}, "
+          f"max {detector.noise.sigma.max():.1f}")
+
+    sorters = None
+    if args.sort:
+        sorters = _sort_command(args, shaped, channels)
+        if sorters is None:
+            return 2
+
+    if args.out:
+        payload = {
+            "source": str(args.raw),
+            "frame_rate_hz": frame_rate,
+            "channels": channels,
+            "threshold_sigmas": args.threshold_sigmas,
+            "n_spikes": len(spikes),
+            "sorting": (
+                {str(channels[c]): s.describe() for c, s in sorters.items()}
+                if sorters else None),
+            "spikes": [
+                {"frame": s.frame,
+                 # The channel as numbered in the recording, not the index
+                 # within the analysed subset - the two differ whenever
+                 # --channels was used, and a spike list that cannot be
+                 # located in its own recording is not much of a record.
+                 "channel": channels[s.channel],
+                 "amplitude_uv": s.amplitude,
+                 # Units are per channel, so a unit id only means anything
+                 # alongside the channel it came from.
+                 "unit": (sorters[s.channel].classify(s.waveform)
+                          if sorters and s.channel in sorters else None)}
+                for s in (shaped if args.sort else spikes)
+            ],
+        }
+        Path(args.out).write_text(json.dumps(payload, indent=2),
+                                  encoding="utf-8")
+        print(f"\nwrote {args.out}")
+    return 0
+
+
+def _sort_command(args, shaped, channels):
+    """Sort per channel. Returns {channel_index: Sorter}, or None on failure.
+
+    Per channel, not pooled. A unit is a neuron as heard by one electrode;
+    clustering waveforms from several electrodes together finds electrodes
+    rather than neurons, and does so convincingly, because the structure it
+    finds is real - just not the structure anybody wanted.
+    """
+    from biocam.analysis.sorting import (
+        MIN_WAVEFORMS_TO_FIT, sort_by_channel, suggest_n_units,
+    )
+
+    print()
+    if not shaped:
+        print("no waveforms to sort.", file=sys.stderr)
+        return None
+
+    if args.suggest_units:
+        busiest = _busiest_channel(shaped)
+        if busiest is not None:
+            index, its_spikes = busiest
+            print(f"how many units does channel {channels[index]} support? "
+                  f"({len(its_spikes)} waveforms)")
+            for n_units, score in suggest_n_units(
+                    its_spikes, technique=args.sort):
+                print(f"   {n_units} units -> separation {score:+.3f}")
+            print("   (a suggestion: silhouette rewards compact, well-spaced "
+                  "clusters, not correct ones)")
+            print()
+
+    try:
+        sorters = sort_by_channel(shaped, technique=args.sort,
+                                  n_units=args.units)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+
+    if not sorters:
+        print(f"no channel had the {MIN_WAVEFORMS_TO_FIT} waveforms a fit "
+              "needs. An under-fitted sorter is worse than none, because it "
+              "still returns labels.", file=sys.stderr)
+        return None
+
+    print(f"sorted {len(sorters)} channel(s) with "
+          f"{args.sort} into {args.units} units each:")
+    for index, sorter in sorted(sorters.items()):
+        print(f"  channel {channels[index]:>5}: {sorter.describe()}")
+        for warning in sorter.warnings():
+            print(f"      WARNING: {warning}", file=sys.stderr)
+    skipped = len({s.channel for s in shaped}) - len(sorters)
+    if skipped:
+        print(f"  ({skipped} channel(s) had too few spikes to fit)")
+    return sorters
+
+
+def _busiest_channel(shaped):
+    """The channel with the most waveforms, as (index, its spikes)."""
+    by_channel = {}
+    for spike in shaped:
+        by_channel.setdefault(spike.channel, []).append(spike)
+    if not by_channel:
+        return None
+    return max(by_channel.items(), key=lambda pair: len(pair[1]))
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "record":
         return record_command(args)
     if args.command == "stim":
         return stim_command(args)
+    if args.command == "analyse":
+        return analyse_command(args)
     return convert_command(args)
 
 

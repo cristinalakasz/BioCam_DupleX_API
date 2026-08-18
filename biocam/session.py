@@ -136,6 +136,30 @@ def _run_loop(loop, packet, writer):
     return loop
 
 
+def _skip_loop(loop, packet, writer):
+    """Account for a drained packet without deciding on it. Never raises.
+
+    Guarded exactly like `_run_loop`, and for the same reason. `loop` is
+    duck-typed - the only contract `record_session` has ever enforced is
+    `observe` - so a caller's loop may have no `skip` at all, and an
+    AttributeError raised on the *lookup* is not caught by any guard inside
+    the method it failed to find. Escaping here would skip the backlog drain
+    and `finalise()` and stamp an intact raw file `failed`: a whole recording
+    lost to a bookkeeping call.
+    """
+    try:
+        loop.skip(packet)
+    except Exception as exc:  # noqa: BLE001 - the recording outranks the loop
+        writer.emit(StimulationSuspended(
+            reason=f"the closed loop could not account for drained frames "
+                   f"({exc}); spike frame numbers past this point are offset "
+                   "from the recording. The recording itself is unaffected",
+            after_frame=writer.n_frames_written,
+        ))
+        return None
+    return loop
+
+
 def _run_service(service, writer):
     """Run the between-packets hook once. Returns it, or None if it failed.
 
@@ -195,6 +219,20 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
     stop_event are not consulted while draining; the only stop conditions are
     the source running out, or DRAIN_DEADLINE_SEC elapsing (stop_reason
     becomes "drain_deadline_exceeded" in that case).
+
+    `loop`, if given, is a closed-loop runner. Its contract is two methods:
+    `observe(packet)`, called for each packet while recording normally, and
+    `skip(packet)`, called instead while `drain` is set. Both must refuse to
+    raise; both are guarded here anyway, because "refuses to raise" is a
+    property of the object passed in and this function cannot check it.
+
+    The loop is deliberately *not* run while draining. A drain works through
+    a backlog that can be seconds deep, and deciding over it would deliver
+    stimuli triggered by data seconds old, after the operator asked to stop.
+    The envelope bounds the rate; nothing bounds staleness. `skip` exists so
+    the detector still learns those frames went past - without it, every
+    later spike's frame number is offset from the raw file, silently and
+    permanently.
 
     `counters`, if given, is the packet source itself (or anything exposing
     the same attributes). Its loss counters are transferred onto the writer
@@ -343,7 +381,17 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
                 # hardware allows. Guarded like the clock and the monitor: a
                 # loop that has broken must stop being a loop, not stop the
                 # recording.
-                loop = _run_loop(loop, packet, writer)
+                #
+                # Not while draining. A drain works through a backlog that can
+                # be seconds deep, and a closed loop run over it would deliver
+                # stimuli triggered by data seconds old, after the operator
+                # asked to stop. The envelope bounds the rate; it has no way
+                # to bound staleness. The detector is still told the frames
+                # went by, so frame numbers stay aligned with the recording.
+                if drain:
+                    loop = _skip_loop(loop, packet, writer)
+                else:
+                    loop = _run_loop(loop, packet, writer)
             if service is not None:
                 # Stimulation runs here, on the consumer thread, between
                 # packets - the arrangement 3Brain's own sample uses

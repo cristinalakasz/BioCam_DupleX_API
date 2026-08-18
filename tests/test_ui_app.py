@@ -42,13 +42,13 @@ def demo(tmp_path):
     return raw
 
 
-def a_window(root, tmp_path, demo, **kwargs):
+def a_window(root, tmp_path, demo, params=None, **kwargs):
     from biocam.ui.app import BioCamWindow
 
     kwargs.setdefault("live", False)
     return BioCamWindow(
         root, output_dir=str(tmp_path / "out"), replay_source=str(demo),
-        params=PARAMS, **kwargs,
+        params=params or PARAMS, **kwargs,
     )
 
 
@@ -447,3 +447,191 @@ def test_the_activity_display_never_costs_the_recording(root, tmp_path, demo):
     assert state.verdict in ("clean", "gaps_detected")
     assert read_sidecar(
         list((tmp_path / "out").glob("*_meta.json"))[0])["status"] == "complete"
+
+
+# --------------------------------------------------------------------------
+# detection, sorting and the closed loop, reachable at last
+# --------------------------------------------------------------------------
+
+# A realistic sample rate, because a spike cannot be represented at 1 kHz:
+# a 0.8 ms waveform is 0.8 samples and np.hanning(0) is empty. The module's
+# PARAMS stays at 1 kHz for the recording tests, where the rate only sets how
+# long a "second" is.
+SPIKY_PARAMS = AcquisitionParameters(
+    frame_rate_hz=18557.720703125, total_channels=4, ch_sample_byte_size=2,
+    bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+    min_digital_value=0, max_digital_value=4095,
+)
+
+
+def spiky_demo(tmp_path, n_frames=60000, channels=(1, 2)):
+    """A recording with real spikes on known channels."""
+    rng = np.random.default_rng(5)
+    data = 2048 + rng.normal(0, 6, (n_frames, SPIKY_PARAMS.total_channels))
+    narrow = -260.0 * np.hanning(int(0.0008 * SPIKY_PARAMS.frame_rate_hz))
+    wide = -190.0 * np.hanning(int(0.0014 * SPIKY_PARAMS.frame_rate_hz))
+    for channel in channels:
+        frame = 1200
+        while frame < n_frames - 80:
+            shape = narrow if rng.random() < 0.5 else wide
+            data[frame:frame + len(shape), channel] += shape
+            frame += int(rng.integers(300, 900))
+    raw = tmp_path / "spiky.raw"
+    np.clip(data, 0, 4095).astype(np.uint16).tofile(raw)
+    return raw
+
+
+def select(window, *cells, which="positive"):
+    from biocam.ui.arrayview import cell_bounds
+
+    for row, col in cells:
+        x0, y0, _, _ = cell_bounds(row, col, window.array.cell)
+        window.array._click(
+            type("E", (), {"x": x0 + 2, "y": y0 + 2})(), which)
+
+
+def test_every_sorting_technique_is_offered(root, tmp_path, demo):
+    from biocam.analysis.sorting import SORTER_LABELS
+
+    window = a_window(root, tmp_path, demo)
+    offered = set(window.sort_combo["values"])
+    assert "(none)" in offered
+    for label in SORTER_LABELS.values():
+        assert label in offered
+
+
+def test_choosing_a_technique_selects_it(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    assert window.sort_technique is None          # "(none)" by default
+    window.var_sort.set("PCA + k-means")
+    assert window.sort_technique == "pca"
+    window.var_sort.set("Template matching")
+    assert window.sort_technique == "template"
+    window.var_sort.set("Amplitude (trough depth)")
+    assert window.sort_technique == "amplitude"
+
+
+def test_detection_watches_the_electrodes_chosen_on_the_array(root, tmp_path, demo):
+    from biocam.ui.arrayview import channel_index
+
+    window = a_window(root, tmp_path, demo)
+    window.array.clear()
+    select(window, (1, 2))
+    select(window, (2, 1), which="negative")
+    window.var_detect.set(True)
+    settings = window._analysis_settings()
+    assert set(settings["detect_channels"]) == {
+        channel_index(1, 2, window.n_cols),
+        channel_index(2, 1, window.n_cols),
+    }
+
+
+def test_nothing_extra_runs_when_detection_is_off(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    select(window, (1, 1))
+    window.var_detect.set(False)
+    assert window._analysis_settings() == {}
+
+
+def test_detection_with_no_electrodes_selected_says_so(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.array.clear()
+    window.var_detect.set(True)
+    window._refresh_analysis()
+    assert "No electrodes selected" in window.lbl_analysis["text"]
+    assert window._analysis_settings() == {}
+
+
+def test_the_loop_needs_detection_and_says_so(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    select(window, (1, 1))
+    window.var_detect.set(False)
+    window.var_loop.set(True)
+    window._refresh_analysis()
+    assert "needs detection on" in window.lbl_analysis["text"]
+
+
+def test_simulation_says_no_stimulus_leaves_the_machine(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    select(window, (1, 1))
+    window.var_detect.set(True)
+    window.var_loop.set(True)
+    window._refresh_analysis()
+    assert "nothing is delivered anywhere" in window.lbl_analysis["text"]
+
+
+def test_spikes_are_detected_through_the_window(root, tmp_path):
+    raw = spiky_demo(tmp_path, channels=(1, 2))
+    window = a_window(root, tmp_path, raw, params=SPIKY_PARAMS)
+    window.array.clear()
+    # channel 1 is (1,2) and channel 2 is (1,3) in a 1-based 2x2 grid.
+    select(window, (1, 2))                      # channel 1
+    select(window, (2, 1), which="negative")    # channel 2
+    window.var_detect.set(True)
+    window.var_duration.set("2")
+    window._on_start()
+    state = pump(root, window, timeout=60.0)
+
+    assert state.spikes_detected > 10
+    assert state.spike_rate_hz > 0
+    assert window.controller.watched_channels() == [1, 2]
+
+
+def test_sorting_runs_through_the_window(root, tmp_path):
+    raw = spiky_demo(tmp_path, channels=(1, 2))
+    window = a_window(root, tmp_path, raw, params=SPIKY_PARAMS)
+    window.array.clear()
+    select(window, (1, 2))                      # channel 1
+    select(window, (2, 1), which="negative")    # channel 2
+    window.var_detect.set(True)
+    window.var_sort.set("PCA + k-means")
+    window.var_duration.set("2")
+    window._on_start()
+    pump(root, window, timeout=60.0)
+
+    assert len(window.controller.spikes_with_waveforms()) > 20
+    window._on_sort()
+    text = window.text.get("1.0", "end")
+    assert "Sorted" in text
+    assert "separation" in text
+
+
+def test_sorting_refuses_rather_than_fitting_badly(root, tmp_path, demo):
+    # Nine waveforms is not a unit. An under-fitted sorter is worse than
+    # none, because it still returns labels.
+    window = a_window(root, tmp_path, demo)
+    window.var_sort.set("PCA + k-means")
+    window._on_sort()
+    assert "Sorted" not in window.text.get("1.0", "end")
+
+
+def test_the_closed_loop_runs_and_its_limits_hold(root, tmp_path):
+    raw = spiky_demo(tmp_path, channels=(1, 2))
+    window = a_window(root, tmp_path, raw, params=SPIKY_PARAMS)
+    window.array.clear()
+    select(window, (1, 2))                      # channel 1
+    select(window, (2, 1), which="negative")    # channel 2
+    window.var_detect.set(True)
+    window.var_loop.set(True)
+    window.var_min_interval.set("50")
+    window.var_max_rate.set("10")
+    window.var_duration.set("2")
+    window._on_start()
+    state = pump(root, window, timeout=60.0)
+
+    assert state.spikes_detected > 10
+    assert state.loop_stimuli > 0
+    # A busy culture asks far more often than the limits allow. That the
+    # limits held is the thing worth asserting.
+    assert state.loop_refused > 0
+    assert state.loop_stimuli <= 25          # ~2 s at 10 Hz, plus slack
+    assert not state.loop_suspended
+
+
+def test_a_half_typed_threshold_does_not_stop_a_recording(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    select(window, (1, 1))
+    window.var_detect.set(True)
+    window.var_sigmas.set("")               # mid-keystroke
+    settings = window._analysis_settings()
+    assert settings["threshold_sigmas"] == 5.0

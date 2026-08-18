@@ -44,7 +44,14 @@ def test_a_second_stimulus_too_soon_is_refused():
     allowed, reason, which = env.check(ms(5))
     assert not allowed
     assert which == "interval"
-    assert "5.0 ms since the last stimulus" in reason
+    assert "interval" in reason
+    # The specific numbers live in the summary, not in the refusal: `check`
+    # runs on every packet and refuses on most of them when a policy is doing
+    # its job, so it must not build a string. What matters is that the
+    # information survived the move rather than being dropped on the way.
+    env.note_refusal(which)
+    assert "20 ms floor" in " ".join(env.warnings())
+    assert env.summary()["refused_interval"] == 1
 
 
 def test_a_second_stimulus_after_the_floor_is_allowed():
@@ -84,7 +91,10 @@ def test_the_charge_budget_refuses_an_accumulating_offset():
     allowed, reason, which = env.check(ms(5), charge_pc=600.0)
     assert not allowed
     assert which == "charge"
-    assert "pC/s" in reason
+    assert "charge" in reason
+    env.note_refusal(which)
+    assert "1000 pC/s" in " ".join(env.warnings())
+    assert env.summary()["refused_charge"] == 1
 
 
 def test_a_balanced_pulse_never_touches_the_charge_budget():
@@ -106,7 +116,10 @@ def test_a_session_limit_stops_the_loop_for_good():
     allowed, reason, which = env.check(ms(100))
     assert not allowed
     assert which == "session"
-    assert "session limit of 2" in reason
+    assert "session limit" in reason
+    env.note_refusal(which)
+    assert "session limit of 2" in " ".join(env.warnings())
+    assert env.summary()["refused_session_limit"] == 1
 
 
 def test_checking_does_not_consume_budget():

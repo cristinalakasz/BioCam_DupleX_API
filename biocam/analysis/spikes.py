@@ -36,6 +36,7 @@ which neuron it came from - and its amplitude is the value at the crossing,
 not the trough. See `SpikeDetector.detect`.
 """
 
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -71,20 +72,48 @@ DEFAULT_WARMUP_SECONDS = 0.05
 # the packet size.
 DEFAULT_NOISE_TAU_SECONDS = 0.5
 
+# How much of the waveform around a crossing to keep, for sorting. A spike is
+# roughly a millisecond wide with a short rising edge before the trough, so
+# these capture the shape without carrying much noise on either side.
+DEFAULT_WAVEFORM_PRE_MS = 0.5
+DEFAULT_WAVEFORM_POST_MS = 1.5
 
-@dataclass(frozen=True)
+# Completed waveforms held before a caller takes them. Bounded by the detector
+# itself, because nothing outside it is guaranteed to drain: the UI does, a
+# headless script written the obvious way does not, and an unbounded list on
+# the acquisition thread is not a caller's mistake to make.
+DEFAULT_MAX_READY = 4096
+
+# Returned instead of a fresh list when nothing is waiting, which is most
+# packets. Immutable, so a caller cannot append to it and be surprised.
+_NOTHING_READY = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Spike:
     """One threshold crossing.
 
     `frame` is absolute within the recording, counted from the first frame the
     detector ever saw, so a spike is locatable in the `.raw` file and against
-    the stimulus log without any further bookkeeping.
+    the stimulus log without any further bookkeeping - as long as nothing
+    skipped frames without saying so. See `SpikeDetector.skip_frames`.
+
+    `slots=True` is not a micro-optimisation. Thousands of these are retained
+    for sorting, and without slots each carries a `__dict__` that every full
+    garbage collection has to walk. This repo has already measured a
+    `gc.collect(1)` at 31.8 ms stalling an unrelated thread - and a collection
+    holds the GIL for its whole traversal, so the acquisition callback cannot
+    run a single bytecode while it happens.
     """
 
     frame: int
     channel: int
     amplitude: float          # filtered value at the crossing
     threshold: float          # what it had to beat, for provenance
+    # The filtered waveform around the crossing, when one was collected. None
+    # on the detection path, which cannot have it: the samples after the
+    # crossing have not arrived yet. See SpikeDetector.take_waveforms.
+    waveform: object = None
 
     @property
     def sigma(self) -> float:
@@ -171,7 +200,11 @@ class SpikeDetector:
                  threshold_sigmas: float = DEFAULT_THRESHOLD_SIGMA,
                  refractory_ms: float = DEFAULT_REFRACTORY_MS,
                  warmup_seconds: float = DEFAULT_WARMUP_SECONDS,
-                 noise_tau_seconds: float = DEFAULT_NOISE_TAU_SECONDS):
+                 noise_tau_seconds: float = DEFAULT_NOISE_TAU_SECONDS,
+                 collect_waveforms: bool = False,
+                 waveform_pre_ms: float = DEFAULT_WAVEFORM_PRE_MS,
+                 waveform_post_ms: float = DEFAULT_WAVEFORM_POST_MS,
+                 max_ready: int = DEFAULT_MAX_READY):
         from biocam.analysis.filters import HighPass
 
         if n_channels < 1:
@@ -192,6 +225,28 @@ class SpikeDetector:
             tau_seconds=noise_tau_seconds, warmup_seconds=warmup_seconds,
         )
 
+        # Waveform collection, for sorting. Off by default: it costs a
+        # copy of the recent filtered signal per block, and the closed loop
+        # has no use for it - a waveform cannot be completed until the
+        # samples *after* the crossing arrive, so it is inherently later than
+        # the decision the loop has to make.
+        self.collect_waveforms = collect_waveforms
+        self.waveform_pre = max(1, int(round(waveform_pre_ms * 1e-3 * frame_rate_hz)))
+        self.waveform_post = max(1, int(round(waveform_post_ms * 1e-3 * frame_rate_hz)))
+        self.waveform_length = self.waveform_pre + self.waveform_post + 1
+        self._tail = None            # recent filtered frames
+        self._tail_start = 0         # absolute frame index of _tail[0]
+        self._pending = []           # spikes waiting for their post-samples
+        self.frames_skipped = 0      # recorded, but never detected on
+        self.max_ready = max(1, int(max_ready))
+        # A deque, so eviction is the append rather than a pop(0). The
+        # bound only bites when nobody is draining - and in that case it
+        # bites on every spike, which is precisely when an O(n) shift of
+        # 4096 pointers per spike would be the wrong thing to be doing on
+        # the acquisition thread.
+        self._ready = deque(maxlen=self.max_ready)
+        self.waveforms_dropped = 0
+
         self._frames_seen = 0
         self._warmed = False
         # The last filtered sample of the previous block, per channel. Without
@@ -209,6 +264,43 @@ class SpikeDetector:
         """Whether the noise estimate has settled enough to detect."""
         return self.noise.ready
 
+    def skip_frames(self, n_frames: int) -> None:
+        """Account for frames that were recorded but never detected on.
+
+        `Spike.frame` promises to locate a spike in the `.raw` file, and that
+        promise is only kept if this counter tracks what the writer wrote.
+        Whenever a block reaches the writer but not the detector - a decode
+        failure, a suspended loop - the frames still happened, and silently
+        not counting them would offset every later spike from the recording by
+        that much, permanently, with nothing in the output to say so.
+
+        The filter state and the tail are both stale across a gap, and both
+        are discarded. Pending waveforms go with them: a waveform stitched
+        from either side of missing data is not a waveform.
+
+        Clearing the filter matters more than it looks. Left primed on the
+        pre-gap baseline, the biquad rings on the first block after the gap,
+        and if the DC baseline moved across it that transient is a run of
+        threshold crossings - false spikes, which on a closed loop are
+        stimuli. Dropping `_warmed` makes the next `detect()` re-settle the
+        filter on the post-gap baseline, which is exactly what the
+        start-of-recording path already does for the same reason.
+
+        `noise.frames` is deliberately *not* advanced: a gap must not grant
+        the estimator readiness for time it never observed.
+        """
+        if n_frames <= 0:
+            return
+        self._frames_seen += int(n_frames)
+        self.frames_skipped += int(n_frames)
+        self.waveforms_dropped += len(self._pending)
+        self._pending.clear()
+        self._tail = None
+        self._tail_start = self._frames_seen
+        self.filter.reset()
+        self._warmed = False
+        self._previous[:] = 0.0
+
     def reset(self) -> None:
         """Return to the state of a detector that has seen nothing.
 
@@ -225,6 +317,12 @@ class SpikeDetector:
         self._previous[:] = 0.0
         self._last_spike[:] = -10 ** 15
         self.spikes_detected = 0
+        self._tail = None
+        self._tail_start = 0
+        self._pending.clear()
+        self._ready.clear()
+        self.waveforms_dropped = 0
+        self.frames_skipped = 0
 
     def detect(self, block) -> list:
         """Filter a block, update the noise estimate, and return its spikes.
@@ -258,16 +356,110 @@ class SpikeDetector:
         filtered = self.filter.process(block)
         self.noise.update(filtered)
         if not self.noise.ready:
-            self._previous = filtered[-1].copy()
+            self._previous[:] = filtered[-1]
             self._frames_seen += block.shape[0]
             return []
 
         thresholds = self.noise.thresholds(self.threshold_sigmas)
         spikes = self._crossings(filtered, thresholds)
-        self._previous = filtered[-1].copy()
+        self._previous[:] = filtered[-1]
+        if self.collect_waveforms:
+            self._keep_tail(filtered, block.shape[0])
         self._frames_seen += block.shape[0]
         self.spikes_detected += len(spikes)
+        if self.collect_waveforms:
+            self._pending.extend(spikes)
+            self._complete_waveforms()
         return spikes
+
+    # -- waveforms, for sorting ------------------------------------------
+
+    def _keep_tail(self, filtered, block_frames: int) -> None:
+        """Retain just enough recent filtered signal to cut waveforms from.
+
+        Sized to the window plus the largest block seen, so it holds whatever
+        a spike at the very start of a block needs and nothing more. It does
+        not grow with the recording.
+        """
+        keep = self.waveform_length + block_frames + 1
+        if self._tail is None:
+            self._tail = filtered.copy()
+            self._tail_start = self._frames_seen
+        else:
+            self._tail = np.concatenate((self._tail, filtered), axis=0)
+        if self._tail.shape[0] > keep:
+            trimmed = self._tail.shape[0] - keep
+            self._tail = self._tail[trimmed:]
+            self._tail_start += trimmed
+
+    def _complete_waveforms(self) -> None:
+        """Move spikes whose window has fully arrived onto the ready list.
+
+        A spike is reported the moment it crosses, but its waveform cannot be
+        cut until the samples after it exist. So the two are separate outputs:
+        `detect` returns crossings now, for the closed loop; `take_waveforms`
+        returns shapes about a millisecond later, for sorting.
+        """
+        if self._tail is None:
+            return
+        tail_end = self._tail_start + self._tail.shape[0]
+        still_pending = []
+        for spike in self._pending:
+            start = spike.frame - self.waveform_pre
+            stop = spike.frame + self.waveform_post + 1
+            if stop > tail_end:
+                still_pending.append(spike)
+                continue
+            if start < self._tail_start:
+                # The window opens before anything still retained - only
+                # possible for a spike in the first moments of a recording.
+                # Counted rather than silently skipped: a sorter fed fewer
+                # waveforms than there were spikes should know why.
+                self.waveforms_dropped += 1
+                continue
+            window = self._tail[start - self._tail_start:stop - self._tail_start,
+                                spike.channel]
+            if window.shape[0] != self.waveform_length:
+                # numpy clips an out-of-range slice rather than raising, so a
+                # bookkeeping drift here would ship a short waveform and
+                # surface much later and much further away, as "waveforms have
+                # different lengths" inside a sorter. Refuse it at the source.
+                self.waveforms_dropped += 1
+                continue
+            if len(self._ready) == self.max_ready:
+                # Bounded here rather than trusting a caller to drain. Nothing
+                # drains this in a headless closed-loop script, and an
+                # unbounded queue on the acquisition thread is how a recording
+                # ends in swap. The append below evicts the oldest itself;
+                # this only has to count it.
+                self.waveforms_dropped += 1
+            # Constructed rather than `replace`d: replace() calls fields(),
+            # builds a kwargs dict and re-runs __init__, and this is per
+            # spike, not per packet. A burst completes tens of them on a
+            # single packet inside a 1 ms budget.
+            self._ready.append(Spike(
+                spike.frame, spike.channel, spike.amplitude, spike.threshold,
+                window.copy(),
+            ))
+        self._pending = still_pending
+
+    def take_waveforms(self) -> list:
+        """Every spike whose waveform is now complete. Empties the queue.
+
+        Returns `Spike` objects with `waveform` filled in - the same spikes
+        `detect` already returned, arriving again once their shape is known.
+        Callers that want both must not count them twice.
+        """
+        if not self._ready:
+            return _NOTHING_READY     # the common case: no allocation for it
+        # Two operations where the old list form was one atomic swap. Safe
+        # because `detect` and `take_waveforms` both run on the consumer
+        # thread and never overlap - safe by convention now, where it used to
+        # be safe by construction. If this is ever called from another thread,
+        # this is the line to revisit.
+        ready = list(self._ready)
+        self._ready.clear()
+        return ready
 
     def _crossings(self, filtered, thresholds) -> list:
         """Falling crossings, one per event, respecting the refractory."""
@@ -303,9 +495,23 @@ class SpikeDetector:
         # to disk depend on that.
         return spikes
 
+    @property
+    def frames_analysed(self) -> int:
+        """Frames actually detected on - the denominator for any rate.
+
+        Not `_frames_seen`, which counts skipped frames too so that
+        `Spike.frame` stays aligned with the recording. Dividing by that would
+        make a suspended loop's spike rate decay smoothly towards zero and be
+        displayed as a measurement rather than as an absence - which is the
+        exact confusion `RatePolicy` warns about, since a detector that has
+        gone deaf looks like a culture that has gone quiet.
+        """
+        return max(0, self._frames_seen - self.frames_skipped)
+
     def rates_hz(self, elapsed_frames: int = None) -> float:
         """Mean detection rate across the recording so far, in Hz."""
-        frames = elapsed_frames if elapsed_frames is not None else self._frames_seen
+        frames = (elapsed_frames if elapsed_frames is not None
+                  else self.frames_analysed)
         if frames <= 0:
             return 0.0
         return self.spikes_detected / (frames / self.frame_rate_hz)

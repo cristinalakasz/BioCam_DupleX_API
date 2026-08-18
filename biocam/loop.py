@@ -54,6 +54,23 @@ DEFAULT_MAX_CHARGE_PER_SECOND_PC = 500_000.0
 # a guess until a lab run measures it.
 SLOW_DECISION_US = 400.0
 
+# Ceiling on warm-up blocks. The count is derived from the detector's noise
+# estimator, whose length the caller controls, and a warm-up runs before
+# acquisition starts - so an over-long one delays the recording silently
+# rather than dropping packets. A few hundred blocks is well past the point
+# where anything further is being warmed.
+MAX_WARM_UP_BLOCKS = 400
+
+# Prebuilt, because `check` runs on every packet and refuses on most of them
+# when a policy is doing its job. The specific numbers live in the counters
+# and are formatted once, in `warnings()`.
+REFUSAL_REASONS = {
+    "session": "the session limit on stimuli has been reached",
+    "interval": "too soon after the last stimulus (the minimum-interval floor)",
+    "rate": "too many stimuli in the last second (the rate ceiling)",
+    "charge": "the charge budget for the last second is spent",
+}
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -136,35 +153,28 @@ class SafetyEnvelope:
         Records nothing: a caller that asks and then does not stimulate must
         not have consumed budget. `record()` is separate for that reason.
         """
+        # No f-strings here. Refusal is the COMMON case, not the rare one -
+        # an echo policy on a bursting culture refuses on nearly every spike,
+        # and a rate policy on a quiet preparation refuses on every packet.
+        # Formatting a message each time put a string build and its garbage
+        # on the hot path a thousand times a second, for text nobody reads
+        # until the run ends. The counters carry the information; the wording
+        # is built in `warnings()`.
         if self.max_stimuli is not None and self.delivered >= self.max_stimuli:
-            return False, (
-                f"the session limit of {self.max_stimuli} stimuli has been "
-                "reached"
-            ), "session"
+            return False, REFUSAL_REASONS["session"], "session"
 
         if (self._last_frame is not None
                 and at_frame - self._last_frame < self.min_interval_frames):
-            gap_ms = (at_frame - self._last_frame) / self.frame_rate_hz * 1e3
-            return False, (
-                f"only {gap_ms:.1f} ms since the last stimulus; the floor is "
-                f"{self.min_interval_ms:.1f} ms"
-            ), "interval"
+            return False, REFUSAL_REASONS["interval"], "interval"
 
         self._expire(at_frame)
         if len(self._recent) >= self.max_rate_hz:
-            return False, (
-                f"{len(self._recent)} stimuli already in the last second; the "
-                f"ceiling is {self.max_rate_hz:g} Hz"
-            ), "rate"
+            return False, REFUSAL_REASONS["rate"], "rate"
 
         if (self.max_charge_per_second_pc is not None
                 and abs(self._recent_charge) + abs(charge_pc)
                 > self.max_charge_per_second_pc):
-            return False, (
-                f"{abs(self._recent_charge):.0f} pC delivered in the last "
-                f"second and this pulse adds {abs(charge_pc):.0f}; the budget "
-                f"is {self.max_charge_per_second_pc:.0f} pC/s"
-            ), "charge"
+            return False, REFUSAL_REASONS["charge"], "charge"
 
         return True, "within limits", None
 
@@ -384,7 +394,7 @@ class ClosedLoop:
             return 0.0
         return self.total_decision_us / self.blocks
 
-    def warm_up(self, block_frames: int = 64, n_blocks: int = 8) -> float:
+    def warm_up(self, block_frames: int = 64, n_blocks: int = None) -> float:
         """Run the whole path a few times, then forget it. Returns the cost.
 
         The first call through this loop costs about ten milliseconds - numpy
@@ -394,25 +404,85 @@ class ClosedLoop:
         have been noticed on the instrument as "we always lose a few at the
         beginning" and attributed to almost anything else.
 
-        So it is paid here instead, before acquisition starts, and then
-        undone: the detector, the policy and the envelope are all reset, so
-        the synthetic blocks used to warm the code up leave nothing behind.
+        **It has to run long enough, and see a spike.** The first version fed
+        512 frames against a noise estimator needing 928, so `detect()` took
+        its not-ready early return on every block and the expensive half was
+        never touched at all: the crossing search, the waveform copy, the
+        envelope check and the refusal path all still cost their first-touch
+        on the first real packet - about 50 ms into a recording, on the first
+        packet carrying detectable spikes. So the length is derived from the
+        estimator rather than assumed, and a synthetic excursion is injected
+        so a crossing, a delivery and a refusal all execute here.
 
-        Returns the worst decision time observed during the warm-up, which is
-        the number that would otherwise have landed on the first real packet.
+        **The send path is not warmed.** `send` is swapped out for the
+        duration, so nothing is delivered - which means the first real
+        stimulus still pays the first-touch cost of whatever `send` does, and
+        on the instrument that is a `StimulusLog` write and pythonnet
+        marshalling into the driver. That is plausibly the most expensive
+        first touch on this whole path, and it lands on the acquisition thread
+        at the moment the loop first decides to fire. Said plainly here
+        because a colleague reading this 600 km away would otherwise take
+        "warmed" for coverage it does not have.
+
+        Everything else is undone afterwards: the detector, the policy and the
+        envelope are reset, so the synthetic blocks leave nothing behind. A
+        suspension is deliberately *not* undone - see below.
+
+        Returns the worst decision time observed, which is the number that
+        would otherwise have landed on a real packet.
         """
         import numpy as np
 
+        if block_frames < 1:
+            raise ValueError(
+                f"warm_up needs at least one frame per block, got {block_frames}"
+            )
+        if n_blocks is None:
+            # Enough to get past the noise estimate, plus a few blocks in
+            # which detection is actually running. Derived rather than fixed,
+            # because a fixed 8 x 64 sat below the estimator's threshold and
+            # so warmed nothing at all.
+            #
+            # `noise` via getattr: warm_up should not be the thing that
+            # narrows what counts as a detector. One without `.noise` gets the
+            # old fixed count rather than an AttributeError out of make_loop,
+            # which would fail the recording before it started.
+            noise = getattr(self.detector, "noise", None)
+            warmup_frames = getattr(noise, "warmup_frames", 0)
+            needed = warmup_frames + 4 * block_frames
+            # Capped: warmup_frames is caller-settable through
+            # `warmup_seconds`, and a generous one would otherwise delay the
+            # start of acquisition by an unbounded and silent amount.
+            n_blocks = min(MAX_WARM_UP_BLOCKS,
+                           max(8, int(needed // block_frames) + 2))
+
         rng = np.random.default_rng(0)
         send, self.send = self.send, None      # nothing goes out during this
+        channels = self.detector.n_channels
         try:
-            for _ in range(n_blocks):
-                block = rng.normal(0.0, 1.0, (block_frames, self.detector.n_channels))
+            for i in range(n_blocks):
+                block = rng.normal(0.0, 10.0, (block_frames, channels))
+                if i >= n_blocks - 3:
+                    # A crossing, on the last few blocks, so `_crossings`,
+                    # `_complete_waveforms`, `envelope.check`, `record` and -
+                    # on the block after - the refusal path all run. Two in a
+                    # row is deliberate: the second is refused by the interval
+                    # floor, which is the branch a busy culture takes most.
+                    block[block_frames // 2:, 0] -= 400.0
                 self.process(block)
         finally:
             self.send = send
 
         cost = self.max_decision_us
+        # Everything the warm-up did is undone - except a suspension, which is
+        # a finding rather than a side effect. Clearing it meant a loop that
+        # had *just proved it was broken* returned a plausible microsecond
+        # figure with `suspended == False`, and the operator saw a normal
+        # recording start. That mattered little before, when warm-up never got
+        # past the not-ready early return and there was almost nothing here
+        # that could fail; the whole point of the fix above is that the
+        # crossing search, the waveform windows and the envelope now run.
+        broke = self.suspended_reason
         self.detector.reset()
         self.policy.reset()
         self.envelope.reset()
@@ -421,7 +491,11 @@ class ClosedLoop:
         self.stimuli_sent = 0
         self.send_failures = 0
         self.errors = 0
-        self.suspended_reason = None
+        self.suspended_reason = (
+            None if broke is None else
+            "the closed loop failed during warm-up, before the recording "
+            f"started, and will not stimulate: {broke}"
+        )
         self.max_decision_us = 0.0
         self.total_decision_us = 0.0
         self.slow_decisions = 0
@@ -436,6 +510,14 @@ class ClosedLoop:
         loop's latency budget and the only one worth arguing about.
         """
         if self.suspended:
+            # Still count the frames. A suspended loop stops deciding, not
+            # existing, and its detector's frame numbers have to stay aligned
+            # with the recording in case the loop is ever resumed - or in case
+            # spikes found before the suspension are looked up afterwards.
+            try:
+                self.detector.skip_frames(len(block))
+            except Exception:  # noqa: BLE001
+                pass
             return Decision(False, "the loop is suspended")
 
         started = time.perf_counter()
@@ -504,6 +586,22 @@ class ClosedLoop:
         problems = []
         if self.suspended:
             problems.append(self.suspended_reason)
+        dropped = getattr(self.detector, "waveforms_dropped", 0)
+        if dropped:
+            problems.append(
+                f"{dropped} spike waveform(s) were detected but never handed "
+                "over for sorting - dropped at the detector because nobody "
+                "collected them fast enough, or because their window fell "
+                "outside the samples still retained. The spikes themselves "
+                "were counted; only their shapes are missing."
+            )
+        skipped = getattr(self.detector, "frames_skipped", 0)
+        if skipped:
+            problems.append(
+                f"{skipped} frame(s) were recorded but never analysed, so "
+                "detection has a gap. Frame numbers stay aligned with the "
+                "recording across it, but no spike in that stretch was found."
+            )
         if self.send_failures:
             problems.append(
                 f"{self.send_failures} stimuli were decided on but not "
@@ -568,6 +666,9 @@ class PacketLoop:
                 )
 
         self.loop = loop
+        # Bound once. `observe` runs a thousand times a second, and even the
+        # sys.modules fast path for `import numpy` is a microsecond of it.
+        self._np = np
         self.channels = np.asarray(channels, dtype=np.intp)
         self._dtype = DTYPE_BY_BYTE_SIZE[params.ch_sample_byte_size]
         self._total_channels = total
@@ -579,8 +680,7 @@ class PacketLoop:
     def observe(self, packet):
         """Decode the watched channels and run one decision. Never raises."""
         try:
-            import numpy as np
-
+            np = self._np
             frames = len(packet.payload) // self._bytes_per_frame
             if frames < 1:
                 return None
@@ -595,14 +695,42 @@ class PacketLoop:
             return self.loop.process(self._offset + block * self._scale)
         except Exception:  # noqa: BLE001 - the recording outranks the loop
             self.decode_errors += 1
+            # The frames still happened, and the writer still wrote them. Not
+            # telling the detector would leave `Spike.frame` offset from the
+            # raw file by however many frames were skipped, silently and
+            # permanently - and locating a spike in the recording is that
+            # field's whole purpose.
+            self.skip(packet)
             return None
+
+    def skip(self, packet) -> None:
+        """Account for a packet without deciding on it. Never raises.
+
+        For frames that reach the writer but must not reach the policy - the
+        backlog drain after a stop, where deciding would deliver stimuli
+        triggered by data seconds old. The detector still needs to know the
+        frames went by, or every later spike is offset from the recording.
+
+        Public, and delegated through any wrapper, because the caller in
+        `session.py` holds only the object it was handed. The first version of
+        this reached in for `loop._bytes_per_frame`, which the UI's wrapper
+        does not have - so it raised, was swallowed by its own guard, and
+        silently did nothing in the one path the window actually uses.
+        """
+        try:
+            self.loop.detector.skip_frames(
+                len(packet.payload) // self._bytes_per_frame)
+        except Exception:  # noqa: BLE001 - bookkeeping never costs a recording
+            pass
 
     def warnings(self):
         problems = list(self.loop.warnings())
         if self.decode_errors:
             problems.append(
                 f"the closed loop failed to decode {self.decode_errors} "
-                "packet(s). The recording itself is unaffected."
+                "packet(s), so spike frame numbers past that point are offset "
+                "from the recording and cannot be used to locate a spike in "
+                "the raw file. The recording itself is unaffected."
             )
         return problems
 
