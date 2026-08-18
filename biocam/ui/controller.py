@@ -36,6 +36,13 @@ from dataclasses import dataclass, field
 # Events kept for the UI to collect. Roughly a screenful of history; the UI
 # polls several times a second, so reaching this means it has stopped polling
 # rather than merely fallen behind.
+def _utc_now() -> str:
+    """An ISO-8601 UTC stamp. One place, so two files cannot disagree."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 EVENT_RING_CAPACITY = 512
 
 # Waveforms kept for sorting. A sort needs a representative sample, not every
@@ -195,6 +202,8 @@ class SessionController:
         self._lock = threading.Lock()
         self._state = SessionSnapshot()
         self._started_at = None
+        self._started_utc = None
+        self._finished_utc = None
         self._factory = None
         self._clock = None
         self._monitor = None
@@ -226,6 +235,7 @@ class SessionController:
         self._waveforms.clear()
         self._waveforms_seen = 0
         self._started_at = time.perf_counter()
+        self._started_utc = _utc_now()
         with self._lock:
             self._state = SessionSnapshot(
                 running=True,
@@ -323,6 +333,7 @@ class SessionController:
                     warnings=self._collect_warnings(clock),
                 )
         finally:
+            self._finished_utc = _utc_now()
             self._started_at = None
 
     def _finish(self, result, writer, clock) -> None:
@@ -423,6 +434,39 @@ class SessionController:
             **self._live_progress(),
             **self._stim_counts(),
             **self._loop_counts(),
+        )
+
+    def build_manifest(self, *, live: bool = False, requested_duration_sec=None,
+                       stimulus_plan=None, stimulus_pattern=None,
+                       raw_path="", meta_path="", stimulus_log_path=""):
+        """Assemble the record of what this session was, and what it did.
+
+        Everything about the configuration is read off the objects that ran,
+        not off whatever the caller believed it had asked for, so the manifest
+        cannot quietly disagree with the session it describes.
+        """
+        from biocam.manifest import (
+            SessionManifest, closed_loop_settings, describe_environment,
+            detection_settings, outcome_from, stimulus_settings,
+        )
+
+        state = self.snapshot()
+        return SessionManifest(
+            live=live,
+            source_name=state.source_name or "",
+            started_utc=self._started_utc or "",
+            finished_utc=self._finished_utc or _utc_now(),
+            raw_path=str(raw_path or state.output_path or ""),
+            meta_path=str(meta_path or ""),
+            stimulus_log_path=str(stimulus_log_path or ""),
+            requested_duration_sec=requested_duration_sec,
+            detection=detection_settings(self._loop),
+            closed_loop=closed_loop_settings(self._loop),
+            traces={"channels": self.trace_channels()},
+            stimulus=stimulus_settings(stimulus_plan, stimulus_pattern),
+            outcome=outcome_from(state, self._loop),
+            warnings=tuple(state.warnings),
+            environment=describe_environment(),
         )
 
     def acquisition_us(self) -> float:

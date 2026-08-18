@@ -780,3 +780,175 @@ def test_the_train_button_follows_the_recording(root, tmp_path, demo):
 
     pump(root, window)
     assert str(window.btn_train["state"]) == "disabled"
+
+
+# --------------------------------------------------------------------------
+# Asymmetric pulses. A short high-amplitude phase with a long low-amplitude
+# recovery is a standard configuration and was previously not expressible.
+# --------------------------------------------------------------------------
+
+def test_mirroring_still_gives_a_symmetric_balanced_pulse(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_amplitude.set("100")
+    window.var_phase.set("200")
+    assert window.var_mirror.get() is True
+    spec = window._pulse_spec()
+    assert spec.amplitude1 == 100.0
+    assert spec.amplitude2 == -100.0
+    assert spec.phase2_us == 200.0
+    assert spec.net_charge_pc == 0.0
+
+
+def test_an_asymmetric_balanced_pulse_is_expressible(root, tmp_path, demo):
+    # -200 uA for 100 us, then +50 uA for 400 us. Same charge either way, very
+    # different pulse - and impossible to say before this.
+    window = a_window(root, tmp_path, demo)
+    window.var_mirror.set(False)
+    window._on_mirror_toggled()
+    window.var_amplitude.set("-200")
+    window.var_phase.set("100")
+    window.var_amplitude2.set("50")
+    window.var_phase2.set("400")
+    spec = window._pulse_spec()
+    assert spec.amplitude1 == -200.0
+    assert spec.phase1_us == 100.0
+    assert spec.amplitude2 == 50.0
+    assert spec.phase2_us == 400.0
+    assert spec.net_charge_pc == 0.0, "this configuration is charge-balanced"
+    plan, _pattern = window._build_stimulus()
+    assert "balanced" in plan.describe()
+
+
+def test_an_unbalanced_pulse_is_still_refused(root, tmp_path, demo):
+    # The second-phase fields shape the pulse; they do not let you escape the
+    # charge constraint. Net DC is what damages electrodes and tissue.
+    window = a_window(root, tmp_path, demo)
+    window.var_mirror.set(False)
+    window._on_mirror_toggled()
+    window.var_amplitude.set("-200")
+    window.var_phase.set("200")
+    window.var_amplitude2.set("50")
+    window.var_phase2.set("200")        # a quarter of the charge back
+    with pytest.raises(Exception):
+        window._build_stimulus()
+
+
+def test_the_second_phase_fields_are_greyed_while_mirroring(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    assert all(str(e["state"]) == "disabled"
+               for e in window.second_phase_entries)
+    window.var_mirror.set(False)
+    window._on_mirror_toggled()
+    assert all(str(e["state"]) == "normal"
+               for e in window.second_phase_entries)
+
+
+def test_the_mirrored_fields_show_what_will_be_delivered(root, tmp_path, demo):
+    # Greyed-out fields showing stale numbers would contradict the pulse.
+    window = a_window(root, tmp_path, demo)
+    window.var_amplitude.set("250")
+    window.var_phase.set("300")
+    window._on_mirror_toggled()
+    assert float(window.var_amplitude2.get()) == -250.0
+    assert window.var_phase2.get() == "300"
+
+
+def test_a_train_uses_the_asymmetric_pulse_too(root, tmp_path, demo):
+    # Both paths share _pulse_spec, so a train cannot deliver a different
+    # pulse from the one on screen.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_mirror.set(False)
+    window._on_mirror_toggled()
+    window.var_amplitude.set("-200")
+    window.var_phase.set("100")
+    window.var_amplitude2.set("50")
+    window.var_phase2.set("400")
+    single, _ = window._build_stimulus()
+    train, _ = window._build_train()
+    assert train.pulse_plan.constructor_args() == single.constructor_args()
+
+
+# --------------------------------------------------------------------------
+# Tkinter prints callback exceptions and carries on. That means a window can
+# throw on every field edit while the test suite stays green, because the
+# tests only ever observe the end state. This catches that class directly.
+# --------------------------------------------------------------------------
+
+def collecting_root(root):
+    """Make Tk callback exceptions visible instead of printed-and-forgotten."""
+    caught = []
+    root.report_callback_exception = (
+        lambda exc, value, tb: caught.append(f"{exc.__name__}: {value}"))
+    return caught
+
+
+def test_building_the_window_raises_nothing_in_a_callback(root, tmp_path, demo):
+    caught = collecting_root(root)
+    a_window(root, tmp_path, demo)
+    root.update()
+    assert caught == [], f"exceptions swallowed during construction: {caught}"
+
+
+def test_editing_the_stimulus_fields_raises_nothing(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    caught = collecting_root(root)
+    for var, value in ((window.var_amplitude, "250"),
+                       (window.var_phase, "300"),
+                       (window.var_gap, "50"),
+                       (window.var_positive, "3,4"),
+                       (window.var_negative, "5,6")):
+        var.set(value)
+        root.update()
+    assert caught == [], f"exceptions swallowed while editing: {caught}"
+
+
+def test_toggling_the_mirror_raises_nothing(root, tmp_path, demo):
+    # This is the one that was broken: toggling writes the mirrored fields,
+    # whose own write-traces fire back into validation.
+    window = a_window(root, tmp_path, demo)
+    caught = collecting_root(root)
+    for value in (False, True, False):
+        window.var_mirror.set(value)
+        window._on_mirror_toggled()
+        root.update()
+    assert caught == [], f"exceptions swallowed while toggling: {caught}"
+
+
+def test_a_finished_session_writes_a_readable_record(root, tmp_path, demo):
+    # The record is written at the very end of a session, so a bug in it
+    # surfaces at the worst possible moment - after a lab run, when the
+    # configuration it was meant to preserve is already gone.
+    import json
+
+    window = a_window(root, tmp_path, demo)
+    window.var_name.set("run1")
+    window.var_detect.set(True)
+    # The fixture's 4-channel array is a 2x2 grid, so these are the only
+    # coordinates on it. Set through the text fields, which is what the
+    # stimulus reads; _on_field_edited mirrors them into the picture, and the
+    # picture is what detection watches.
+    # Different columns: positive and negative on the same column is
+    # forbidden by the API, and the window refuses it.
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window._on_field_edited()
+    caught = collecting_root(root)
+    window._on_start()
+    pump(root, window)
+    root.update()
+
+    record = tmp_path / "out" / "run1_session.json"
+    assert record.exists(), (
+        f"no session record was written; callbacks caught: {caught}")
+    data = json.loads(record.read_text(encoding="utf-8"))
+    assert data["live"] is False
+    assert data["detection"]["enabled"] is True
+    assert data["outcome"]["verdict"] == "clean"
+    assert data["stimulus"]["positive"] == [[1, 1]]
+    assert data["stimulus"]["negative"] == [[2, 2]]
+    # The electrodes that were actually watched, which is the whole point:
+    # without it a spike count in this recording belongs to nothing.
+    assert data["detection"]["channels"] == [0, 3]
+    assert data["closed_loop"]["armed"] is False

@@ -306,6 +306,13 @@ class BioCamWindow:
         self.var_amplitude = tk.StringVar(value="100")
         self.var_phase = tk.StringVar(value="200")
         self.var_gap = tk.StringVar(value="100")
+        # The second phase, independently settable. Mirroring is the default
+        # because it is charge-balanced by construction, but a short
+        # high-amplitude phase followed by a long low-amplitude recovery is a
+        # standard configuration and was previously not expressible at all.
+        self.var_mirror = tk.BooleanVar(value=True)
+        self.var_amplitude2 = tk.StringVar(value="-100")
+        self.var_phase2 = tk.StringVar(value="200")
         self.var_positive = tk.StringVar(value="10,10")
         self.var_negative = tk.StringVar(value="20,30")
         self.var_resolution = tk.StringVar(value="10")
@@ -314,8 +321,6 @@ class BioCamWindow:
             ("Amplitude (µA)", self.var_amplitude),
             ("Phase duration (µs)", self.var_phase),
             ("Inter-phase gap (µs)", self.var_gap),
-            ("Positive electrode(s)", self.var_positive),
-            ("Negative electrode(s)", self.var_negative),
         ]
         row = 0
         for label, var in fields:
@@ -324,6 +329,30 @@ class BioCamWindow:
             entry.grid(row=row, column=1, sticky="w", pady=2)
             var.trace_add("write", lambda *_: self._on_field_edited())
             row += 1
+
+        ttk.Checkbutton(
+            frame, text="Second phase mirrors the first",
+            variable=self.var_mirror, command=self._on_mirror_toggled,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+        self.second_phase_entries = []
+        for label, var in (("Second amplitude (µA)", self.var_amplitude2),
+                           ("Second duration (µs)", self.var_phase2)):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(frame, textvariable=var, width=18)
+            entry.grid(row=row, column=1, sticky="w", pady=2)
+            var.trace_add("write", lambda *_: self._on_field_edited())
+            self.second_phase_entries.append(entry)
+            row += 1
+
+        for label, var in (("Positive electrode(s)", self.var_positive),
+                           ("Negative electrode(s)", self.var_negative)):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(frame, textvariable=var, width=18)
+            entry.grid(row=row, column=1, sticky="w", pady=2)
+            var.trace_add("write", lambda *_: self._on_field_edited())
+            row += 1
+        self._on_mirror_toggled()
 
         if not self.live:
             ttk.Label(frame, text="Clock resolution (µs)").grid(
@@ -667,6 +696,22 @@ class BioCamWindow:
         validate_pattern(pattern, self.grid)
         return plan_pulse(self._pulse_spec(), self._constraints()), pattern
 
+    def _on_mirror_toggled(self):
+        """Grey the second-phase fields when they are being derived."""
+        if not hasattr(self, "second_phase_entries"):
+            return
+        state = "disabled" if self.var_mirror.get() else "normal"
+        for entry in self.second_phase_entries:
+            entry.configure(state=state)
+        if self.var_mirror.get():
+            # Keep them showing what will actually be delivered, so the
+            # displayed numbers never contradict the pulse.
+            self.var_amplitude2.set(str(-_as_float(self.var_amplitude, 0.0)))
+            self.var_phase2.set(self.var_phase.get())
+        # Guarded: this also runs while the panel is still being built, before
+        # the button whose state validation sets exists.
+        self._on_field_edited()
+
     def _pulse_spec(self):
         """The pulse the fields describe, before planning.
 
@@ -674,15 +719,25 @@ class BioCamWindow:
         describe different pulses - a train that quietly used a different
         amplitude from the one shown would be very hard to notice and very
         easy to write.
+
+        Mirroring is charge-balanced by construction. Unmirrored, it is not,
+        so `plan()` still enforces balance and refuses anything that injects
+        net DC - the fields let you shape the two phases, not escape the
+        constraint.
         """
         from biocam.stim import PulseSpec
 
         amplitude = float(self.var_amplitude.get())
         phase_us = float(self.var_phase.get())
+        if self.var_mirror.get():
+            amplitude2, phase2_us = -amplitude, phase_us
+        else:
+            amplitude2 = float(self.var_amplitude2.get())
+            phase2_us = float(self.var_phase2.get())
         return PulseSpec(
             amplitude1=amplitude, phase1_us=phase_us,
             inter_us=float(self.var_gap.get()),
-            amplitude2=-amplitude, phase2_us=phase_us, name="ui-pulse",
+            amplitude2=amplitude2, phase2_us=phase2_us, name="ui-pulse",
         )
 
     def _constraints(self):
@@ -733,6 +788,15 @@ class BioCamWindow:
         A greyed-out control with no explanation is the thing an operator
         cannot debug alone in the middle of an experiment.
         """
+        # Field traces fire while the panel is still being built - setting the
+        # mirrored second-phase fields triggers their own write callbacks - so
+        # this runs before the widgets it configures exist. Tkinter prints a
+        # callback exception and carries on, which is exactly why 54 passing
+        # UI tests did not notice: the window threw on every edit during
+        # construction and the tests only ever saw the end state.
+        if not hasattr(self, "btn_stim"):
+            return
+
         try:
             plan, pattern = self._build_stimulus()
         except Exception as exc:  # noqa: BLE001 - every failure is a message
@@ -1094,6 +1158,46 @@ class BioCamWindow:
         self._stimulator = None
         self._log("Instrument released.", "ok")
 
+    def _write_manifest(self):
+        """Persist what this session WAS, beside what it recorded.
+
+        The sidecar says what was acquired and the stimulus log says what
+        fired. Neither says which electrodes were watched, at what threshold,
+        under which policy, or inside what limits - so two sessions driven by
+        completely different rules are indistinguishable on disk. Six weeks
+        later, on a shared instrument, that is the difference between data and
+        an unlabelled file.
+
+        Written after the stimulus log and guarded the same way: a recording
+        is never lost because a record of it could not be saved.
+        """
+        if self._factory is None:
+            return
+        output = Path(self._factory.output_path)
+        path = output.with_name(output.stem + "_session.json")
+        plan = pattern = None
+        try:
+            plan, pattern = self._build_stimulus()
+        except Exception:  # noqa: BLE001 - an invalid pulse is still a fact
+            pass                # about the session; record the rest anyway
+        try:
+            manifest = self.controller.build_manifest(
+                live=self.live,
+                requested_duration_sec=(
+                    None if self.var_until_stopped.get()
+                    else _as_float(self.var_duration, None)),
+                stimulus_plan=plan, stimulus_pattern=pattern,
+                raw_path=output,
+                meta_path=output.with_name(output.stem + "_meta.json"),
+                stimulus_log_path=output.with_name(output.stem + "_stimuli.json"),
+            )
+            manifest.write(path)
+        except Exception as exc:  # noqa: BLE001 - never at the cost of the UI
+            self._log(f"Could not write the session record to {path}: {exc}. "
+                      "The recording itself is unaffected.", "bad")
+            return
+        self._log(f"Session record: {path} ({manifest.describe()})", "ok")
+
     def _write_stimulus_log(self):
         """Persist what was stimulated, beside the recording it belongs to.
 
@@ -1193,6 +1297,7 @@ class BioCamWindow:
             # the recording finished and Start greyed out for good.
             self.btn_start.configure(state="normal")
             self._write_stimulus_log()
+            self._write_manifest()
             self.btn_stop.configure(state="disabled")
             self._log(f"Finished: {state.stop_reason}, {state.frames:,} frames, "
                       f"verdict {state.verdict}",
