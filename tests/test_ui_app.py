@@ -635,3 +635,148 @@ def test_a_half_typed_threshold_does_not_stop_a_recording(root, tmp_path, demo):
     window.var_sigmas.set("")               # mid-keystroke
     settings = window._analysis_settings()
     assert settings["threshold_sigmas"] == 5.0
+
+
+# --------------------------------------------------------------------------
+# Scheduled trains (issue #34)
+#
+# The property that matters is where in TIME the train lands. Stimulation
+# timestamps are counted from the beginning of the acquisition, not from now,
+# so an unshifted train sent mid-recording is scheduled entirely in the past -
+# and what the instrument does with a past timestamp is untested (#24).
+# --------------------------------------------------------------------------
+
+def test_a_train_describes_itself_before_it_is_sent(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_train_count.set("10")
+    window.var_train_rate.set("20")
+    window._on_train_edited()
+    text = window.lbl_train.cget("text")
+    assert "10" in text, text
+
+
+def test_a_single_pulse_train_is_refused(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_train_count.set("1")
+    window._on_train_edited()
+    assert "two pulses" in window.lbl_train.cget("text")
+    assert str(window.btn_train["state"]) == "disabled"
+
+
+def test_a_zero_rate_is_refused(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_train_rate.set("0")
+    window._on_train_edited()
+    assert "above zero" in window.lbl_train.cget("text")
+
+
+def test_a_train_is_refused_when_there_is_no_clock_to_place_it_against(
+        root, tmp_path, demo):
+    # Before a recording starts there is no acquisition time, so there is no
+    # answer to "when should this fire". Sending anyway would schedule it
+    # against an unknown origin.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    with pytest.raises(RuntimeError, match="acquisition clock"):
+        window._positioned_train()
+
+
+def test_a_train_is_shifted_into_acquisition_time(root, tmp_path, demo):
+    # The whole point. A train built with a 100 ms delay and sent one second
+    # into a recording must fire at ~1.1 s of acquisition time, not at 0.1 s.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_train_count.set("5")
+    window.var_train_rate.set("10")
+    window.var_train_delay.set("100")
+
+    class Reading:
+        acquisition_us = 1_000_000.0
+        source = "test"
+        frames_seen = 1000
+        frames_lost = 0
+
+    class Clock:
+        def read(self):
+            return Reading()
+
+    window.controller._clock = Clock()
+    plan, pattern, train = window._positioned_train()
+    unshifted = train.timestamps_us[0]
+    assert unshifted == pytest.approx(100_000.0)
+    assert plan.timestamps_us[0] == pytest.approx(1_100_000.0), (
+        "the train was not moved into acquisition time, so every timestamp "
+        "sits in the past"
+    )
+    # The spacing is untouched by the shift.
+    gaps = [b - a for a, b in zip(plan.timestamps_us, plan.timestamps_us[1:])]
+    assert all(g == pytest.approx(100_000.0) for g in gaps)
+
+
+def test_a_sent_train_is_queued_as_scheduled_not_immediate(root, tmp_path, demo):
+    # A scheduled request and an immediate one take different paths in the
+    # stimulator and are logged differently. A train queued as immediate would
+    # fire all its pulses at once.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_train_count.set("4")
+
+    class Reading:
+        acquisition_us = 500_000.0
+
+    class Clock:
+        def read(self):
+            return Reading()
+
+    window.controller._clock = Clock()
+    window._on_train()
+
+    queued = window.controller.stim_queue.take()
+    assert queued is not None, "the train never reached the queue"
+    assert queued.scheduled is True
+    assert queued.label == "train"
+    assert len(queued.plan.timestamps_us) == 4
+
+
+def test_the_train_and_the_single_pulse_describe_the_same_pulse(
+        root, tmp_path, demo):
+    # Both paths build their spec in one place. If they ever diverged, a train
+    # would deliver a different amplitude from the one displayed - hard to
+    # notice, and easy to introduce.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window.var_amplitude.set("120")
+    window.var_phase.set("200")
+
+    single, _pattern = window._build_stimulus()
+    train, _pattern2 = window._build_train()
+    assert train.pulse_plan.constructor_args() == single.constructor_args()
+
+
+def test_the_train_button_follows_the_recording(root, tmp_path, demo):
+    # A train is scheduled against acquisition time, so it means nothing when
+    # nothing is being acquired. The button has to say so by itself - it is
+    # otherwise only refreshed when a field is edited, which would leave it
+    # enabled after a recording ended.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    window._on_train_edited()
+    assert str(window.btn_train["state"]) == "disabled"
+
+    window._on_start()
+    root.update()
+    assert str(window.btn_train["state"]) == "normal"
+
+    pump(root, window)
+    assert str(window.btn_train["state"]) == "disabled"

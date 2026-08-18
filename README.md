@@ -43,6 +43,7 @@ each one; #16 is the ten-minute first session, #21 the first stimulation step.
 15. [Stimulation](#15-stimulation)
 16. [Recording and stimulating together](#16-recording-and-stimulating-together)
 17. [The operator window](#17-the-operator-window)
+18. [Spike detection and sorting](#18-spike-detection-and-sorting)
 
 ---
 
@@ -52,16 +53,15 @@ This repository controls a 3Brain BioCAM DupleX: a 4096-channel high-density
 microelectrode array (MEA) system capable of both recording extracellular
 signal and delivering electrical stimulation.
 
-- **Built:** the acquisition path (Phase 1) — `python -m biocam.cli record`,
-  recording all 4096 channels to disk with gap detection and an integrity
-  sidecar, plus conversion to HDF5 — and the stimulation engine (Phase 2),
-  `python -m biocam.cli stim` (§15).
+- **Built:** all seven phases. Acquisition (`biocam record`, all 4096
+  channels with gap detection and an integrity sidecar, plus HDF5
+  conversion), the stimulation engine (`biocam stim`), combined
+  recording-and-stimulation sessions, the operator window (`python -m
+  biocam.ui`), online spike detection, closed-loop stimulation, and spike
+  sorting with three selectable techniques (`biocam analyse`). See §14.
 - **Superseded:** `BioCam_DupleX_API/recorder.py` and `connector.py`, the
   original scripts. They have known defects (§7, Appendix A of the design
   spec); Phase 1 replaced them.
-- **Does not exist yet:** combined recording+stimulation sessions (Phase 3), a
-  UI (Phase 4), online spike detection (Phase 5), and closed-loop stimulation
-  (Phase 6). See §14.
 - **Never executed on the instrument:** all of it. The development machine is
   ~600 km from the BioCAM. A green test suite is evidence about Layers 2–3
   only (§12) and proves nothing about the .NET interop.
@@ -489,10 +489,11 @@ for anything not covered here.
   is configurable from **1 to 250 ms** (`recorder.py --packet-ms`).
 - **Closed-loop latency** (detect → decide → stimulate) is published at
   **≈1.15 ms mean, ≈1.52 ms worst case**, measured at a 1 ms acquisition
-  period. Nothing in this repository implements closed-loop stimulation yet
-  (Phase 6, §14) — this figure is the budget any future implementation must
-  fit inside, most of which is consumed by whatever work runs inside the data
-  callback (§12 callback rule).
+  period. Closed-loop stimulation is now implemented (Phase 6, §14) and this
+  figure is the budget it has to fit inside — most of which is consumed by
+  whatever work runs on the packet path (§12 callback rule). What it costs
+  here, and what still has to be measured in the lab, is in
+  [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md).
 - **Stimulation** is delivered through positive/negative electrode endpoint
   pairs. Constraints that are easy to violate and fail silently or ignore
   extra data rather than erroring loudly:
@@ -507,10 +508,11 @@ for anything not covered here.
     **26 µs + 8.4 µs × (rows − 1)**, which bounds how fast stimulation
     patterns can be cycled.
 
-None of the stimulation engine exists in `biocam/` yet — see Phase 2 in
-`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md` for the
-planned design (three `Send` overloads, an on-device protocol engine, and why
-scheduling belongs on the instrument rather than in a Python loop).
+The stimulation engine is in `biocam/stim/` and `biocam/interop/stimulator.py`
+— see §15, and Phase 2 in
+`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md` for the design
+(three `Send` overloads, an on-device protocol engine, and why scheduling
+belongs on the instrument rather than in a Python loop).
 
 ---
 
@@ -521,8 +523,8 @@ scheduling belongs on the instrument rather than in a Python loop).
 | `TakeBioCamControl` returns `None` | BrainWave, or another 3Brain program (including a previous crashed Python process), still holds the device — only one process may control the BioCAM at a time | Close BrainWave and any other 3Brain software, then retry (§2) |
 | No device found / connection times out | USB not connected, or BioCAM not powered | Check the USB cable and power; confirm the BioCAM's status LED is on |
 | `MeaPlate.IsConnected` is `False` after `TakeBioCamControl` succeeds | The MEA plate is not seated on the DupleX head | Reseat the MEA plate on the DupleX head and retry |
-| **No stimulation output, with no error reported** | **Known defect.** The stimulator lifecycle is `Initialize → Start → Stop → Close`; `BioCam_DupleX_API/connector.py` calls `Initialize` and `Close` but never `Start()`, so pulses silently never fire | Add the missing `Start()` call, or wait for the Phase 1/2 rebuild (§14) — do not assume stimulation is working just because nothing errored |
-| Data-loss warnings, or gaps that look like signal but aren't | Acquisition period too short for the work being done per packet, or slow work inside the data callback (`recorder.py` currently writes to disk and prints inside the callback — a known defect, §7) | Increase `--packet-ms`; longer term, wait for the Phase 1 rebuild that moves I/O off the callback thread (§12 callback rule) |
+| **No stimulation output from `connector.py`** | **Known defect, but not the one this table used to claim.** The stimulator lifecycle is `Initialize → Start → Stop → Close`; `BioCam_DupleX_API/connector.py` calls only `Initialize` and `Close`. What that is, precisely, is an **incomplete lifecycle** — not an observed silent failure. The XML documents every `Send` overload as throwing `InvalidOperationException` "when the stimulator has not started", and `connector.py` never calls `Send` at all, so nothing about it is silent. What the DupleX actually does is issue #22 | Use `biocam stim` (§15), which runs all four calls and checks every return. Do not assume stimulation is working just because nothing errored |
+| Data-loss warnings, or gaps that look like signal but aren't | Acquisition period too short for the work being done per packet, or slow work inside the data callback (`recorder.py` writes to disk and prints inside the callback — a known defect, §7, and the reason it was replaced) | Increase `--packet-ms`, and use `biocam record` rather than `recorder.py`: it hands the payload to a bounded queue and returns (§12 callback rule). If the closed loop is armed, see [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md) — 32 watched channels at `--packet-ms 1` does not fit |
 | `ModuleNotFoundError: No module named 'clr'` | `pythonnet` is not installed — you are on a development machine, not the lab machine | Use `requirements-dev.txt`, not `requirements.txt` (§5). Installing `pythonnet` is neither necessary nor sufficient without Windows + .NET Framework anyway (§3) |
 
 ---
@@ -675,9 +677,14 @@ only:
 | 1 | Acquisition: recording, saving, data integrity, on the three-layer split | **Done and merged.** Gate 1 clean. Never run on the instrument — issues #11–#18 |
 | 2 | Stimulation engine + manual and scheduled triggering | **Merged** (PR #25), Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
 | 3 | Session control: recording and stimulation together, changing live | **Merged** (PR #28). Clock, stimulus log and control queue (§16). Driven by the window in §17 — issues #26, #27 |
-| 4 | UI | **In progress.** `python -m biocam.ui` — runs with or without the instrument (§17). Live path untested |
-| 5 | Spike detection | Not started |
-| 6 | Closed-loop stimulation (depends on Phase 5) | Not started |
+| 4 | UI | **Merged** (PR #29). `python -m biocam.ui` — runs with or without the instrument (§17). Live path untested |
+| 5 | Spike detection | **Merged** (PR #35). Streaming high-pass, Quiroga noise estimate, threshold crossings across packet boundaries |
+| 6 | Closed-loop stimulation (depends on Phase 5) | **Merged** (PR #36). Policy, safety envelope, `warm_up` — issues #26, #27, #38, #39 |
+| 7 | Spike sorting, and making the above reachable | **Merged** (PR #37). Three techniques, a null-corrected separation score, `biocam analyse`, the analysis panel, live traces |
+
+Nothing in phases 4–7 has ever run on the instrument either. The closed loop's
+per-packet budget, and what still has to be measured in the lab, are in
+[`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md).
 
 If this table and the roadmap document ever disagree, the roadmap document is
 correct — this table is a pointer, not a second source of truth.
@@ -788,12 +795,17 @@ A train planned as "start in half a second" and sent ten minutes into a
 recording has every timestamp ten minutes in the past. What the instrument does
 then is untested (issue #24), and the plausible outcomes include firing the
 whole train at once. `TrainPlan.shifted_by(current_acquisition_time_us)` does
-the conversion — but note that nothing in this repository can yet *read* the
-current acquisition time, which is the other half of issue #24.
+the conversion.
 
-**So `biocam stim --count N` cannot run yet.** Nothing on the `stim` path
-starts an acquisition, so a scheduled train has no time origin, and the command
-refuses with a clear message rather than sending one into an undefined one.
+**`biocam stim --count N` still cannot run on its own.** Nothing on the `stim`
+path starts an acquisition, so a scheduled train has no time origin there, and
+the command refuses with a clear message rather than sending one into an
+undefined one.
+
+**Send trains from the window instead** (§17). It records and stimulates in one
+session, so the acquisition clock has a reading, and the "Send train" button
+shifts the plan by it before queueing. If the clock has no reading yet the
+train is refused rather than sent to an unknown point in time.
 Single pulses work. Trains wait on issue #24 and on Phase 3, where recording
 and stimulation are driven together.
 
@@ -902,11 +914,10 @@ Two details worth knowing when you read one:
 
 ### 16.4 What is still missing
 
-There is **no command yet that records and stimulates in one run**. The
-mechanism is built and tested; driving it — a window with a "stimulate now"
-button, a protocol timeline — is Phase 4. Until then `biocam record` and
-`biocam stim` are separate, and scheduled trains are not usable from the CLI
-at all (§15.5).
+The **CLI** still has no single command that records and stimulates in one
+run: `biocam record` and `biocam stim` remain separate, and scheduled trains
+are not usable from the CLI at all (§15.5). The **window** does both — it
+records and stimulates in one session, and can send scheduled trains (§17).
 
 ---
 
@@ -963,12 +974,125 @@ simulated run mistaken for a real one is worse than no run at all.
   is a warning the run survived; red is an error. Both are also in the
   session log with a timestamp.
 
-### 17.4 What it does not do yet
+### 17.4 Spikes, sorting and the closed loop
 
-- **No scheduled trains.** Single pulses only. Trains need a confirmed time
-  origin — issue #24.
-- **No live signal display.** It reports counts and health, not traces.
-  Rendering 4096 channels is a different problem and is not required to run
-  an experiment safely.
+The fourth panel turns on everything downstream of the recording. All of it
+watches **the electrodes selected on the array** — clicking an electrode is
+how you choose what to detect on, trace, and sort.
+
+- **Detect spikes** — a streaming high-pass and a threshold in units of the
+  noise, not of microvolts, so it adapts per electrode.
+- **Sorting technique** — Amplitude, PCA + k-means, or Template matching, run
+  on the spikes collected so far. Sorting is **per electrode**: a unit is a
+  neuron as heard by one site. The separation score is corrected against a
+  null, so a technique cannot report an impressive number for noise (§17.6).
+- **Close the loop** — stimulate on a detected spike, under a safety envelope
+  that the policy cannot override.
+
+Sorting is disabled while a recording runs. It competes with the thread
+draining the packet queue, and losing that race costs packets.
+
+Keep the watched set small. Detection over the whole array costs about three
+times a core, and [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md)
+has the measured per-packet numbers.
+
+### 17.5 Traces
+
+Under the array, one lane per selected electrode, each with its own vertical
+scale — one shared scale means a single saturated electrode flattens
+everything else to a line.
+
+Each column shows the **minimum and maximum** over its time bin rather than a
+sampled value. That matters: a spike is ~20 samples long and a column spans
+far more than that, so a subsampled trace would drop most spikes and change
+the height of the rest at random. The envelope cannot miss one.
+
+Capped at eight electrodes — past that the lanes are too thin to read and the
+cost stops being negligible.
+
+### 17.6 What it does not do yet
+
+- **Trains are scheduled, not verified.** The window can send them: it shifts
+  the plan by the acquisition clock's reading, and refuses if there is no
+  reading yet. Whether the instrument honours the schedule is untested —
+  issue #24.
+- **Sorting runs on what was collected, not on the file.** For a whole
+  recording use `biocam analyse` (§18).
+- **The array display assumes row-major channel ordering.** If the instrument
+  disagrees, clicking one electrode would stimulate another — issue #31, and
+  it is the first thing to check in the lab.
 - **Nothing here has run on the instrument.** The whole live path is
   untested; the simulation path is what the tests cover.
+
+---
+
+## 18. Spike detection and sorting
+
+```
+biocam analyse recording.raw recording_meta.json --channels 300,301        --sort pca --units 2
+```
+
+Detection and sorting on a finished recording. The same code the window runs
+live, so a result here and a result there mean the same thing.
+
+### 18.1 Detection
+
+A second-order Butterworth high-pass (300 Hz by default) and a threshold in
+units of the noise rather than microvolts, so it adapts to each electrode. The
+noise estimate is Quiroga's `median(|x|) / 0.6745`, which a burst cannot
+inflate the way a standard deviation can.
+
+`--suggest-units` reports how many units each electrode looks like it has,
+before you commit to a number.
+
+### 18.2 The three techniques
+
+| `--sort` | What it separates on | Fails when |
+|---|---|---|
+| `amplitude` | trough depth | two neurons at similar distance from the site |
+| `pca` | shape, projected onto its main axes | one unit is rare, so it contributes little variance |
+| `template` | correlation against per-unit mean shapes | shapes are similar but amplitudes differ |
+
+They fail differently, which is why there are three. If all three agree, that
+is worth more than any one of their scores.
+
+### 18.3 Read the separation score, not the silhouette
+
+**A silhouette score on one-dimensional data is high almost regardless of the
+data.** Split any single hump down the middle and you get two tidy halves. The
+amplitude technique scored **0.61 on pure noise** — a number that reads as
+"these units are convincing".
+
+So what is reported is the silhouette **minus what the same clustering scores
+on structureless data of the same shape**. On one synthetic fixture — 150
+waveforms, two units against pure noise:
+
+| technique | noise, raw | noise, corrected | real, raw | real, corrected |
+|---|---|---|---|---|
+| amplitude | **0.61** | 0.05 | 0.76 | 0.21 |
+| pca | 0.21 | −0.02 | 0.85 | 0.33 |
+| template | 0.03 | −0.00 | 0.69 | 0.57 |
+
+Read the amplitude row. Raw, it scores **0.61 on pure noise** and 0.76 on real
+units — those are not distinguishable by eye, and 0.61 alone would read as a
+solid result. Corrected, it is 0.05 against 0.21.
+
+The exact values depend on the fixture; what does not is that the corrected
+score for noise sits near zero for every technique. Both numbers are printed,
+so you can see the correction being applied — and below `0.10` the sorter says
+outright that its units are not to be trusted.
+
+### 18.4 Sorting is per electrode
+
+A unit is a neuron **as heard by one site**. Pooling waveforms across
+electrodes does not find neurons; it finds electrodes, and it does so
+convincingly, because the structure is real. Each electrode is fitted
+separately and reported separately.
+
+### 18.5 What this is not
+
+- **Not a spike sorter of record.** It is enough to see whether a preparation
+  has separable units and to drive a closed loop. For publication-grade
+  sorting, export to HDF5 (§8) and use a dedicated tool.
+- **Never run on instrument data.** Every number above comes from a
+  synthetic recording with known planted units. Real cultures are harder.

@@ -425,7 +425,24 @@ class SessionController:
             **self._loop_counts(),
         )
 
-    def request_stimulus(self, plan, pattern, *, label: str = "") -> bool:
+    def acquisition_us(self) -> float:
+        """Microseconds of signal acquired so far, or None if not recording.
+
+        The number a scheduled plan has to be shifted by. Stimulation
+        timestamps are counted from the beginning of the acquisition, not from
+        now, so a train built with `delay_us=0` and sent ten minutes in has
+        every timestamp already in the past.
+        """
+        clock = getattr(self, "_clock", None)
+        if clock is None:
+            return None
+        try:
+            return float(clock.read().acquisition_us)
+        except Exception:  # noqa: BLE001 - a caller can decide what to do
+            return None
+
+    def request_stimulus(self, plan, pattern, *, scheduled: bool = False,
+                         label: str = "") -> bool:
         """Ask for a stimulus. Returns False if it was not accepted.
 
         Never blocks - the UI thread must stay responsive, and a control
@@ -433,7 +450,8 @@ class SessionController:
         unbounded. A False here means the queue was full; the count is in the
         snapshot.
         """
-        return self.stim_queue.request(plan, pattern, label=label)
+        return self.stim_queue.request(plan, pattern, scheduled=scheduled,
+                                       label=label)
 
     # -- internals -------------------------------------------------------
 
