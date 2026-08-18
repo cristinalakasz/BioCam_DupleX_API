@@ -146,6 +146,12 @@ class NoiseEstimator:
         self.blocks += 1
         self.frames += block.shape[0]
 
+    def reset(self) -> None:
+        """Forget everything. Only correct before a recording starts."""
+        self.sigma[:] = 0.0
+        self.blocks = 0
+        self.frames = 0
+
     def thresholds(self, sigmas: float) -> np.ndarray:
         """The negative-going threshold per channel."""
         return -abs(sigmas) * self.sigma
@@ -202,6 +208,23 @@ class SpikeDetector:
     def ready(self) -> bool:
         """Whether the noise estimate has settled enough to detect."""
         return self.noise.ready
+
+    def reset(self) -> None:
+        """Return to the state of a detector that has seen nothing.
+
+        Exists so that a warm-up pass - running blocks through the whole code
+        path to pay its allocation and first-touch costs before a recording
+        starts - can be undone. Without the reset a warm-up would leave the
+        noise estimate and the filter carrying synthetic data, which is worse
+        than the cost it was avoiding.
+        """
+        self.filter.reset()
+        self.noise.reset()
+        self._frames_seen = 0
+        self._warmed = False
+        self._previous[:] = 0.0
+        self._last_spike[:] = -10 ** 15
+        self.spikes_detected = 0
 
     def detect(self, block) -> list:
         """Filter a block, update the noise estimate, and return its spikes.
