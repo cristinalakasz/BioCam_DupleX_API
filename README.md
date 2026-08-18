@@ -960,6 +960,19 @@ simulated run mistaken for a real one is worse than no run at all.
 **Every refusal is written next to the button**, live, as you type. If
 `Stimulate now` is greyed out, the reason is directly beneath it.
 
+**The second phase.** By default it mirrors the first, which is
+charge-balanced by construction. Untick *Second phase mirrors the first* to
+shape it independently — a short high-amplitude phase followed by a long
+low-amplitude recovery is a standard configuration and was previously not
+expressible at all. The charge constraint still holds: the fields let you
+shape the two phases, not escape it.
+
+**Trains.** Count, rate and a start delay. The plan is shifted by the
+acquisition clock before it is queued, because stimulation timestamps are
+counted from the beginning of the acquisition rather than from now (§15.5).
+With no clock reading yet, the train is refused rather than sent to an unknown
+point in time.
+
 ### 17.3 Reading the status panel
 
 - **Acquisition time** is what a scheduled stimulus would be timed against,
@@ -1010,7 +1023,29 @@ the height of the rest at random. The envelope cannot miss one.
 Capped at eight electrodes — past that the lanes are too thin to read and the
 cost stops being negligible.
 
-### 17.6 What it does not do yet
+### 17.6 What a session leaves behind
+
+Four files, named after the recording:
+
+| file | what it holds |
+|---|---|
+| `name.raw` | the signal |
+| `name_meta.json` | acquisition parameters and integrity |
+| `name_stimuli.json` | every stimulus: delivered, refused, or rejected |
+| `name_session.json` | **what the experiment was** |
+
+The last is the one to read first. The others say what was acquired and what
+fired; only this says which electrodes were watched, at what threshold, under
+which policy, inside what limits, whether the loop was actually armed, and
+whether the run was live or simulated. Two sessions driven by completely
+different rules are otherwise indistinguishable on disk — and six weeks later,
+on a shared instrument, that is the difference between data and an unlabelled
+file.
+
+Every field is read off the objects that ran, not off what the window believed
+it had configured, so the record cannot quietly disagree with the session.
+
+### 17.7 What it does not do yet
 
 - **Trains are scheduled, not verified.** The window can send them: it shifts
   the plan by the acquisition clock's reading, and refuses if there is no
