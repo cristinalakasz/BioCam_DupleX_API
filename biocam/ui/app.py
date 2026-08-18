@@ -231,6 +231,16 @@ class BioCamWindow:
         )
         self.array.canvas.grid(row=0, column=0, columnspan=3)
 
+        from biocam.ui.traceview import TraceStripView
+
+        # Directly under the array, because the electrodes it draws are the
+        # ones just clicked on it. Two panels apart would make the connection
+        # something the operator has to remember rather than see.
+        self.traces = TraceStripView(
+            frame, tk, width=self.n_cols * self.array.cell, height=200)
+        self.traces.canvas.grid(row=3, column=0, columnspan=3,
+                                sticky="ew", pady=(8, 0))
+
         legend = ttk.Frame(frame)
         legend.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         tk.Label(legend, text="  ", bg=POSITIVE_COLOUR,
@@ -357,6 +367,7 @@ class BioCamWindow:
         frame.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
 
         self.var_detect = tk.BooleanVar(value=False)
+        self.var_traces = tk.BooleanVar(value=True)
         self.var_sigmas = tk.StringVar(value="5")
         self.var_sort = tk.StringVar(value="(none)")
         self.var_units = tk.StringVar(value="2")
@@ -369,6 +380,11 @@ class BioCamWindow:
         ttk.Checkbutton(
             frame, text="Detect spikes on the selected electrodes",
             variable=self.var_detect, command=self._refresh_analysis,
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Checkbutton(
+            frame, text="Draw traces for the selected electrodes",
+            variable=self.var_traces, command=self._refresh_analysis,
         ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         ttk.Label(frame, text="Threshold (sigmas)").grid(
@@ -467,6 +483,22 @@ class BioCamWindow:
                     f"{self.var_sigmas.get()} sigma.")
         else:
             lines.append("Detection off.")
+
+        if self.var_traces.get():
+            from biocam.data.traces import MAX_TRACE_CHANNELS
+
+            if not selected:
+                lines.append(
+                    "Traces on, but no electrodes are selected - click some.")
+            elif selected > MAX_TRACE_CHANNELS:
+                lines.append(
+                    f"Traces: the first {MAX_TRACE_CHANNELS} of {selected} "
+                    "selected. A trace is for looking at closely, and this "
+                    "costs time on the thread draining the packet queue.")
+            else:
+                lines.append(
+                    f"Traces: {selected} electrode(s), peak-preserving so a "
+                    "spike cannot fall between samples.")
 
         technique = self.sort_technique
         if technique:
@@ -836,6 +868,7 @@ class BioCamWindow:
         if not channels:
             return {}
         return {
+            "trace_channels": self._trace_channels(),
             "detect_channels": tuple(channels),
             "threshold_sigmas": _as_float(self.var_sigmas, 5.0),
             "collect_waveforms": self.sort_technique is not None,
@@ -844,6 +877,32 @@ class BioCamWindow:
             "min_interval_ms": _as_float(self.var_min_interval, 20.0),
             "max_rate_hz": _as_float(self.var_max_rate, 10.0),
         }
+
+    def _trace_channels(self) -> tuple:
+        """The electrodes whose signal is drawn, in array order.
+
+        The array selection again, capped: a trace is for looking at closely
+        and the cost lands on the thread draining the packet queue, so past
+        `MAX_TRACE_CHANNELS` the extras are dropped and the operator is told.
+        Silently drawing eight of twenty would be worse - it reads as "these
+        are the ones you chose".
+        """
+        from biocam.data.traces import MAX_TRACE_CHANNELS
+        from biocam.ui.arrayview import channel_index
+
+        if not self.var_traces.get():
+            return ()
+        chosen = list(self.array.positive) + list(self.array.negative)
+        channels = sorted({channel_index(row, col, self.n_cols)
+                           for row, col in chosen})
+        if len(channels) > MAX_TRACE_CHANNELS:
+            self._log(
+                f"{len(channels)} electrodes are selected but only "
+                f"{MAX_TRACE_CHANNELS} can be traced at once; tracing the "
+                f"first {MAX_TRACE_CHANNELS}. Detection still watches all of "
+                "them.", "warn")
+            channels = channels[:MAX_TRACE_CHANNELS]
+        return tuple(channels)
 
     def _make_live_factory(self, output, duration):
         # Imported here, never at module scope: this module must stay
@@ -948,6 +1007,7 @@ class BioCamWindow:
                 self._log(describe(event), self._severity(event))
             self._render(self.controller.snapshot())
             self._render_activity()
+            self._render_traces()
         finally:
             # Rescheduled in a finally so one bad render cannot stop the UI
             # updating forever - a frozen window during a recording is the
@@ -1033,6 +1093,21 @@ class BioCamWindow:
                   f"({activity.samples} samples, "
                   f"{activity.max_observe_us:.0f} us slowest)"),
             fg=COLOURS["ok"])
+
+    def _render_traces(self):
+        """Repaint the trace strip. UI thread only, from a copied snapshot."""
+        if not hasattr(self, "traces"):
+            return
+        snapshot = self.controller.traces()
+        if snapshot is None:
+            self.traces.set_message(
+                "Traces are off. Tick \"Draw traces\" and select electrodes "
+                "on the array.")
+            return
+        if not snapshot.has_data:
+            self.traces.set_message("Waiting for the first packet...")
+            return
+        self.traces.set_snapshot(snapshot)
 
     def _log(self, message, tag=None):
         stamp = time.strftime("%H:%M:%S")

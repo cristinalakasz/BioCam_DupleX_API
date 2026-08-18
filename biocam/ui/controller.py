@@ -199,6 +199,7 @@ class SessionController:
         self._clock = None
         self._monitor = None
         self._loop = None
+        self._traces = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -271,6 +272,9 @@ class SessionController:
             # for detection - in which case nothing extra runs on the
             # acquisition thread at all.
             self._loop = factory.make_loop()
+            # Rolling traces for a few selected electrodes. None when none
+            # were chosen, in which case nothing extra runs per packet.
+            self._traces = factory.make_traces()
             if self._loop is not None:
                 # Waveforms are drained on the consumer thread, right after
                 # the loop has seen the packet, so a sort can be run at any
@@ -299,6 +303,7 @@ class SessionController:
                         clock=clock,
                         monitor=self._monitor,
                         loop=self._loop,
+                        traces=self._traces,
                         service=lambda: self.stim_queue.service(factory.send),
                     )
                 finally:
@@ -359,6 +364,21 @@ class SessionController:
         limit on the one machine that also has to keep drawing.
         """
         return list(self._waveforms)
+
+    def traces(self):
+        """A snapshot of the rolling trace window, or None. UI thread only.
+
+        A copy: the consumer thread keeps writing into the recorder while this
+        is being drawn.
+        """
+        recorder = self._traces
+        if recorder is None:
+            return None
+        return recorder.snapshot()
+
+    def trace_channels(self) -> list:
+        recorder = self._traces
+        return [] if recorder is None else list(recorder.channels)
 
     def watched_channels(self) -> list:
         """The electrode numbers detection is watching, in detector order."""
@@ -488,6 +508,8 @@ class SessionController:
             problems.extend(self._monitor.warnings())
         if self._loop is not None:
             problems.extend(self._loop.warnings())
+        if self._traces is not None:
+            problems.extend(self._traces.warnings())
         dropped = self._waveforms_seen - len(self._waveforms)
         if dropped > 0:
             problems.append(
