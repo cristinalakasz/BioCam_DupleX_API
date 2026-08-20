@@ -315,6 +315,27 @@ class DriverPacketSource:
         """
         return self._last_payload_mismatch
 
+    def _note_payload_length(self, declared: int, actual: int) -> None:
+        """Record one header-versus-payload comparison. Callback thread.
+
+        A method rather than four lines inside the callback closure so that it
+        can be tested: the closure is built inside `start()` and is reachable
+        only with a live driver, which meant the first test written for this
+        reimplemented the logic in its own body and passed against anything.
+
+        Allocates at most once per session, deliberately. If the unit is wrong
+        then EVERY packet mismatches - which is precisely the case this exists
+        to detect - and building a fresh tuple a thousand times a second on
+        the driver's callback thread would break the no-allocation property of
+        the hot path at exactly the moment it matters. The first sample
+        answers "is it bytes?" as well as the millionth.
+        """
+        if declared == actual:
+            return
+        self._payload_length_mismatches += 1
+        if self._last_payload_mismatch is None:
+            self._last_payload_mismatch = (declared, actual)
+
     @property
     def payload_length_mismatches(self) -> int:
         """Packets whose DataPacketHeader.PayloadLength disagreed with the
@@ -608,11 +629,16 @@ class DriverPacketSource:
             # the wrong way round. A check on the data must never cost the
             # data. Counted, never raised: this runs on the acquisition thread
             # and must not throw back into the .NET dispatcher.
+            #
+            # The cost is measured, not assumed. On this machine, DLLs and no
+            # instrument (`python -m biocam.interop.benchmark`): a
+            # DataPacketHeader property read is **0.52 us**, against a 6.9 us
+            # payload copy in the same callback and a 1000 us budget at a 1 ms
+            # period. The fifth marshal this adds is about 7% of the copy it
+            # sits beside. An unmeasured per-packet marshal has no business
+            # going into a lab session when measuring it is free here.
             try:
-                declared = header.PayloadLength
-                if declared != len(payload):
-                    self._payload_length_mismatches += 1
-                    self._last_payload_mismatch = (declared, len(payload))
+                self._note_payload_length(header.PayloadLength, len(payload))
             except Exception:  # noqa: BLE001 - a check is never worth a packet
                 pass
 

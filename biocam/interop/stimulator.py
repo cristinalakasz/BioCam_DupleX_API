@@ -597,6 +597,13 @@ class Stimulator:
                 )
             entry["latency_cycles"] = int(latency)
             entry["delivered"] = True
+        # `send_now` fills the pulse and endpoint buffers too. Counting only
+        # `send_scheduled` left the 64-deep PULSE buffer uncounted under
+        # closed-loop operation - the one _note_buffer_use names as mattering
+        # most, because the loop calls this method at spike rate. The
+        # docstring said "send_now included" while the code did the opposite.
+        self._note_buffer_use(
+            pulses=1, endpoints=len(positive) + len(negative), timestamps=0)
         return int(latency)
 
     def send_scheduled(self, plan, pattern: StimPattern) -> None:

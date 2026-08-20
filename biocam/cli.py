@@ -818,6 +818,21 @@ def record_command(args) -> int:
         sidecar_lines.append(
             f"CALLBACK ERRORS: {source.callback_errors} exceptions raised "
             "inside a driver callback")
+    # getattr, like the counter transfer in session.py: not every packet
+    # source has a header to check, and one that has not is not in error.
+    payload_mismatches = getattr(source, "payload_length_mismatches", 0)
+    if payload_mismatches:
+        # PayloadLength has no documented unit and this code assumes bytes.
+        # If EVERY packet mismatches, that is this software's unit error and
+        # the recording is fine; if only some do, the frames after them may be
+        # offset. Either way the operator has to see it, or the number sits in
+        # a JSON file nobody opens.
+        sample = getattr(source, "last_payload_mismatch", None)
+        detail = "" if not sample else f" (declared {sample[0]}, got {sample[1]})"
+        sidecar_lines.append(
+            f"PAYLOAD LENGTH: {payload_mismatches} packet(s) "
+            f"disagreed with their own header{detail}. Please report this "
+            "number even if it is the packet count - see issue #24.")
 
     session_only_lines = []
     # The clock's own account of itself. Not in the sidecar - it describes

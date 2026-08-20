@@ -321,3 +321,191 @@ def test_the_pulse_buffer_fills_first_under_a_closed_loop():
     assert seconds_to_fill < 10.0, (
         f"{seconds_to_fill:.1f} s of sustained closed-loop stimulation fills "
         "the smallest documented buffer")
+
+
+# --------------------------------------------------------------------------
+# Gate 2: what the pre-lab review found
+# --------------------------------------------------------------------------
+
+def a_bare_source():
+    """A DriverPacketSource with only the counters, and no driver.
+
+    `__init__` needs the DLLs; the counter logic does not. This is the object
+    the callback mutates, without the runtime it normally lives in.
+    """
+    from biocam.interop.source import DriverPacketSource
+
+    source = object.__new__(DriverPacketSource)
+    source._payload_length_mismatches = 0
+    source._last_payload_mismatch = None
+    return source
+
+
+def test_a_repeated_payload_mismatch_records_only_the_first_sample():
+    # If the unit is wrong EVERY packet mismatches - the case the check exists
+    # for - and building a fresh tuple per packet on the driver's callback
+    # thread would break the no-allocation property of the hot path at exactly
+    # the moment it matters. The first sample settles "is it bytes?" as well
+    # as the millionth.
+    #
+    # This calls the real method. The first version of this test rewrote the
+    # logic inside its own body and passed against any implementation at all -
+    # which is why `_note_payload_length` was extracted from the callback
+    # closure in the first place.
+    source = a_bare_source()
+    for declared, actual in ((4096, 8192), (2048, 4096), (1024, 2048)):
+        source._note_payload_length(declared, actual)
+
+    assert source._payload_length_mismatches == 3
+    assert source._last_payload_mismatch == (4096, 8192), (
+        "the sample was overwritten, so it allocates once per mismatched "
+        "packet rather than once per session")
+
+
+def test_a_matching_payload_records_nothing():
+    source = a_bare_source()
+    for _ in range(100):
+        source._note_payload_length(8192, 8192)
+    assert source._payload_length_mismatches == 0
+    assert source._last_payload_mismatch is None
+
+
+def test_the_mismatch_path_allocates_at_most_once():
+    # The property the callback depends on, stated as a count rather than as
+    # prose: a thousand mismatched packets must not leave a thousand tuples.
+    import gc
+
+    source = a_bare_source()
+    source._note_payload_length(4096, 8192)     # first touch, allocates
+    gc.collect()
+    before = len(gc.get_objects())
+    for _ in range(2000):
+        source._note_payload_length(4096, 8192)
+    gc.collect()
+    grew = len(gc.get_objects()) - before
+    assert grew < 50, (
+        f"2000 mismatched packets grew the tracked-object count by {grew}")
+
+
+def test_the_trace_snapshot_reads_its_cursor_once(tmp_path):
+    # Reading _write twice let the consumer thread's _append land between the
+    # two np.roll calls, pairing a minimum from one instant with a maximum
+    # from another in a single drawn column - a display lying about the thing
+    # it exists to show.
+    import inspect
+
+    from biocam.data.traces import TraceRecorder
+
+    source = inspect.getsource(TraceRecorder.snapshot)
+    body = source.split('"""')[-1]          # past the docstring
+    # Exactly one each: the hoist into a local, and nothing after it.
+    assert body.count("self._write") == 1, (
+        "snapshot() reads self._write more than once; the two rolls can "
+        "disagree, pairing a minimum and a maximum from different instants")
+    assert body.count("self.filled") == 1, (
+        "snapshot() re-reads self.filled after hoisting it into a local")
+
+
+def test_the_snapshot_is_internally_consistent_under_concurrent_writes():
+    # The property that matters, not just the shape of the code: every column
+    # must have its minimum at or below its maximum.
+    import threading
+
+    import numpy as np
+
+    from biocam.data.recording import AcquisitionParameters
+    from biocam.data.traces import TraceRecorder
+
+    params = AcquisitionParameters(
+        frame_rate_hz=1000.0, total_channels=8, ch_sample_byte_size=2,
+        bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+        min_digital_value=0, max_digital_value=4095)
+    recorder = TraceRecorder(params, (0, 1), columns=64, span_sec=0.064)
+
+    class Packet:
+        def __init__(self, payload):
+            self.payload = payload
+
+    stop = threading.Event()
+    rng = np.random.default_rng(0)
+
+    def feed():
+        while not stop.is_set():
+            data = rng.integers(0, 4095, size=(4, 8), dtype=np.uint16)
+            recorder.observe(Packet(data.tobytes()))
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    try:
+        for _ in range(400):
+            snap = recorder.snapshot()
+            if snap.has_data:
+                assert (snap.minima <= snap.maxima).all(), (
+                    "a column's minimum came from a different instant than "
+                    "its maximum")
+    finally:
+        stop.set()
+        writer.join(5)
+
+
+def test_starting_a_session_drops_the_previous_ones_objects(tmp_path):
+    # _run reassigns these, but not for 18-25 ms - make_loop warms the closed
+    # loop first - and every UI-thread reader is live in that window.
+    # acquisition_us() is the one that matters: it is what a scheduled train
+    # is shifted by.
+    import threading
+
+    import numpy as np
+
+    from biocam.data.recording import AcquisitionParameters
+    from biocam.ui.controller import SessionController
+    from biocam.ui.factories import ReplayFactory
+
+    params = AcquisitionParameters(
+        frame_rate_hz=1000.0, total_channels=4, ch_sample_byte_size=2,
+        bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+        min_digital_value=0, max_digital_value=4095)
+    raw = tmp_path / "src.raw"
+    np.arange(4000 * 4, dtype=np.uint16).reshape(4000, 4).tofile(raw)
+
+    controller = SessionController()
+    factory = ReplayFactory(raw_path=raw, params=params,
+                            output_path=tmp_path / "a.raw",
+                            frames_per_packet=40, trace_channels=(0,))
+    controller.start(factory)
+    assert controller.join(30)
+    assert controller._traces is not None, "the first session left no state"
+    stale = controller.acquisition_us()
+
+    # A second session. Immediately after start(), nothing may still describe
+    # the first one.
+    factory2 = ReplayFactory(raw_path=raw, params=params,
+                             output_path=tmp_path / "b.raw",
+                             frames_per_packet=40)
+    # Block the worker inside make_clock, so the window between start() and
+    # _run reassigning these is observable rather than raced. Without this the
+    # test asserted `x is None or x is not None`, which is always true.
+    gate = threading.Event()
+
+    class Blocking(ReplayFactory):
+        def make_clock(self):
+            gate.wait(10)
+            return super().make_clock()
+
+    factory2 = Blocking(raw_path=raw, params=params,
+                        output_path=tmp_path / "b.raw", frames_per_packet=40)
+    controller.start(factory2)
+    try:
+        assert controller._traces is None, (
+            "a new session still holds the previous one's trace window")
+        assert controller._clock is None, (
+            "a new session still holds the previous one's clock")
+        assert controller._loop is None
+        assert controller._monitor is None
+        assert controller.acquisition_us() is None, (
+            "acquisition_us() returned the previous recording's time - the "
+            "number a scheduled train is shifted by")
+        assert stale is None or stale != controller.acquisition_us()
+    finally:
+        gate.set()
+        controller.join(30)
