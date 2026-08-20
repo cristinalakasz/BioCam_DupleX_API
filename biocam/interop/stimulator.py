@@ -101,6 +101,12 @@ class StimulatorError(RuntimeError):
     """The stimulator refused an operation, or was used out of order."""
 
 
+# The three internal buffers Send fills, and the depths the XML gives for
+# them (XML:4959-4976). Whether these bound one call or accumulate across
+# calls is NOT stated - see Stimulator._note_buffer_use.
+BUFFER_DEPTHS = {"pulses": 64, "endpoints": 288, "timestamps": 1024}
+
+
 class Stimulator:
     """Claims the stimulator for the duration of a with-block.
 
@@ -137,9 +143,10 @@ class Stimulator:
         # analysis depends on, and which cannot be reconstructed afterwards.
         self._log = log
         self._clock = clock
-        # Pulses handed to the device's internal memory and not known to
-        # have executed. A high-water mark - see _check_schedule.
-        self._queued_pulses = 0
+        # What has gone into the device's three internal buffers since it
+        # started. Diagnostic only - see _note_buffer_use for why this is not
+        # a limit.
+        self._buffer_use = {"pulses": 0, "endpoints": 0, "timestamps": 0}
         self._stimulator = None
         self._initialized = False
         self._started = False
@@ -347,19 +354,16 @@ class Stimulator:
                 "would throw InvalidOperationException."
             )
         self._started = True
-        # The queued-pulse count starts again here.
+        # Buffer-use counts restart with the streaming bracket.
         #
-        # Be clear about what this rests on: **nothing in the XML says that
-        # Start empties the internal memory buffers Send fills.** It says only
-        # "Start the stimulator and returns a value indicating whether the
-        # operation was successful" (XML:4870). Zeroing here is an assumption,
-        # chosen because Start brackets one acquisition and carrying a count
-        # across sessions would refuse legitimate stimuli forever after a busy
-        # one. If it is wrong, the error is in the safe direction - we would
-        # allow a send the device cannot hold, which is the situation that
-        # existed before this counter and which the driver at least reports by
-        # ignoring the NEXT call. Untested on the instrument; see issue #24.
-        self._queued_pulses = 0
+        # Nothing in the XML says Start empties the internal buffers Send
+        # fills - it says only "Start the stimulator and returns a value
+        # indicating whether the operation was successful" (XML:4870), and no
+        # other member documents when they clear. Zeroing here is a choice
+        # about what the counts MEAN - "since this stimulator started" - not a
+        # claim about the device. Since they only warn, a wrong guess costs a
+        # misleading warning rather than a missing stimulus.
+        self._buffer_use = {"pulses": 0, "endpoints": 0, "timestamps": 0}
 
     def reset(self) -> None:
         """Reset the stimulator, and forget how many pulses it has queued.
@@ -371,7 +375,8 @@ class Stimulator:
         Reset empties the internal memory buffers that `Send` fills, and no
         other member documents when those buffers clear either. Treating a
         reset as "the queue is now empty" is therefore an assumption, and it
-        is the assumption `_queued_pulses` is cleared on. It is the natural
+        is the assumption the buffer-use counts are cleared on. It is the
+        natural
         reading of a method called Reset, and it is the only lever the API
         offers - but it has never been checked on the instrument, so a
         colleague who resets and then finds a Send silently ignored should
@@ -396,7 +401,7 @@ class Stimulator:
                 "the stimulator was not reset and whatever it had queued is "
                 "still queued."
             )
-        self._queued_pulses = 0
+        self._buffer_use = {"pulses": 0, "endpoints": 0, "timestamps": 0}
 
     def stop(self) -> None:
         """Stop the stimulator. Call this BEFORE data streaming stops.
@@ -416,6 +421,14 @@ class Stimulator:
         finally:
             self._started = False
             self._maybe_started = False
+            # Drop the clock with the session it belonged to. This object
+            # outlives one recording - the window claims the instrument once
+            # and holds it for its lifetime - so keeping a finished
+            # recording's clock would leave the next stimulus timed, and
+            # range-checked, against the previous session's timeline. Nothing
+            # reaches that today, because the IsStreaming and _require_running
+            # guards come first; it is one caller away from being reachable.
+            self._clock = None
 
     @contextmanager
     def stimulating(self):
@@ -645,33 +658,12 @@ class Stimulator:
                 "MaxCount and the API introduction PDF both say 1000; 1000 is "
                 "the intersection."
             )
-        # And cumulatively, because the limit is the stimulator's internal
-        # memory, not a per-call argument check. Two legal 600-pulse sends are
-        # jointly over the documented depth, and the XML is explicit about what
-        # then happens (XML:4954): "Any time that one of these memory buffers
-        # overflows will cause the next invocation of the method to not
-        # consider the new argument values." The call that overflows appears
-        # to succeed and the NEXT one silently does nothing - the worst
-        # failure mode available, since nothing reports it.
-        #
-        # This count is a high-water mark, not a live reading: nothing in the
-        # API tells us when the device has finished executing queued pulses,
-        # so it is only cleared by Reset() or a fresh Start(). It will
-        # therefore refuse conservatively over a long session. Refusing a
-        # stimulus that would have fit is recoverable; silently dropping the
-        # one after an overflow is not.
-        if self._queued_pulses + len(timestamps) > MAX_TRAIN_PULSES:
-            raise StimulatorError(
-                f"{self._queued_pulses} pulse(s) are already queued on the "
-                f"stimulator and this plan adds {len(timestamps)}, which is "
-                f"past the {MAX_TRAIN_PULSES} its internal memory holds. The "
-                "API documents that an overflow makes the NEXT Send silently "
-                "ignore its arguments, so this is refused rather than risked. "
-                "Call reset() once the train has run to clear it. This count "
-                "cannot decrease on its own: nothing in the API reports when "
-                "queued pulses have executed, so it is a high-water mark and "
-                "will refuse conservatively over a long session (issue #24)."
-            )
+        # The cumulative buffer question is DELIBERATELY not enforced here.
+        # See `_note_buffer_use` and BUFFER_DEPTHS below for why: the XML text
+        # supports two readings, this repository's own constants
+        # (MAX_ENDPOINT_VALUES_PER_SEND, MAX_PULSE_VALUES_PER_SEND) already
+        # commit to the per-call one, and refusing on the other reading would
+        # break legitimate long sessions. It is counted and reported instead.
         if any(b <= a for a, b in zip(timestamps, timestamps[1:])):
             raise StimulatorError(
                 "timestamps must be strictly increasing; the XML calls for an "
@@ -748,7 +740,9 @@ class Stimulator:
         entry["delivered"] = True
         # Counted only after the driver accepted them, so a refused send does
         # not consume budget that was never taken.
-        self._queued_pulses += len(timestamps)
+        self._note_buffer_use(
+            pulses=1, endpoints=len(positive) + len(negative),
+            timestamps=len(timestamps))
 
     # -- internals -------------------------------------------------------
 
@@ -840,6 +834,63 @@ class Stimulator:
         Pure Python: no .NET call, nothing to verify on the instrument.
         """
         self._clock = clock
+
+    def _note_buffer_use(self, pulses: int, endpoints: int,
+                         timestamps: int) -> None:
+        """Count what this Send put into the device's internal buffers.
+
+        `Send` stores each argument in "a corresponding internal memory
+        buffer", and an overflow "will cause the NEXT invocation of the method
+        to not consider the new argument values" (XML:4952-4976). Three
+        buffers, with three depths: 64 pulses, 288 endpoints, 1024 timestamps.
+
+        **Whether those depths bound one call or accumulate across calls is
+        not stated, and the two readings have very different consequences.**
+
+        - Per call: the limits bound one Send's arguments. This repository
+          already commits to that reading - `MAX_ENDPOINT_VALUES_PER_SEND` and
+          `MAX_PULSE_VALUES_PER_SEND` are named for it, and those checks are
+          enforced. Nothing accumulates and these counters are inert.
+        - Cumulative: the buffers fill up as calls are made. Then the buffer
+          that matters most is the 64-deep **pulse** one, because every Send
+          adds one to it - `send_now` included - and the closed loop calls
+          `send_now` at spike rate. At the safety envelope's 10 Hz ceiling
+          that fills in about six seconds of sustained stimulation, and the
+          symptom is one silently ignored Send, which in the recorded signal
+          is indistinguishable from a stimulus that evoked nothing.
+
+        An earlier version of this class refused a send on the cumulative
+        reading. That was wrong twice over: it contradicted the reading the
+        rest of the package is built on, and it guarded the 1024-deep
+        timestamp buffer while leaving the 64-deep pulse buffer - the one the
+        closed loop actually hammers - uncounted. Refusing a legitimate
+        stimulus mid-experiment is not automatically the conservative choice.
+
+        So this counts and reports, and settles nothing by itself. The lab
+        settles it: run a closed loop past 64 stimuli and see whether one goes
+        missing (issue #24).
+        """
+        self._buffer_use["pulses"] += pulses
+        self._buffer_use["endpoints"] += endpoints
+        self._buffer_use["timestamps"] += timestamps
+
+    def buffer_warnings(self) -> list:
+        """Whether this session has passed any documented buffer depth."""
+        problems = []
+        for name, used in self._buffer_use.items():
+            depth = BUFFER_DEPTHS[name]
+            if used > depth:
+                problems.append(
+                    f"{used} {name} have been sent to the stimulator since it "
+                    f"started, past the {depth} its internal buffer for them "
+                    "is documented to hold. If those buffers accumulate "
+                    "across calls rather than bounding one call, a Send after "
+                    "this point is silently ignored - which in the signal "
+                    "looks exactly like a stimulus that evoked nothing. Which "
+                    "reading is right is untested (issue #24); this is a "
+                    "count, not a diagnosis."
+                )
+        return problems
 
     def _read_clock(self):
         """The acquisition clock's current reading, or None.

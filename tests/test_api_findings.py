@@ -234,3 +234,90 @@ def test_two_legal_sends_can_exceed_the_devices_memory():
     assert first <= MAX_TRAIN_PULSES
     assert second <= MAX_TRAIN_PULSES
     assert first + second > MAX_TRAIN_PULSES
+
+
+# --------------------------------------------------------------------------
+# Re-review: a payload-unit guess must not condemn every recording
+# --------------------------------------------------------------------------
+
+def a_recording_with(tmp_path, name, packets, mismatches, sample=None):
+    from biocam.data.recording import read_sidecar
+
+    raw = tmp_path / f"{name}.raw"
+    meta = tmp_path / f"{name}_meta.json"
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        for counter in range(1, packets + 1):
+            writer.write_packet(timestamp=counter * 100, counter=counter,
+                                payload=bytes(8))
+        if mismatches:
+            writer.note_payload_mismatches(mismatches, sample=sample)
+        writer.finalise("duration_reached")
+    return writer, read_sidecar(meta)["integrity"]
+
+
+def test_every_packet_mismatching_is_read_as_a_unit_error_not_data_loss(tmp_path):
+    # PayloadLength has NO documented unit. If this software compares the
+    # wrong one, every packet disagrees - and letting that set the verdict
+    # would report every otherwise-perfect recording as gaps_detected, which
+    # trades the integrity claim the sidecar exists to make for a guess.
+    writer, integrity = a_recording_with(tmp_path, "all", packets=20,
+                                         mismatches=20, sample=(4096, 8192))
+    assert integrity["verdict"] == "clean", (
+        "a wrong unit assumption condemned a recording that lost nothing")
+    assert integrity["payload_length_mismatches"] == 20
+    text = " ".join(writer.payload_warnings())
+    assert "wrong units" in text, text
+    assert "4096" in text and "8192" in text, "the numbers that settle it"
+
+
+def test_some_packets_mismatching_is_read_as_lost_alignment(tmp_path):
+    # Some but not all is the shape of a real problem: the frames after such
+    # a packet may be offset, which in the signal looks like data.
+    writer, integrity = a_recording_with(tmp_path, "some", packets=20,
+                                         mismatches=3)
+    assert integrity["verdict"] != "clean"
+    text = " ".join(writer.payload_warnings())
+    assert "3 of 20" in text, text
+
+
+def test_no_mismatch_says_nothing(tmp_path):
+    writer, integrity = a_recording_with(tmp_path, "none", packets=20,
+                                         mismatches=0)
+    assert integrity["verdict"] == "clean"
+    assert writer.payload_warnings() == []
+
+
+def test_the_mismatch_numbers_reach_the_sidecar(tmp_path):
+    # Written and never read is how a diagnostic becomes decoration.
+    _writer, integrity = a_recording_with(tmp_path, "sample", packets=10,
+                                          mismatches=2, sample=(4096, 8192))
+    assert integrity["payload_mismatch_sample"] == [4096, 8192]
+    assert integrity["packets_written"] == 10
+
+
+# --------------------------------------------------------------------------
+# Re-review: the buffer depths, and which one actually matters
+# --------------------------------------------------------------------------
+
+def test_the_three_documented_buffer_depths_are_recorded():
+    # XML:4959-4976 lists three, and the smallest is the one a closed loop
+    # fills fastest: every Send adds one pulse, and send_now is what the loop
+    # calls at spike rate.
+    from biocam.interop.stimulator import BUFFER_DEPTHS
+
+    assert BUFFER_DEPTHS == {"pulses": 64, "endpoints": 288, "timestamps": 1024}
+    assert min(BUFFER_DEPTHS, key=BUFFER_DEPTHS.get) == "pulses"
+
+
+def test_the_pulse_buffer_fills_first_under_a_closed_loop():
+    # The arithmetic behind the warning. At the safety envelope's default
+    # 10 Hz ceiling, the 64-deep pulse buffer is the binding one - reached in
+    # about six seconds of sustained stimulation, long before the 1024-deep
+    # timestamp buffer an earlier version of this code guarded instead.
+    from biocam.interop.stimulator import BUFFER_DEPTHS
+    from biocam.loop import DEFAULT_MAX_RATE_HZ
+
+    seconds_to_fill = BUFFER_DEPTHS["pulses"] / DEFAULT_MAX_RATE_HZ
+    assert seconds_to_fill < 10.0, (
+        f"{seconds_to_fill:.1f} s of sustained closed-loop stimulation fills "
+        "the smallest documented buffer")

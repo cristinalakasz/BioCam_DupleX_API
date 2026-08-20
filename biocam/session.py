@@ -502,7 +502,8 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
             writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
             writer.note_callback_errors(getattr(counters, "callback_errors", 0))
             writer.note_payload_mismatches(
-                getattr(counters, "payload_length_mismatches", 0))
+                getattr(counters, "payload_length_mismatches", 0),
+                sample=getattr(counters, "last_payload_mismatch", None))
         if stop_source is not None:
             try:
                 stop_source()

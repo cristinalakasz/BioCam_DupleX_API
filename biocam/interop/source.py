@@ -306,6 +306,16 @@ class DriverPacketSource:
                 count += 1
 
     @property
+    def last_payload_mismatch(self):
+        """(declared, actual) for the most recent mismatch, or None.
+
+        The direction and size, not just the count - which is what would say
+        whether PayloadLength is in bytes or in something else. Written and
+        never read is how a diagnostic becomes decoration.
+        """
+        return self._last_payload_mismatch
+
+    @property
     def payload_length_mismatches(self) -> int:
         """Packets whose DataPacketHeader.PayloadLength disagreed with the
         payload actually delivered.

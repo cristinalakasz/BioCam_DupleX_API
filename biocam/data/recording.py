@@ -193,6 +193,8 @@ class RecordingWriter:
         self._queue_overflows = 0
         self._callback_errors = 0
         self._payload_mismatches = 0
+        self._payload_mismatch_sample = None
+        self._packets_written = 0
         self._discarded_at_stop = 0
         self._started_utc = None
         self._finalised = False
@@ -289,6 +291,7 @@ class RecordingWriter:
         frames_in_packet = len(payload) // self._params.bytes_per_frame
         frames_written_before = self._bytes_written // self._params.bytes_per_frame
 
+        self._packets_written += 1
         gap = self._tracker.observe(
             counter=counter,
             frames_in_packet=frames_in_packet,
@@ -352,7 +355,62 @@ class RecordingWriter:
         """
         self._queue_overflows = count
 
-    def note_payload_mismatches(self, count: int = 0) -> None:
+    @property
+    def _suspect_payload_alignment(self) -> bool:
+        """Whether payload mismatches indicate lost alignment, or a bad guess.
+
+        `DataPacketHeader.PayloadLength` is documented only as "the length of
+        the data payload this header refers to" (XML:1916-1919). **No unit.**
+        `len(payload)` is a byte count, and bytes is the natural reading -
+        `ProcessPayload(DataPacketHeader, Byte[], Int32)` and
+        `CopyTo(Byte[], Int32)` both point that way - but natural is not
+        documented.
+
+        If the unit is something else, EVERY packet mismatches. Letting that
+        condemn the verdict would mean a wrong guess here silently reports
+        every otherwise-perfect recording as `gaps_detected` - trading a
+        diagnostic for the integrity claim the sidecar exists to make.
+
+        So the two are distinguished by their shape. Every packet mismatching
+        is a unit error in this software; some packets mismatching is a real
+        alignment problem in the data. Only the second touches the verdict,
+        and the first is reported through `warnings()` instead, where it reads
+        as the software problem it is.
+        """
+        if not self._payload_mismatches:
+            return False
+        if (self._packets_written
+                and self._payload_mismatches >= self._packets_written):
+            return False        # every packet - see above
+        return True
+
+    def payload_warnings(self) -> list:
+        """What the payload-length check found, in words."""
+        if not self._payload_mismatches:
+            return []
+        sample = self._payload_mismatch_sample
+        detail = ("" if not sample else
+                  f" One header declared {sample[0]} against {sample[1]} bytes"
+                  " delivered.")
+        if not self._suspect_payload_alignment:
+            return [
+                f"every packet ({self._payload_mismatches}) disagreed with its "
+                "own header's PayloadLength.{}".format(detail) +
+                " That pattern means this software is comparing the wrong "
+                "units, not that the data is misaligned - PayloadLength has "
+                "no documented unit (XML:1916-1919) and this code assumes "
+                "bytes. The recording is unaffected and its verdict is "
+                "unchanged. Please report the numbers above (issue #24)."
+            ]
+        return [
+            f"{self._payload_mismatches} of {self._packets_written} packets "
+            f"disagreed with their own header's PayloadLength.{detail} Some "
+            "but not all is the shape of a real alignment problem: the frames "
+            "after such a packet may be offset, which in the signal looks "
+            "like data rather than an error."
+        ]
+
+    def note_payload_mismatches(self, count: int = 0, sample=None) -> None:
         """Packets whose header disagreed with the payload delivered.
 
         Cumulative, so this assigns rather than accumulates - see
@@ -362,6 +420,11 @@ class RecordingWriter:
         frames starting at its first byte did not hold.
         """
         self._payload_mismatches = count
+        # (declared, actual) for one mismatch. This is the number that settles
+        # whether the unit is bytes: without it a sidecar can say "17
+        # mismatches" and not "declared 4096, got 8192".
+        if sample is not None:
+            self._payload_mismatch_sample = list(sample)
 
     def note_callback_errors(self, count: int = 1) -> None:
         """Record the cumulative count of exceptions raised in a callback.
@@ -578,7 +641,7 @@ class RecordingWriter:
         # counters in this block; they are all in the sidecar.
         if (self._tracker.has_gaps or self._driver_loss or self._queue_overflows
                 or self._callback_errors or self._discarded_at_stop
-                or self._payload_mismatches):
+                or self._suspect_payload_alignment):
             return VERDICT_GAPS
         if self._tracker.counter_anomalies:
             # A counter anomaly is not a gap: GapTracker deliberately declines
@@ -693,6 +756,8 @@ class RecordingWriter:
                 "queue_overflows": self._queue_overflows,
                 "callback_errors": self._callback_errors,
                 "payload_length_mismatches": self._payload_mismatches,
+                "payload_mismatch_sample": self._payload_mismatch_sample,
+                "packets_written": self._packets_written,
                 "discarded_at_stop": self._discarded_at_stop,
                 "counter_anomalies": self._tracker.counter_anomalies,
             },
