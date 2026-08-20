@@ -38,6 +38,19 @@ SECONDS = 2.0
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__ or "")
+        print("usage: python tools/make_demo_recording.py [prefix]")
+        print()
+        print("  prefix  what to name the pair of files (default: demo),")
+        print("          producing <prefix>.raw and <prefix>_meta.json")
+        return 0
+    if argv and argv[0].startswith("-"):
+        # Otherwise an unrecognised flag becomes the filename, and asking for
+        # help writes a 76 MB file called --help.raw. Which it did.
+        print(f"error: unknown option {argv[0]!r}. This takes a filename "
+              "prefix, not flags; try --help.", file=sys.stderr)
+        return 2
     stem = Path(argv[0]) if argv else Path("demo")
     n_frames = int(FRAME_RATE_HZ * SECONDS)
 
