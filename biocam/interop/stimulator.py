@@ -137,6 +137,9 @@ class Stimulator:
         # analysis depends on, and which cannot be reconstructed afterwards.
         self._log = log
         self._clock = clock
+        # Pulses handed to the device's internal memory and not known to
+        # have executed. A high-water mark - see _check_schedule.
+        self._queued_pulses = 0
         self._stimulator = None
         self._initialized = False
         self._started = False
@@ -344,6 +347,9 @@ class Stimulator:
                 "would throw InvalidOperationException."
             )
         self._started = True
+        # A fresh Start clears the stimulator's internal buffers, so the
+        # queued count starts again with it.
+        self._queued_pulses = 0
 
     def stop(self) -> None:
         """Stop the stimulator. Call this BEFORE data streaming stops.
@@ -592,6 +598,33 @@ class Stimulator:
                 "MaxCount and the API introduction PDF both say 1000; 1000 is "
                 "the intersection."
             )
+        # And cumulatively, because the limit is the stimulator's internal
+        # memory, not a per-call argument check. Two legal 600-pulse sends are
+        # jointly over the documented depth, and the XML is explicit about what
+        # then happens (XML:4954): "Any time that one of these memory buffers
+        # overflows will cause the next invocation of the method to not
+        # consider the new argument values." The call that overflows appears
+        # to succeed and the NEXT one silently does nothing - the worst
+        # failure mode available, since nothing reports it.
+        #
+        # This count is a high-water mark, not a live reading: nothing in the
+        # API tells us when the device has finished executing queued pulses,
+        # so it is only cleared by Reset() or a fresh Start(). It will
+        # therefore refuse conservatively over a long session. Refusing a
+        # stimulus that would have fit is recoverable; silently dropping the
+        # one after an overflow is not.
+        if self._queued_pulses + len(timestamps) > MAX_TRAIN_PULSES:
+            raise StimulatorError(
+                f"{self._queued_pulses} pulse(s) are already queued on the "
+                f"stimulator and this plan adds {len(timestamps)}, which is "
+                f"past the {MAX_TRAIN_PULSES} its internal memory holds. The "
+                "API documents that an overflow makes the NEXT Send silently "
+                "ignore its arguments, so this is refused rather than risked. "
+                "Call reset() to clear the queue once the train has run - and "
+                "note that this count cannot decrease on its own, because "
+                "nothing in the API reports when queued pulses have "
+                "executed (issue #24)."
+            )
         if any(b <= a for a, b in zip(timestamps, timestamps[1:])):
             raise StimulatorError(
                 "timestamps must be strictly increasing; the XML calls for an "
@@ -617,10 +650,17 @@ class Stimulator:
         # issue-#24 case, and refusing beats discovering on a culture what the
         # instrument does with it.
         reading = self._read_clock()
-        if reading is not None and timestamps[-1] <= reading.acquisition_us:
+        # `timestamps[0]`, not `[-1]`. Testing the last one only refuses a
+        # train that has ENTIRELY passed, and accepts one whose first forty of
+        # fifty pulses are already in the past - which is the issue-#24
+        # undefined case for those forty, and silently changes the delivered
+        # protocol. A hole in a train looks exactly like a stimulus that
+        # evoked nothing, which is the argument this file makes elsewhere for
+        # logging refusals at all.
+        if reading is not None and timestamps[0] <= reading.acquisition_us:
             raise StimulatorError(
-                f"every timestamp in this plan is in the past: the last is "
-                f"{timestamps[-1]:.0f} us and the acquisition is already at "
+                f"this plan starts in the past: its first timestamp is "
+                f"{timestamps[0]:.0f} us and the acquisition is already at "
                 f"{reading.acquisition_us:.0f} us ({reading.source}). "
                 "Timestamps are measured from the beginning of the "
                 "acquisition, not from now - shift the plan with "
@@ -659,6 +699,9 @@ class Stimulator:
                 "ignore its values."
             )
         entry["delivered"] = True
+        # Counted only after the driver accepted them, so a refused send does
+        # not consume budget that was never taken.
+        self._queued_pulses += len(timestamps)
 
     # -- internals -------------------------------------------------------
 

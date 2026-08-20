@@ -1,9 +1,15 @@
 """Detecting lost data from the instrument's own packet counter.
 
-DataPacketHeader carries a UInt16 PacketCounter alongside the timestamp,
-confirmed from its constructor signature in 3Brain.BioCamDriver.xml:
+DataPacketHeader carries a UInt16 PacketCounter alongside the timestamp.
+The XML gives it only through a constructor signature:
     #ctor(Byte, BioCamUsbComSignalType, Int32, UInt64, UInt16)
-being (Reserved, SignalType, PayloadLength, Timestamp, PacketCounter).
+being (Reserved, SignalType, PayloadLength, Timestamp, PacketCounter) - which
+is an inference about a *parameter*, not a statement about the property.
+
+Reflection settles it directly (DLLs, no instrument):
+    UInt16 PacketCounter  (get/set)
+so COUNTER_MODULUS below is a read fact rather than a deduction. Reproduce
+with `python -m biocam.interop.reflect DataPacketHeader`.
 
 That makes loss detection exact rather than inferred: no clock arithmetic, no
 tolerance threshold. The counter wraps at 65536, which is handled explicitly -

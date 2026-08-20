@@ -587,9 +587,28 @@ def _probe_data_format(data_format) -> list:
 
 
 def _parameters_from(data_format) -> AcquisitionParameters:
+    # "If the number of channels is not equal for all wells, -1 is returned"
+    # (XML:349-352). That is a documented return value, not a hypothetical,
+    # and it is the worst possible one to pass through: a negative channel
+    # count gives a negative bytes_per_frame, hence negative frames per
+    # packet and a negative frame count, while the writer keeps happily
+    # accepting bytes. The result is a recording that looks like it worked.
+    wells, per_well = data_format.NWells, data_format.NChsPerWell
+    if per_well < 0:
+        raise RuntimeError(
+            "the instrument reports NChsPerWell = -1, which the API documents "
+            "as 'the number of channels is not equal for all wells'. This "
+            "software assumes a uniform array and cannot size a frame from "
+            "that. Nothing was recorded."
+        )
+    if wells < 1 or per_well < 1:
+        raise RuntimeError(
+            f"the instrument reports {wells} well(s) of {per_well} channel(s), "
+            "which cannot describe a recordable array. Nothing was recorded."
+        )
     return AcquisitionParameters(
         frame_rate_hz=data_format.FrameRate,
-        total_channels=data_format.NWells * data_format.NChsPerWell,
+        total_channels=wells * per_well,
         ch_sample_byte_size=data_format.ChSampleByteSize,
         bit_depth=data_format.BitDepth,
         adc_counts_to_value=data_format.ADCCountsToValue,
@@ -600,7 +619,7 @@ def _parameters_from(data_format) -> AcquisitionParameters:
 
 
 def record_command(args) -> int:
-    from biocam.interop.device import BioCamDevice
+    from biocam.interop.device import BioCamDevice, cycles_per_us_of
     from biocam.interop.source import DriverPacketSource
 
     # LOW: refuse to run below the Python version POLL_INTERVAL_SEC's ~1 ms
@@ -688,7 +707,17 @@ def record_command(args) -> int:
             # stimulus a time origin. Its warnings are reported at the end,
             # because a clock that cannot agree with itself must not be
             # scheduled against silently.
-            clock = AcquisitionClock(params.frame_rate_hz)
+            # cycles_per_us from IBioCam.ClockCyclesToMilliseconds (XML:4667),
+            # the same call MainForm.cs:272 makes. Supplying it is what lets
+            # the clock's cross-check fail at all: without it the clock
+            # calibrates the factor from these same packets, the device
+            # estimate reduces algebraically to the frame estimate, and the
+            # comparison is identically zero however wrong the clock is. This
+            # call site had the device in hand and did not use it, so every
+            # `biocam record` run produced `device-calibrated` readings whose
+            # agreement meant nothing.
+            clock = AcquisitionClock(
+                params.frame_rate_hz, cycles_per_us=cycles_per_us_of(device))
 
             with RecordingWriter(raw_path, meta_path, params,
                                  listener=report) as writer:

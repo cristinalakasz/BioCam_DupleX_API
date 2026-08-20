@@ -94,11 +94,16 @@ class BioCamDevice:
         # pythonnet allows; if pythonnet does not fill the default,
         # Activate() raises TypeError (missing required argument) rather
         # than silently doing the wrong thing, and the fallback below
-        # supplies an explicit value. We do not know what C#'s actual
-        # default is, so `False` here is a guess, not a verified value -
-        # chosen only because "do not support invalid-serial BioCAMs"
-        # reads as the more conservative default for a flag named
-        # supportBioCamInvalidSerial.
+        # supplies an explicit value.
+        #
+        # `False` is no longer a guess. Reflection on this machine (DLLs, no
+        # instrument) gives the signature outright:
+        #
+        #     Void Activate(Boolean supportBioCamInvalidSerial = False)
+        #
+        # so the explicit fallback matches C#'s own default exactly, and the
+        # two paths cannot diverge in behaviour. Reproduce with
+        # `python -m biocam.interop.reflect BioCamPool`.
         #
         # MEDIUM 5: asking the lab "confirm which path is taken" without
         # ever reporting anything left nobody able to answer it.

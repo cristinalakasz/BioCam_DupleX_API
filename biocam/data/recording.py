@@ -51,6 +51,7 @@ import numpy as np
 from biocam.data.events import (
     DiskLow, GapDetected, GapSummary, RecordingStarted, RecordingStopped,
 )
+from biocam.data.clock import TIMESTAMP_UNAVAILABLE
 from biocam.data.frames import DTYPE_BY_BYTE_SIZE, to_microvolts
 from biocam.data.integrity import MAX_RETAINED_GAPS, GapTracker
 
@@ -182,10 +183,16 @@ class RecordingWriter:
                                    max_retained_gaps=max_retained_gaps)
         self._bytes_written = 0
         self._first_timestamp: Optional[int] = None
+        # Packets whose header carried the documented 0 sentinel. Counted
+        # rather than silently skipped: if every packet has one, the
+        # device clock is dead and every acquisition time in the session
+        # is a frame-count estimate, which the operator should know.
+        self._timestamps_unavailable = 0
         self._last_timestamp: Optional[int] = None
         self._driver_loss = 0
         self._queue_overflows = 0
         self._callback_errors = 0
+        self._payload_mismatches = 0
         self._discarded_at_stop = 0
         self._started_utc = None
         self._finalised = False
@@ -293,9 +300,17 @@ class RecordingWriter:
         self._file.write(payload)
         self._bytes_written += len(payload)
 
-        if self._first_timestamp is None:
-            self._first_timestamp = timestamp
-        self._last_timestamp = timestamp
+        # 0 means "the timestamp is not available" (XML:1923), not "the
+        # acquisition just started". Recording it as a first_timestamp puts a
+        # sentinel in the sidecar where a later reader takes an origin - the
+        # same confusion biocam/data/clock.py exists to avoid. Unavailable
+        # timestamps are counted instead, so their absence is visible.
+        if timestamp == TIMESTAMP_UNAVAILABLE:
+            self._timestamps_unavailable += 1
+        else:
+            if self._first_timestamp is None:
+                self._first_timestamp = timestamp
+            self._last_timestamp = timestamp
 
         # HIGH: this is a plain attribute read, not a syscall, so it runs on
         # every packet with none of the stall risk shutil.disk_usage() carries
@@ -336,6 +351,17 @@ class RecordingWriter:
         accumulates.
         """
         self._queue_overflows = count
+
+    def note_payload_mismatches(self, count: int = 0) -> None:
+        """Packets whose header disagreed with the payload delivered.
+
+        Cumulative, so this assigns rather than accumulates - see
+        note_driver_loss(). Non-zero means the frame alignment of this
+        recording cannot be trusted: the bytes were still written exactly as
+        received, but the assumption that a payload is a whole number of
+        frames starting at its first byte did not hold.
+        """
+        self._payload_mismatches = count
 
     def note_callback_errors(self, count: int = 1) -> None:
         """Record the cumulative count of exceptions raised in a callback.
@@ -541,14 +567,18 @@ class RecordingWriter:
 
     @property
     def verdict(self) -> str:
-        # discarded_at_stop joins the same "not clean" bucket as the other
-        # counters below (none of which are literal frame-counter gaps
-        # either): a recording that discarded acquired data at stop time
-        # must never report clean, and this codebase has no verdict more
-        # specific than gaps_detected for "integrity was compromised, but
-        # not by a counter gap".
+        # discarded_at_stop and payload_length_mismatches join the same
+        # "not clean" bucket as the other counters below (none of which are
+        # literal frame-counter gaps either): a recording that discarded
+        # acquired data at stop time, or whose payloads disagreed with their
+        # own headers, must never report clean - and this codebase has no
+        # verdict more specific than gaps_detected for "integrity was
+        # compromised, but not by a counter gap". A reader who sees
+        # gaps_detected with an empty `gaps` list should look at the other
+        # counters in this block; they are all in the sidecar.
         if (self._tracker.has_gaps or self._driver_loss or self._queue_overflows
-                or self._callback_errors or self._discarded_at_stop):
+                or self._callback_errors or self._discarded_at_stop
+                or self._payload_mismatches):
             return VERDICT_GAPS
         if self._tracker.counter_anomalies:
             # A counter anomaly is not a gap: GapTracker deliberately declines
@@ -654,6 +684,7 @@ class RecordingWriter:
             "integrity": {
                 "verdict": self._verdict_for_status(status),
                 "first_timestamp": self._first_timestamp,
+                "timestamps_unavailable": self._timestamps_unavailable,
                 "last_timestamp": self._last_timestamp,
                 "n_frames_missing": self._tracker.n_frames_missing,
                 "gaps": [asdict(g) for g in gaps],
@@ -661,6 +692,7 @@ class RecordingWriter:
                 "driver_loss_events": self._driver_loss,
                 "queue_overflows": self._queue_overflows,
                 "callback_errors": self._callback_errors,
+                "payload_length_mismatches": self._payload_mismatches,
                 "discarded_at_stop": self._discarded_at_stop,
                 "counter_anomalies": self._tracker.counter_anomalies,
             },
