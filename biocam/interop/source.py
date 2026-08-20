@@ -187,6 +187,11 @@ class DriverPacketSource:
         # One private error counter per handler thread - see module
         # docstring on why these cannot share a counter.
         self._data_errors = 0
+        # Packets whose header disagreed with the payload actually
+        # delivered. See on_data: a mismatch desynchronises every later
+        # frame, silently, so it is counted rather than assumed absent.
+        self._payload_length_mismatches = 0
+        self._last_payload_mismatch = None
         self._loss_errors = 0
         self._error_errors = 0
         self._streaming = False
@@ -299,6 +304,27 @@ class DriverPacketSource:
                 return count
             if item is not STOP:
                 count += 1
+
+    @property
+    def last_payload_mismatch(self):
+        """(declared, actual) for the most recent mismatch, or None.
+
+        The direction and size, not just the count - which is what would say
+        whether PayloadLength is in bytes or in something else. Written and
+        never read is how a diagnostic becomes decoration.
+        """
+        return self._last_payload_mismatch
+
+    @property
+    def payload_length_mismatches(self) -> int:
+        """Packets whose DataPacketHeader.PayloadLength disagreed with the
+        payload actually delivered.
+
+        Should be zero. Anything else means the frame alignment assumption
+        this whole format rests on did not hold for that packet, and the
+        recording past it is suspect in a way that looks like signal.
+        """
+        return self._payload_length_mismatches
 
     @property
     def callback_errors(self) -> int:
@@ -490,6 +516,11 @@ class DriverPacketSource:
         self._driver_loss_counter = None
         self._loss_fallback_events = 0
         self._data_errors = 0
+        # Packets whose header disagreed with the payload actually
+        # delivered. See on_data: a mismatch desynchronises every later
+        # frame, silently, so it is counted rather than assumed absent.
+        self._payload_length_mismatches = 0
+        self._last_payload_mismatch = None
         self._loss_errors = 0
         self._error_errors = 0
         self._pressure_reported = False
@@ -547,10 +578,11 @@ class DriverPacketSource:
             try:
                 header = args.Header  # read once - saves a marshaling
                                        # round trip versus reading it twice.
+                payload = bytes(args.Payload)
                 packet = Packet(
                     timestamp=header.Timestamp,
                     counter=header.PacketCounter,
-                    payload=bytes(args.Payload),
+                    payload=payload,
                 )
             except Exception:
                 # Covers a null Payload (documented as possible when no data
@@ -558,6 +590,32 @@ class DriverPacketSource:
                 # an exception cross back into the .NET dispatcher.
                 self._data_errors += 1
                 return
+
+            # The header states its own payload length (Int32 PayloadLength,
+            # confirmed by reflection). Nothing in the XML promises that
+            # `args.Payload` is exactly that many bytes, and the driver's own
+            # lower-level path explicitly works with payloads at an offset
+            # inside a larger buffer (XML:103-109, ProcessPayload(header,
+            # data, payloadIndex)). If `Payload` were ever a pooled buffer
+            # bigger than the payload, every byte after the first packet is
+            # misaligned - wrong channel, wrong time, no error, and a .raw
+            # that looks like real signal.
+            #
+            # Deliberately AFTER the packet is built and in its own guard. The
+            # first version read PayloadLength inside the try above, which
+            # meant a header that would not yield it dropped the packet
+            # entirely - trading a real recording for a diagnostic, which is
+            # the wrong way round. A check on the data must never cost the
+            # data. Counted, never raised: this runs on the acquisition thread
+            # and must not throw back into the .NET dispatcher.
+            try:
+                declared = header.PayloadLength
+                if declared != len(payload):
+                    self._payload_length_mismatches += 1
+                    self._last_payload_mismatch = (declared, len(payload))
+            except Exception:  # noqa: BLE001 - a check is never worth a packet
+                pass
+
             if len(self._queue) >= self._queue_size:
                 self.queue_overflows += 1
             else:
