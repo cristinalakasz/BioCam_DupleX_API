@@ -274,6 +274,13 @@ class SessionController:
             # mid-observe can be one packet stale but never torn. A lock would
             # be a lock the drain has to take.
             self._clock = clock
+            # Hand the clock to whatever will be sending stimuli, so every log
+            # entry carries the acquisition time it was made at. Without this
+            # the stimulus log says what fired and through which electrodes
+            # but not WHEN, and no later analysis can recover it.
+            attach = getattr(factory, "attach_clock", None)
+            if attach is not None:
+                attach(clock)
             # Built by the factory, because only it knows the acquisition
             # parameters and the array geometry.
             self._monitor = factory.make_monitor()

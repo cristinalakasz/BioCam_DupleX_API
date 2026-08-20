@@ -733,6 +733,24 @@ class Stimulator:
                 "was delivered."
             )
 
+    def attach_clock(self, clock) -> None:
+        """Give this stimulator the acquisition clock for the current session.
+
+        The clock cannot be supplied to `__init__` by the window, and that is
+        not an oversight in the caller: the instrument is claimed once and
+        held for the window's lifetime, while a clock belongs to one
+        recording. So the two are joined here, when a session starts.
+
+        Until this was called, `_read_clock` returned None for every stimulus
+        and **every log entry was written with `clock_us: null`** - the log
+        recorded what was stimulated and through which electrodes, but not
+        when, which is the one correspondence that cannot be reconstructed
+        afterwards. The feature existed and no caller reached it.
+
+        Pure Python: no .NET call, nothing to verify on the instrument.
+        """
+        self._clock = clock
+
     def _read_clock(self):
         """The acquisition clock's current reading, or None.
 

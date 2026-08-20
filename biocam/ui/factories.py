@@ -155,9 +155,28 @@ class ReplayFactory:
                 pass
         return PacketLoop(loop, self.params, self.detect_channels)
 
+    def attach_clock(self, clock) -> None:
+        """Hold the session's clock, so simulated stimuli are timed too.
+
+        Simulation exists to rehearse the real thing. A simulated log with no
+        acquisition times would not rehearse the field that matters most, and
+        would hide a missing wire rather than expose it.
+        """
+        self.clock = clock
+
+    def _reading(self):
+        clock = getattr(self, "clock", None)
+        if clock is None:
+            return None
+        try:
+            return clock.read()
+        except Exception:  # noqa: BLE001 - an unusable clock is not fatal here
+            return None
+
     def send_loop_stimulus(self, trigger):
         """A simulated closed-loop stimulus: recorded, never delivered."""
-        self.log.immediate(_LoopPlan(), _LoopPattern(), simulated=True)
+        self.log.immediate(_LoopPlan(), _LoopPattern(), simulated=True,
+                           clock_reading=self._reading())
 
     def make_monitor(self):
         from biocam.data.monitor import LiveMonitor
@@ -224,9 +243,11 @@ class ReplayFactory:
         as a delivered immediate pulse.
         """
         if request.scheduled:
-            self.log.scheduled(request.plan, request.pattern, simulated=True)
+            self.log.scheduled(request.plan, request.pattern, simulated=True,
+                               clock_reading=self._reading())
         else:
-            self.log.immediate(request.plan, request.pattern, simulated=True)
+            self.log.immediate(request.plan, request.pattern, simulated=True,
+                               clock_reading=self._reading())
 
 
 @dataclass
@@ -400,6 +421,17 @@ class LiveFactory:
             except Exception:  # noqa: BLE001 - never at a session's cost
                 pass
         return PacketLoop(loop, self.params, self.detect_channels)
+
+    def attach_clock(self, clock) -> None:
+        """Give the stimulator the clock for this session.
+
+        The instrument is claimed once for the window's lifetime; a clock
+        belongs to one recording. Joining them here is what puts an
+        acquisition time on every stimulus in the log.
+        """
+        self.clock = clock
+        if self.stimulator is not None:
+            self.stimulator.attach_clock(clock)
 
     def send_loop_stimulus(self, trigger):
         """Deliver a closed-loop stimulus. Runs on the acquisition thread.
