@@ -10,12 +10,23 @@
 
 # --- Recorded data -----------------------------------------------------
 # Raw recordings are multi-GB and exceed GitHub's 100 MB file limit, but the
-# per-session *_meta.json sidecars are small and worth versioning.
+# small per-session JSON beside them is worth versioning. A session leaves
+# four files: the .raw, the integrity sidecar, the stimulus log, and the
+# session record. The last three are kilobytes and are the only durable
+# account of what a run was and what it did - the _session.json in particular,
+# which is the one file that says which electrodes were watched, under which
+# policy, inside what limits, and whether the run was live or simulated.
+#
+# The manifest and stimulus log were added in later phases and this rule was
+# not updated with them, so they were being ignored while the sidecar was
+# kept - versioning the least informative of the three.
 # NB: must be "recordings/*" not "recordings/" -- git does not descend into an
-# excluded directory, so the negation below would never be reached.
+# excluded directory, so the negations below would never be reached.
 *.raw
 recordings/*
 !recordings/*_meta.json
+!recordings/*_session.json
+!recordings/*_stimuli.json
 
 # Test fixtures are deliberately committed: small slices of real signal, needed
 # to test analysis code on a machine with no instrument.
