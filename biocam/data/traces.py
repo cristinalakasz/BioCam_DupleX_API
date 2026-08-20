@@ -172,7 +172,11 @@ class TraceRecorder:
             ).reshape(frames, self._total_channels)[:, self._indices]
             values = block.astype(np.float64)
             if self.as_microvolts:
-                values = self._offset + values * self._scale
+                # In place: `values` is already a private copy from astype, so
+                # this saves two whole-block temporaries per packet on the
+                # thread that drains the queue.
+                values *= self._scale
+                values += self._offset
             self._fold(values)
             self.packets_seen += 1
             return True
@@ -229,23 +233,31 @@ class TraceRecorder:
 
     def snapshot(self) -> TraceSnapshot:
         """A copy, oldest column first. Safe to call from another thread."""
-        if not self.filled:
+        # Both scalars are read ONCE, into locals, before anything uses them.
+        # The consumer thread advances them while this runs on the UI thread,
+        # and reading `_write` twice let `_append` land between the two rolls -
+        # pairing a minimum from one instant with a maximum from another, in a
+        # single drawn column. That is a display lying about the thing it
+        # exists to show, which is the exact failure this module rejects
+        # subsampling to avoid.
+        filled, write = self.filled, self._write
+        unit = "uV" if self.as_microvolts else "counts"
+        if not filled:
             return TraceSnapshot(self.channels,
                                  np.zeros((len(self.channels), 0)),
                                  np.zeros((len(self.channels), 0)),
-                                 0, self.seconds_per_column,
-                                 "uV" if self.as_microvolts else "counts")
-        if self.filled < self.columns:
-            lows = self._min[:, :self.filled].copy()
-            highs = self._max[:, :self.filled].copy()
+                                 0, self.seconds_per_column, unit)
+        if filled < self.columns:
+            lows = self._min[:, :filled].copy()
+            highs = self._max[:, :filled].copy()
         else:
             # Unwrap the ring so column 0 is the oldest sample, which is what
-            # anyone drawing left-to-right expects.
-            lows = np.roll(self._min, -self._write, axis=1).copy()
-            highs = np.roll(self._max, -self._write, axis=1).copy()
-        return TraceSnapshot(self.channels, lows, highs, self.filled,
-                             self.seconds_per_column,
-                             "uV" if self.as_microvolts else "counts")
+            # anyone drawing left-to-right expects. np.roll already returns a
+            # new array, so no further copy is needed.
+            lows = np.roll(self._min, -write, axis=1)
+            highs = np.roll(self._max, -write, axis=1)
+        return TraceSnapshot(self.channels, lows, highs, filled,
+                             self.seconds_per_column, unit)
 
     def warnings(self) -> list:
         problems = []

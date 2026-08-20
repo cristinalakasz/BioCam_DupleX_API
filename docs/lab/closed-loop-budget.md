@@ -136,6 +136,26 @@ much (issue #39).
 
 ---
 
+## 3b. What the callback costs, measured here
+
+The `DataReceived` callback reads five header members per packet and copies
+the payload. Measured on the development machine with
+`python -m biocam.interop.benchmark` — **DLLs, no instrument**:
+
+| operation | cost |
+|---|---|
+| `bytes(payload)` (152 KB) | 6.9 µs mean |
+| a `DataPacketHeader` property read | **0.52 µs** |
+
+The payload-length check adds one property read — about 7% of the copy beside
+it, and 0.05% of the 1000 µs budget at a 1 ms period. That was an assumption
+until it was measured.
+
+`Marshal.Copy` into a `bytearray` was **211.7 µs** for the same payload, 30×
+slower than `bytes()`. It is not used, and this is why.
+
+---
+
 ## 4. Not tested — report these
 
 None of this involves the instrument, but none of it has been measured on the

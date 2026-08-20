@@ -231,6 +231,16 @@ class SessionController:
             )
         self._factory = factory
         self._stop.clear()
+        # Drop the previous session's objects BEFORE the thread starts.
+        # `_run` reassigns them, but not for 18-25 ms - `make_loop` warms the
+        # closed loop first - and every UI-thread reader is live in that
+        # window. `acquisition_us()` is the one that matters: it is documented
+        # as the number a scheduled plan is shifted by, and returning the
+        # previous recording's time would place a train at a wrong offset.
+        self._clock = None
+        self._monitor = None
+        self._loop = None
+        self._traces = None
         self._events.drain()
         self._waveforms.clear()
         self._waveforms_seen = 0
@@ -363,7 +373,7 @@ class SessionController:
                 clock_source=final.get("clock_source"),
                 elapsed_sec=(time.perf_counter() - self._started_at
                              if self._started_at else None),
-                warnings=self._collect_warnings(clock),
+                warnings=self._collect_warnings(clock, writer),
             )
 
     # -- for the UI thread -----------------------------------------------
@@ -566,8 +576,17 @@ class SessionController:
             "stimulation_suspended": queue.suspended,
         }
 
-    def _collect_warnings(self, clock) -> tuple:
+    def _collect_warnings(self, clock, writer=None) -> tuple:
         problems = []
+        if writer is not None:
+            # The recording's own account of itself. Without this the
+            # payload-length check writes a number into the sidecar that
+            # nothing puts in front of a human - and a colleague finishes the
+            # day and reports nothing, because nothing asked them to.
+            try:
+                problems.extend(writer.payload_warnings())
+            except Exception:  # noqa: BLE001 - a warning is never worth a run
+                pass
         if clock is not None:
             try:
                 problems.extend(clock.warnings())
@@ -579,6 +598,15 @@ class SessionController:
             problems.extend(self._loop.warnings())
         if self._traces is not None:
             problems.extend(self._traces.warnings())
+        stimulator = getattr(self._factory, "stimulator", None)
+        if stimulator is not None:
+            # Whether the device's internal buffers accumulate across calls is
+            # the open question issue #24 exists to settle, and it cannot be
+            # settled by a session whose counts nobody sees.
+            try:
+                problems.extend(stimulator.buffer_warnings())
+            except Exception:  # noqa: BLE001
+                pass
         dropped = self._waveforms_seen - len(self._waveforms)
         if dropped > 0:
             problems.append(

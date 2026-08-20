@@ -108,10 +108,47 @@ def main():
     _time("bytes(payload)", lambda p: bytes(p), payload)
     _time("Marshal.Copy into bytearray", marshal_copy, payload)
 
+    _time_header_reads()
+
     budget_us = 1000.0
     print(f"\nBudget is {budget_us:.0f} us per packet at a 1 ms acquisition period.")
     print("A strategy above that cannot keep up and must not be used in the callback.")
     return 0
+
+
+def _time_header_reads():
+    """What a DataPacketHeader property costs to read from Python.
+
+    The callback reads four header members per packet and, since the
+    payload-length check was added, a fifth. That fifth was carried on the
+    argument that a single Int32 property get is negligible beside the payload
+    copy - almost certainly true, and until now not measured. An unmeasured
+    per-packet marshal has no business going into a lab session when the
+    measurement is free here.
+
+    Needs the DLLs, not the instrument: DataPacketHeader has a public
+    (Int32 payloadLength, UInt16 packetCounter) constructor (XML:1953-1959),
+    so a header can be built and read without a BioCAM.
+    """
+    from _3Brain.BioCamDriver import DataPacketHeader
+
+    header = DataPacketHeader(PAYLOAD_BYTES, 1)
+    reads = (
+        ("header.PayloadLength", lambda h: h.PayloadLength),
+        ("header.Timestamp", lambda h: h.Timestamp),
+        ("header.PacketCounter", lambda h: h.PacketCounter),
+    )
+    print("")
+    print("Header property reads (the callback does four; the payload-length")
+    print("check added a fifth):")
+    for label, read in reads:
+        for _ in range(WARMUP):
+            read(header)
+        start = time.perf_counter()
+        for _ in range(REPEATS):
+            read(header)
+        per_call_us = (time.perf_counter() - start) / REPEATS * 1e6
+        print(f"  {label:<26} {per_call_us:8.4f} us per read")
 
 
 if __name__ == "__main__":
