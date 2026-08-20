@@ -52,6 +52,22 @@ def a_window(root, tmp_path, demo, params=None, **kwargs):
     )
 
 
+def while_running(root, window):
+    """Start a recording that will not end until it is told to.
+
+    The demo replays in about 0.4 s of wall clock, so any test that starts a
+    recording and then asserts something about the running state is racing it:
+    under load the run can finish before the assertion executes. Two tests
+    were intermittently failing exactly this way. "Until stopped" removes the
+    race rather than widening a timeout, which would only make it rarer.
+    """
+    window.var_until_stopped.set(True)
+    window._on_duration_mode()
+    window._on_start()
+    root.update()
+    assert window.controller.running, "the recording did not start"
+
+
 def pump(root, window, timeout=20.0):
     """Run the event loop until the WINDOW has caught up, not the controller.
 
@@ -178,12 +194,11 @@ def test_the_buttons_swap_over_while_recording(root, tmp_path, demo):
 
 def test_stimulation_becomes_available_once_recording(root, tmp_path, demo):
     window = a_window(root, tmp_path, demo)
-    window.var_duration.set("2")
-    window._on_start()
-    root.update()
+    while_running(root, window)
     window._refresh_stim_validity()
     assert str(window.btn_stim["state"]) == "normal"
     window._on_stimulate()
+    window._on_stop()
     state = pump(root, window)
     assert state.stimuli_delivered == 1
 
@@ -774,10 +789,10 @@ def test_the_train_button_follows_the_recording(root, tmp_path, demo):
     window._on_train_edited()
     assert str(window.btn_train["state"]) == "disabled"
 
-    window._on_start()
-    root.update()
+    while_running(root, window)
     assert str(window.btn_train["state"]) == "normal"
 
+    window._on_stop()
     pump(root, window)
     assert str(window.btn_train["state"]) == "disabled"
 
