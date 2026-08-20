@@ -347,8 +347,55 @@ class Stimulator:
                 "would throw InvalidOperationException."
             )
         self._started = True
-        # A fresh Start clears the stimulator's internal buffers, so the
-        # queued count starts again with it.
+        # The queued-pulse count starts again here.
+        #
+        # Be clear about what this rests on: **nothing in the XML says that
+        # Start empties the internal memory buffers Send fills.** It says only
+        # "Start the stimulator and returns a value indicating whether the
+        # operation was successful" (XML:4870). Zeroing here is an assumption,
+        # chosen because Start brackets one acquisition and carrying a count
+        # across sessions would refuse legitimate stimuli forever after a busy
+        # one. If it is wrong, the error is in the safe direction - we would
+        # allow a send the device cannot hold, which is the situation that
+        # existed before this counter and which the driver at least reports by
+        # ignoring the NEXT call. Untested on the instrument; see issue #24.
+        self._queued_pulses = 0
+
+    def reset(self) -> None:
+        """Reset the stimulator, and forget how many pulses it has queued.
+
+        `IBioCamStim.Reset` (XML:4882) - "Reset the stimulator and returns a
+        value indicating whether the operation was successful."
+
+        **That is the whole of what the API says.** It does not state that
+        Reset empties the internal memory buffers that `Send` fills, and no
+        other member documents when those buffers clear either. Treating a
+        reset as "the queue is now empty" is therefore an assumption, and it
+        is the assumption `_queued_pulses` is cleared on. It is the natural
+        reading of a method called Reset, and it is the only lever the API
+        offers - but it has never been checked on the instrument, so a
+        colleague who resets and then finds a Send silently ignored should
+        report exactly that (issue #24).
+
+        Raises rather than warning, unlike `stop()`: this is a deliberate
+        operator action, not a teardown path, and silently failing to clear a
+        queue the caller believes is now empty is how the next stimulus goes
+        missing.
+        """
+        self._require_running("reset the stimulator")
+        try:
+            ok = self._stimulator.Reset()
+        except BaseException as exc:
+            raise StimulatorError(
+                f"IBioCamStim.Reset raised {exc!r}. The stimulator's queued "
+                "pulses are in an unknown state; the recording is unaffected."
+            ) from exc
+        if ok is not True:
+            raise StimulatorError(
+                f"IBioCamStim.Reset() returned {ok!r} rather than True, so "
+                "the stimulator was not reset and whatever it had queued is "
+                "still queued."
+            )
         self._queued_pulses = 0
 
     def stop(self) -> None:
@@ -620,10 +667,10 @@ class Stimulator:
                 f"past the {MAX_TRAIN_PULSES} its internal memory holds. The "
                 "API documents that an overflow makes the NEXT Send silently "
                 "ignore its arguments, so this is refused rather than risked. "
-                "Call reset() to clear the queue once the train has run - and "
-                "note that this count cannot decrease on its own, because "
-                "nothing in the API reports when queued pulses have "
-                "executed (issue #24)."
+                "Call reset() once the train has run to clear it. This count "
+                "cannot decrease on its own: nothing in the API reports when "
+                "queued pulses have executed, so it is a high-water mark and "
+                "will refuse conservatively over a long session (issue #24)."
             )
         if any(b <= a for a, b in zip(timestamps, timestamps[1:])):
             raise StimulatorError(
