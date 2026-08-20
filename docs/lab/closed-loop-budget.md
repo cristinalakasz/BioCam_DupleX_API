@@ -69,9 +69,11 @@ Drawing traces for selected electrodes costs, per packet:
 
 | frames/packet | 1 channel | 4 channels | 8 channels | share of budget |
 |---|---|---|---|---|
-| 19 (1 ms) | 32 µs | 52 µs | 56 µs | 3–6% |
-| 37 (2 ms) | 39 µs | 71 µs | 58 µs | 2–4% |
-| 186 (10 ms) | 50 µs | 74 µs | 85 µs | <1% |
+| 19 (1 ms) | 24 µs | 29 µs | 30 µs | 2–3% |
+| 186 (10 ms) | 34 µs | 42 µs | 70 µs | <1% |
+
+Re-measured after the snapshot lock and in-place scaling; both came in cheaper
+than the earlier figures, not dearer.
 
 Cheap enough to leave on. It is capped at eight electrodes — past that the
 lanes are unreadable anyway, and the cap is enforced rather than trusted.
