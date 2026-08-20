@@ -1,7 +1,7 @@
 # BioCam DupleX API
 
-Software to record from, and — in later phases — closed-loop stimulate, a
-3Brain BioCAM DupleX high-density microelectrode array (4096 channels).
+Software to record from, stimulate, and closed-loop stimulate a 3Brain
+BioCAM DupleX high-density microelectrode array (4096 channels).
 
 **This is the lab manual.** It is written for the person who runs experiments
 on the instrument, not for the person who wrote the code. The author is
@@ -9,11 +9,24 @@ on the instrument, not for the person who wrote the code. The author is
 it was wrong on the page, not caught by hand. Report discrepancies rather than
 working around them.
 
-**What is built:** the acquisition path, the stimulation engine, and an
-operator window that records and stimulates together — `python -m biocam.ui`
-(§17). It runs with or without the instrument, so you can learn it before you
-need it. **What does not exist yet:** online spike detection, spike sorting,
-and closed-loop stimulation.
+**Start here: `python -m biocam.ui`** — the operator window (§17). It
+records and stimulates in one session, draws the array and the traces, detects
+spikes, sorts them, and closes the loop. It runs **with or without the
+instrument**, so learn it on a recorded file before you need it:
+
+```
+python tools/make_demo_recording.py demo
+python -m biocam.ui --replay demo.raw --meta demo_meta.json
+```
+
+Everything the window does is also available from the command line — `biocam
+record`, `biocam stim`, `biocam analyse` (§7, §15, §18) — but the window is
+the one interface that does all of it at once.
+
+**What is built:** all of it. Acquisition, the stimulation engine, combined
+recording-and-stimulation sessions, the window, online spike detection, spike
+sorting with three selectable techniques, and closed-loop stimulation. §14 has
+the phase-by-phase status.
 
 **Built is not the same as proven.** None of this software has ever run on the
 instrument — not one recording, not one stimulus. It was written against the
@@ -86,8 +99,8 @@ short on purpose.
 3. **Run preflight** (§6), **from the repository root**: `python -m
    biocam.preflight`. It confirms the environment only — Python version,
    `numpy`, and the seven DLLs on disk. It does **not** confirm the device is
-   detected or the plate is seated; that check is not implemented yet
-   (arrives with Phase 1).
+   detected or the plate is seated — that check is still not implemented, and
+   a clean preflight is not evidence the instrument is there.
 4. **Check free disk space.** Recording all 4096 channels consumes
    **~152 MB per second — about 9 GB per minute**
    (18,557.72 Hz × 4096 channels × 2 bytes/sample ≈ 152 MB/s; verify with
@@ -331,8 +344,9 @@ On your machine the "not found in ..." path will be
 to produce this example, not the real DLL location.
 
 **What preflight does not check:** device detection or MEA plate connection.
-That requires Layer 1 code that doesn't exist until Phase 1 (§14). A clean
-preflight pass tells you the environment is correct — it does not tell you the
+Both would need to claim the instrument, which preflight deliberately does not
+do — it must be safe to run while something else holds the BioCAM. A clean
+preflight pass tells you the environment is correct; it does not tell you the
 BioCAM is connected, powered, or ready.
 
 ---
@@ -540,10 +554,12 @@ One line per top-level path:
   - `biocam/interop/` — **Layer 1**: .NET interop via `pythonnet`. The only package allowed to import `clr`. Mostly needs the instrument; `reflect.py` and `verify_stim_model.py` are the exceptions, needing the DLLs but no BioCAM (§15).
   - `biocam/data/` — **Layer 2**: pure byte/number logic (payload decoding, frame reassembly, unit conversion, integrity). Fully testable with synthetic buffers.
   - `biocam/stim/` — **Layer 2**: stimulation modelling — pulses, electrode patterns, trains, arbitrary sequences, and the validation that keeps the driver from silently altering any of them (§15). Pure arithmetic; no `clr`, no device.
-  - `biocam/analysis/` — **Layer 3**: signal processing (spike detection, sorting). Fully testable against fixtures. Populated starting Phase 5.
-  - `biocam/ui/` — **Layer 2**: the operator window (§17), Tkinter. Runs against the instrument or against a recorded file; the difference is confined to `biocam/ui/factories.py`.
+  - `biocam/analysis/` — **Layer 3**: signal processing (§18) — `filters.py` (streaming high-pass), `spikes.py` (noise estimate, threshold crossings, waveform collection), `sorting.py` (three techniques and the null-corrected separation score). Fully testable against fixtures.
+  - `biocam/ui/` — **Layer 2**: the operator window (§17), Tkinter. `app.py` is the window, `arrayview.py` the electrode picture, `traceview.py` the trace strip, `controller.py` the thread boundary, and `factories.py` the one place the live and simulated paths differ.
+  - `biocam/loop.py` — **Layer 2**: closed-loop stimulation (§17.5) — the policy that decides, and the safety envelope that decides whether the policy may
   - `biocam/control.py` — **Layer 2**: the bounded hand-off that lets a UI request a stimulus without touching the acquisition thread (§16.2)
-  - `biocam/cli.py` — the `record`, `convert` and `stim` subcommands
+  - `biocam/manifest.py` — **Layer 2**: the session record written beside every recording, holding what the experiment *was* (§17.7)
+  - `biocam/cli.py` — the `record`, `convert`, `stim` and `analyse` subcommands
   - `biocam/session.py` — the recording loop that joins a packet source to a writer
   - `biocam/preflight.py` — the environment check run by `python -m biocam.preflight` (§6)
 - `BioCam_DupleX_API/` — legacy, pre-layer-split code and vendor material:
@@ -553,7 +569,10 @@ One line per top-level path:
   - `recordings/` — output of `recorder.py`; `.raw` files are gitignored, `_meta.json` sidecars are committed
 - `tests/` — the pytest suite (§12) and `tests/fixtures/` — the two committed real-signal fixtures
 - `tools/make_fixtures.py` — the one-off script that produced the committed fixtures from a full (uncommitted) recording
-- `docs/superpowers/` — specs (`specs/`) and plans (`plans/`) for this project's own development, including the setup spec and the six-phase roadmap referenced throughout this document
+- `tools/make_demo_recording.py` — builds the synthetic recording the window is learned on (§17); plants spikes and then runs the real detector over its own output to check they are findable
+- `docs/lab/` — **read these before a session.** [`storage-setup.md`](docs/lab/storage-setup.md) (where recordings may be written, and the write test a drive must pass), [`closed-loop-budget.md`](docs/lab/closed-loop-budget.md) (what detection and the loop cost per packet, and what must be measured on the instrument), [`stimulus-timing.md`](docs/lab/stimulus-timing.md) (how a stimulus is placed in time, and how precisely)
+- `docs/api/` — what the assemblies themselves say, read by reflection rather than transcribed from the XML: [`stimulation-reference.md`](docs/api/stimulation-reference.md) and [`device-reference.md`](docs/api/device-reference.md). Regenerate rather than trusting either
+- `docs/superpowers/` — specs (`specs/`) and plans (`plans/`) for this project's own development, including the setup spec and the phase roadmap referenced throughout this document
 - `requirements.txt` / `requirements-dev.txt` — pinned dependencies for the lab machine and a development machine respectively (§5)
 - `pytest.ini` — test configuration
 - `3Brain_BioCamDriverAPI_v2.6_Introduction.pdf` — vendor manual, source for §9
@@ -680,7 +699,10 @@ only:
 | 4 | UI | **Merged** (PR #29). `python -m biocam.ui` — runs with or without the instrument (§17). Live path untested |
 | 5 | Spike detection | **Merged** (PR #35). Streaming high-pass, Quiroga noise estimate, threshold crossings across packet boundaries |
 | 6 | Closed-loop stimulation (depends on Phase 5) | **Merged** (PR #36). Policy, safety envelope, `warm_up` — issues #26, #27, #38, #39 |
-| 7 | Spike sorting, and making the above reachable | **Merged** (PR #37). Three techniques, a null-corrected separation score, `biocam analyse`, the analysis panel, live traces |
+| 7 | Spike sorting, and making the above reachable | **Merged** (PR #37). Three techniques, a null-corrected separation score, `biocam analyse`, the analysis panel |
+| 8 | Live traces and scheduled trains | **Merged** (PR #41). Peak-preserving trace strip (§17.6), trains sent from the window (§17.3) |
+| 9 | A recording that describes its own experiment | **Merged** (PR #42). `name_session.json` (§17.7), and an independently-shaped second phase for the pulse |
+| 10 | Stimulus timing, and the API review it came from | **Merged** (PR #43). Every stimulus now carries an acquisition time (§17.7, `docs/lab/stimulus-timing.md`); the API verification's findings fixed; issue #17 closed by reflection |
 
 Nothing in phases 4–7 has ever run on the instrument either. The closed loop's
 per-packet budget, and what still has to be measured in the lab, are in
@@ -940,14 +962,48 @@ everything else is the code that will run on the instrument. Learn the
 controls this way before spending bench time on them — and if something about
 the window confuses you, say so from here rather than at the BioCAM.
 
-### 17.1 It always tells you which one it is
+### 17.1 What is on screen
+
+One window, four columns above a log:
+
+```
+┌──────────────┬─────────────────────┬──────────────┬────────────────────┐
+│ Recording    │ Electrode array     │ Stimulus     │ Spikes and         │
+│              │                     │              │ closed loop        │
+│ name         │  ████ 64x64 grid,   │ amplitude    │                    │
+│ duration     │  ██▓▒ one cell per  │ phase / gap  │ ☐ detect spikes    │
+│ until stopped│  ░░▒▓ electrode,    │ second phase │ ☑ draw traces      │
+│              │  ████ brightness =  │ electrodes   │ threshold          │
+│ [ Start ]    │       activity      │              │                    │
+│ [ Stop  ]    │                     │ [Stimulate]  │ sorting technique  │
+│              │  click to select    │              │ units / [ Sort ]   │
+│ status:      │  ─────────────────  │ Train:       │                    │
+│  elapsed     │  ╱╲__╱╲_ traces,    │ pulses/rate  │ ☐ close the loop   │
+│  frames      │  ─╲╱──╲╱ one lane   │ starts in    │ policy / limits    │
+│  missing     │         per chosen  │ [Send train] │                    │
+│  verdict     │         electrode   │              │ what will happen   │
+├──────────────┴─────────────────────┴──────────────┴────────────────────┤
+│ Session log — every event, with a timestamp                            │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**The array is the centre of it.** Clicking an electrode selects it, and that
+one selection drives three things at once: the electrodes a stimulus is
+delivered through, the electrodes spikes are detected on, and the electrodes
+drawn as traces. Brightness is live activity, so you can see which sites carry
+signal before choosing any.
+
+Everything the window refuses, it explains in place — the reason a greyed-out
+button is greyed out is written directly beneath it, live, as you type.
+
+### 17.2 It always tells you which one it is
 
 A red banner and `LIVE INSTRUMENT` in the title bar mean stimuli reach the
 preparation. A blue banner and `SIMULATION` mean nothing leaves the machine.
 If you are ever unsure which you are looking at, look at the banner — a
 simulated run mistaken for a real one is worse than no run at all.
 
-### 17.2 What it will not let you do
+### 17.3 What it will not let you do
 
 | It refuses | Because |
 |---|---|
@@ -973,7 +1029,7 @@ counted from the beginning of the acquisition rather than from now (§15.5).
 With no clock reading yet, the train is refused rather than sent to an unknown
 point in time.
 
-### 17.3 Reading the status panel
+### 17.4 Reading the status panel
 
 - **Acquisition time** is what a scheduled stimulus would be timed against,
   and it names where it came from. `device` means the instrument's own clock
@@ -987,7 +1043,7 @@ point in time.
   is a warning the run survived; red is an error. Both are also in the
   session log with a timestamp.
 
-### 17.4 Spikes, sorting and the closed loop
+### 17.5 Spikes, sorting and the closed loop
 
 The fourth panel turns on everything downstream of the recording. All of it
 watches **the electrodes selected on the array** — clicking an electrode is
@@ -998,7 +1054,7 @@ how you choose what to detect on, trace, and sort.
 - **Sorting technique** — Amplitude, PCA + k-means, or Template matching, run
   on the spikes collected so far. Sorting is **per electrode**: a unit is a
   neuron as heard by one site. The separation score is corrected against a
-  null, so a technique cannot report an impressive number for noise (§17.6).
+  null, so a technique cannot report an impressive number for noise (§18.3).
 - **Close the loop** — stimulate on a detected spike, under a safety envelope
   that the policy cannot override.
 
@@ -1009,7 +1065,7 @@ Keep the watched set small. Detection over the whole array costs about three
 times a core, and [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md)
 has the measured per-packet numbers.
 
-### 17.5 Traces
+### 17.6 Traces
 
 Under the array, one lane per selected electrode, each with its own vertical
 scale — one shared scale means a single saturated electrode flattens
@@ -1023,7 +1079,7 @@ the height of the rest at random. The envelope cannot miss one.
 Capped at eight electrodes — past that the lanes are too thin to read and the
 cost stops being negligible.
 
-### 17.6 What a session leaves behind
+### 17.7 What a session leaves behind
 
 Four files, named after the recording:
 
@@ -1045,7 +1101,7 @@ file.
 Every field is read off the objects that ran, not off what the window believed
 it had configured, so the record cannot quietly disagree with the session.
 
-### 17.7 What it does not do yet
+### 17.8 What it does not do yet
 
 - **Trains are scheduled, not verified.** The window can send them: it shifts
   the plan by the acquisition clock's reading, and refuses if there is no
