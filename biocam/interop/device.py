@@ -143,17 +143,46 @@ class BioCamDevice:
                 f"{BioCamPool.SupportBioCamWithInvalidSerial!r}"
             )
 
+        # From here on the pool is active, and every way out of __enter__ -
+        # a timeout, a driver exception, a failed check, or Ctrl+C during
+        # the up-to-30 s wait for a slot (exactly when BrainWave still holds
+        # the device, and exactly when an operator reaches for Ctrl+C) -
+        # must release whatever was taken and deactivate the pool. __exit__
+        # never runs for a with-block whose __enter__ raised, and
+        # KeyboardInterrupt is not an Exception, so both are handled here.
+        try:
+            self._claim()
+        except BaseException:
+            try:
+                self.__exit__(None, None, None)
+            except BaseException as cleanup_exc:  # noqa: BLE001 - keep the real error
+                # ascii(), not repr(): these assemblies are obfuscated, and
+                # printing their exception text to a cp1252 console raises
+                # UnicodeEncodeError - which would replace the real error.
+                try:
+                    print(
+                        "BioCamDevice: cleanup after a failed connect also "
+                        f"failed: {ascii(cleanup_exc)}. The BioCAM may still "
+                        "be claimed; restart the process before retrying."
+                    )
+                except BaseException:  # noqa: BLE001 - nothing left to tell
+                    pass
+            raise
+        return self
+
+    def _claim(self):
+        """Find a free slot, take control of it, and check the connection.
+
+        Runs with the pool already active; the caller undoes everything on
+        any failure.
+        """
+        BioCamPool = self._pool
         deadline = time.time() + self._timeout_sec
         # MEDIUM 4: found_slot_index is a plain local, not self._slot_index,
-        # until TakeBioCamControl below has actually returned a live
-        # handle. Identifying a free slot index is not the same as holding
-        # it - the sample only releases a slot it holds. Setting
-        # self._slot_index this early meant a TakeBioCamControl failure
-        # (or the checks that follow it) still ran __exit__ as if a slot
-        # had been taken: it would call ReleaseBioCamControl on a slot
-        # never claimed, and a failure from that release call would
-        # replace the carefully-worded "close BrainWave" message below
-        # with whatever ReleaseBioCamControl raises instead.
+        # until TakeBioCamControl below has actually returned a live handle.
+        # Identifying a free slot is not the same as holding it - the sample
+        # only releases a slot it holds - so __exit__ must not release one
+        # that was merely seen to be free.
         found_slot_index = -1
         while time.time() < deadline:
             free = list(BioCamPool.GetSlotIndexesFreeBioCam())
@@ -162,36 +191,24 @@ class BioCamDevice:
                 break
             time.sleep(0.5)
         else:
-            BioCamPool.Deactivate()
             raise TimeoutError(
                 "No free BioCAM found. Check USB, power, and that BrainWave "
                 "is closed - it holds the device."
             )
 
-        # From here on, any failure - including one that raises instead of
-        # returning falsy, which the XML doc does not rule out - must still
-        # release the slot and deactivate the pool. Otherwise the BioCAM
-        # stays claimed until the process dies, and the next person on the
-        # instrument finds it held by nothing.
-        try:
-            self.biocam = BioCamPool.TakeBioCamControl(found_slot_index)
-            if self.biocam is None:
-                raise RuntimeError(
-                    "TakeBioCamControl returned nothing. Close BrainWave or "
-                    "any other 3Brain software and try again."
-                )
-            # MEDIUM 4: only now, with a live handle in hand, does
-            # __exit__'s ReleaseBioCamControl(self._slot_index) become
-            # correct to call - so this is the earliest point this is set.
-            self._slot_index = found_slot_index
-            if not self.biocam.IsConnected:
-                raise RuntimeError("BioCAM reports it is not connected.")
-            if not self.biocam.MeaPlate.IsConnected:
-                raise RuntimeError("The MEA plate is not seated.")
-        except Exception:
-            self.__exit__(None, None, None)
-            raise
-        return self
+        self.biocam = BioCamPool.TakeBioCamControl(found_slot_index)
+        if self.biocam is None:
+            raise RuntimeError(
+                "TakeBioCamControl returned nothing. Close BrainWave or "
+                "any other 3Brain software and try again."
+            )
+        # Only now, with a live handle in hand, is __exit__'s
+        # ReleaseBioCamControl(self._slot_index) correct to call.
+        self._slot_index = found_slot_index
+        if not self.biocam.IsConnected:
+            raise RuntimeError("BioCAM reports it is not connected.")
+        if not self.biocam.MeaPlate.IsConnected:
+            raise RuntimeError("The MEA plate is not seated.")
 
     def __exit__(self, exc_type, exc, tb):
         if self._pool is None:

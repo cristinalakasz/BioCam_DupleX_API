@@ -181,3 +181,14 @@ def test_retained_gap_list_is_capped_and_the_remainder_is_counted():
 def test_default_max_retained_gaps_matches_the_module_constant():
     tracker = GapTracker(frame_rate_hz=RATE)
     assert tracker._max_retained_gaps == MAX_RETAINED_GAPS
+
+
+def test_a_repeated_counter_is_flagged_as_an_anomaly():
+    # Not loss - but the payload is still written, so the file may now hold
+    # a packet twice, and every later frame is shifted by one packet. That
+    # cannot be reported as clean.
+    tracker = GapTracker(frame_rate_hz=RATE)
+    for i, counter in enumerate([5, 6, 6, 7]):
+        assert tracker.observe(counter, frames_in_packet=10, frames_written=i * 10) is None
+    assert tracker.n_frames_missing == 0
+    assert tracker.counter_anomalies == 1

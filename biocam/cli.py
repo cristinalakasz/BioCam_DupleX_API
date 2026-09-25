@@ -60,6 +60,7 @@ source.stop() ran.
 """
 
 import argparse
+import math
 import queue
 import shutil
 import sys
@@ -215,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     record = sub.add_parser("record", help="record from the instrument")
-    record.add_argument("--duration", type=float, default=None,
+    record.add_argument("--duration", type=_duration_sec, default=None,
                         help="seconds to record; omit to run until stopped")
     record.add_argument("--name", type=str, default=None,
                         help="base name for the output files")
@@ -304,7 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
              "semicolons, e.g. '10,10' or '10,10;11,10'")
     stim.add_argument("--negative", type=_electrode_list, required=True,
                       help="negative endpoints, same format as --positive")
-    stim.add_argument("--count", type=int, default=1,
+    stim.add_argument("--count", type=_positive_count, default=1,
                       help="number of pulses (default 1)")
     group = stim.add_mutually_exclusive_group()
     group.add_argument("--rate-hz", type=float, default=None,
@@ -388,6 +389,40 @@ def _channel_list(value: str, total: int) -> list:
             f"channel(s) {outside} are outside the {total}-channel recording"
         )
     return channels
+
+
+def _positive_count(value: str) -> int:
+    """argparse type for --count: a whole number of pulses, at least one.
+
+    Zero and negatives used to be accepted and then sent one pulse anyway.
+    """
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--count must be a whole number, got {value!r}") from None
+    if count < 1:
+        raise argparse.ArgumentTypeError(
+            f"--count must be at least 1, got {count}")
+    return count
+
+
+def _duration_sec(value: str) -> float:
+    """argparse type for --duration: a finite number of seconds above zero.
+
+    nan and inf used to pass here and fail only inside the session, after
+    streaming had started, stamping the recording failed.
+    """
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--duration must be a number of seconds, got {value!r}") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--duration must be a finite number of seconds above zero, "
+            f"got {value!r}; omit it to record until stopped")
+    return seconds
 
 
 def _electrode_list(value: str):
@@ -998,6 +1033,21 @@ def stim_command(args) -> int:
             max_total_ticks=args.max_total_ticks,
         )
     else:
+        if args.count > 1:
+            # A train's timestamps count from the beginning of an
+            # acquisition (XML), and `stim` never starts one - nor can
+            # anything else be running one, because only one process may
+            # control the BioCAM. Sent from here, the train would be timed
+            # from nothing. Refused before the instrument is touched.
+            print(
+                "refused: a train needs a running acquisition to be timed "
+                "from, and `stim` does not record. Send trains from the "
+                "window, which records while it stimulates: "
+                "python -m biocam.ui --live. Use --dry-run to check the "
+                "plan here.",
+                file=sys.stderr,
+            )
+            return 2
         constraints = None  # read from the device below
 
     if constraints is None:

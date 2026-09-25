@@ -243,3 +243,85 @@ def test_data_format_reads_through_to_biocam_dataformat_when_claimed(fake_pool):
 
     with BioCamDevice() as device:
         assert device.data_format == "SENTINEL_FORMAT"
+
+
+# --------------------------------------------------------------------------
+# an interrupted connect must still hand the instrument back
+# --------------------------------------------------------------------------
+
+def test_ctrl_c_while_waiting_for_a_free_slot_deactivates_the_pool(fake_pool, monkeypatch):
+    # The wait is up to 30 s and happens exactly when BrainWave still holds
+    # the device - the moment an operator reaches for Ctrl+C. Activate() has
+    # run by then, and __exit__ never will: __enter__ did not return.
+    fake_pool.free_slots = []
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(device_module.time, "sleep", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        BioCamDevice(timeout_sec=30).__enter__()
+
+    assert fake_pool.take_calls == []
+    assert fake_pool.release_calls == []
+    assert fake_pool.deactivate_calls == 1
+
+
+def test_a_driver_error_while_polling_for_slots_deactivates_the_pool(fake_pool, monkeypatch):
+    def broken(cls):
+        raise RuntimeError("driver-side failure")
+
+    monkeypatch.setattr(FakeBioCamPool, "GetSlotIndexesFreeBioCam",
+                        classmethod(broken))
+    with pytest.raises(RuntimeError, match="driver-side failure"):
+        BioCamDevice().__enter__()
+
+    assert fake_pool.deactivate_calls == 1
+
+
+def test_ctrl_c_after_control_is_taken_releases_the_slot(fake_pool):
+    # `except Exception` does not catch KeyboardInterrupt, so an interrupt
+    # during the connection checks used to skip the release: the BioCAM
+    # stayed claimed by a process that was about to exit.
+    class Interrupting(_FakeBioCam):
+        @property
+        def IsConnected(self):
+            raise KeyboardInterrupt
+
+        @IsConnected.setter
+        def IsConnected(self, value):
+            pass
+
+    fake_pool.take_result = Interrupting()
+    with pytest.raises(KeyboardInterrupt):
+        BioCamDevice().__enter__()
+
+    assert fake_pool.release_calls == [0]
+    assert fake_pool.deactivate_calls == 1
+
+
+def test_a_failed_activate_is_not_followed_by_deactivate(fake_pool, monkeypatch):
+    # Deactivate is the undo of an Activate that happened. Calling it after
+    # one that failed is an undocumented call on an unknown state.
+    def broken(cls, *args):
+        raise RuntimeError("activation failed")
+
+    monkeypatch.setattr(FakeBioCamPool, "Activate", classmethod(broken))
+    with pytest.raises(RuntimeError, match="activation failed"):
+        BioCamDevice().__enter__()
+
+    assert fake_pool.deactivate_calls == 0
+
+
+def test_a_failing_cleanup_does_not_hide_why_the_connect_failed(fake_pool, monkeypatch):
+    # The plate is unseated, and then releasing the slot fails too. The
+    # operator must still be told about the plate.
+    fake_pool.take_result = _FakeBioCam(mea_plate_connected=False)
+
+    def broken(cls, slot_index):
+        raise RuntimeError(" obfuscated driver error")
+
+    monkeypatch.setattr(FakeBioCamPool, "ReleaseBioCamControl", classmethod(broken))
+    with pytest.raises(RuntimeError, match="MEA plate is not seated"):
+        BioCamDevice().__enter__()
+    assert fake_pool.deactivate_calls == 1

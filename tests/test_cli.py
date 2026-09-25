@@ -786,3 +786,14 @@ def test_record_command_reports_the_gc_measurement_delta_on_stderr(
     # The gc delta is not written anywhere else - it must not be claimed as
     # part of the sidecar record, only labelled as console/session-only.
     assert "console/session-only" in err
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "inf"])
+def test_record_refuses_a_duration_that_is_not_a_positive_number(value):
+    # nan and inf used to be accepted and fail only after streaming had
+    # started, stamping the recording failed; 0 and negatives recorded one
+    # packet.
+    from biocam.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--duration", value])

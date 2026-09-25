@@ -244,11 +244,21 @@ class RecordingWriter:
         self._disk_poll_stop.set()
         if self._disk_poll_thread is not None:
             self._disk_poll_thread.join(timeout=2.0)
+        # close() flushes, and on a full disk - the likeliest way a 152 MB/s
+        # recording dies - the flush fails again and close() raises. Left
+        # unguarded, that replaced the exception already propagating and
+        # skipped the failure sidecar below, leaving it "in_progress".
+        close_error = None
         if self._file is not None:
-            self._file.close()
-            self._file = None
+            try:
+                self._file.close()
+            except OSError as exc:
+                close_error = exc
+            finally:
+                self._file = None
         if not self._finalised:
-            error = exc_type.__name__ if exc_type is not None else None
+            error = exc_type.__name__ if exc_type is not None else (
+                type(close_error).__name__ if close_error is not None else None)
             # FIX 1: this write itself can fail - the disk that just failed
             # the caller's write is the same disk this sidecar is written to.
             # If it does, that failure must never replace whatever exception
@@ -277,6 +287,14 @@ class RecordingWriter:
                     f"{sidecar_exc}",
                     RuntimeWarning,
                 )
+        if close_error is not None:
+            if exc_type is None:
+                # Nothing else is propagating: the unwritten data is the news.
+                raise close_error
+            warnings.warn(
+                f"closing {self._raw_path} also failed: {close_error}",
+                RuntimeWarning,
+            )
         return False
 
     def write_packet(self, timestamp: int, counter: int, payload: bytes) -> None:
