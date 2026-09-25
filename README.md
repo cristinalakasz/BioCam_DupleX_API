@@ -1,1189 +1,609 @@
-# BioCam DupleX API
+# BioCAM DupleX control software
 
 Software to record from, stimulate, and closed-loop stimulate a 3Brain
-BioCAM DupleX high-density microelectrode array (4096 channels).
+BioCAM DupleX high-density microelectrode array (4096 electrodes, 64 × 64).
 
-**This is the lab manual.** It is written for the person who runs experiments
-on the instrument, not for the person who wrote the code. The author is
-~600 km from the BioCAM and cannot run any of this; if something here is wrong,
-it was wrong on the page, not caught by hand. Report discrepancies rather than
-working around them.
+**This is the lab manual**, written for the person who runs experiments.
+Developer material — code layers, test gates, DLL details, the legacy scripts,
+the roadmap — is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
-**Start here: `python -m biocam.ui`** — the operator window (§17). It
-records and stimulates in one session, draws the array and the traces, detects
-spikes, sorts them, and closes the loop. It runs **with or without the
-instrument**, so learn it on a recorded file before you need it:
+> **Built is not proven.** None of this software has ever run on the
+> instrument: not one recording, not one stimulus. It was written ~600 km from
+> the BioCAM, against the vendor's documentation and assemblies, and checked by
+> hand. Everything below describes what the code is *designed* to do. §11 lists
+> what is being tried for the first time and what to report. If something here
+> is wrong, report it rather than working around it.
+
+---
+
+## Contents
+
+1. [What the software can do](#1-what-the-software-can-do)
+2. [Before every session](#2-before-every-session)
+3. [Quick start: learn it on the demo](#3-quick-start-learn-it-on-the-demo)
+4. [The operator window](#4-the-operator-window)
+5. [Stimulation: what you must understand first](#5-stimulation-what-you-must-understand-first)
+6. [Command line](#6-command-line)
+7. [What a session leaves on disk](#7-what-a-session-leaves-on-disk)
+8. [Spike detection and sorting](#8-spike-detection-and-sorting)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Known limitations before a closed-loop session](#10-known-limitations-before-a-closed-loop-session)
+11. [What is untested, and what to report](#11-what-is-untested-and-what-to-report)
+12. [Glossary](#12-glossary)
+
+---
+
+## 1. What the software can do
+
+**Record.** It streams all 4096 channels at 18,557.72 samples per second each
+(about **152 MB/s, 9 GB per minute**) to a `.raw` file, exactly as the
+instrument sends them. As it goes, it checks that no data was lost. The
+instrument numbers every packet, so a skipped number is a **gap**. Every
+recording ends with an **integrity verdict**: `clean`, `gaps_detected`, or
+`unknown`.
+
+**Stimulate.** It sends biphasic current pulses, or trains of them, through
+chosen electrodes. The vendor driver silently *changes* pulses it does not like
+(§5), so every pulse is checked first and **refused, with the reason, rather
+than adjusted**. After the driver builds the pulse, it is read back to confirm
+nothing changed. In the window, stimulating is only allowed while a recording
+is running, and every attempt is logged, including refusals.
+
+**Watch activity live.** The window colours each electrode by how much signal
+it is picking up. It also draws live traces for up to 8 chosen electrodes,
+drawn so that a spike cannot fall between two displayed points.
+
+**Detect and sort spikes.** It filters the signal (300 Hz high-pass) and
+detects spikes as dips below a threshold measured in units of each electrode's
+noise. It can then sort each electrode's spikes into putative neurons with one
+of three techniques. Detection runs live in the window or afterwards on a file.
+Sorting runs in the window between recordings, or on a file.
+
+**Close the loop.** It can stimulate automatically when spikes are detected
+(policy *echo*), or when firing drops below a target (policy *rate*). A
+**safety envelope** — a minimum interval and a maximum rate — sits after the
+policy and cannot be overridden by it. Read §10 before using this on tissue.
+
+**Rehearse without the instrument.** The window runs in **simulation mode**
+against a recorded file. Only the packets and the stimulator are stand-ins;
+everything else is the code that runs on the instrument.
+
+**Leave a complete record.** Each recording leaves the signal, the acquisition
+parameters and integrity evidence, and a description of what the experiment
+was. If anything was stimulated, it also leaves every stimulus with its time
+(§7).
+
+---
+
+## 2. Before every session
+
+1. **Close BrainWave** and any other 3Brain software, including a leftover
+   Python process. Only one process can control the BioCAM at a time.
+   Otherwise `TakeBioCamControl()` returns `None` and every command fails.
+2. **Seat the MEA plate** on the DupleX head before connecting. An unseated
+   plate fails at `MeaPlate.IsConnected`.
+3. **Run the preflight check from the repository root:**
+   `python -m biocam.preflight`. It checks the Python version, the packages
+   (`numpy`, `h5py`, `pythonnet`), that the 3Brain DLLs exist, and that they
+   load into .NET. It does **not** detect the device or the plate: a pass
+   means the software can run, not that the instrument is ready.
+4. **Check free disk space.** A full-array recording is **~152 MB/s**
+   (18,557.72 × 4096 × 2 bytes), about 9 GB per minute and 91 GB per 10
+   minutes. A drive that fills mid-run loses the run.
+5. **Record to a local, dedicated drive.** Never use a OneDrive or other synced
+   folder, a network share, or the Windows system drive. Each of these loses
+   data in ways this software cannot detect. Setting up a drive, including the
+   sustained-write test it must pass, is in
+   [`docs/lab/storage-setup.md`](docs/lab/storage-setup.md).
+
+Environment setup for a new lab machine (Python 3.12, `pip install -r
+requirements.txt`, and the DLLs) is in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+The lab machine must run Windows 10/11 with .NET Framework 4.7 or later.
+
+---
+
+## 3. Quick start: learn it on the demo
 
 ```
 python tools/make_demo_recording.py demo
 python -m biocam.ui --replay demo.raw --meta demo_meta.json
 ```
 
-Everything the window does is also available from the command line — `biocam
-record`, `biocam stim`, `biocam analyse` (§7, §15, §18) — but the window is
-the one interface that does all of it at once.
+The first command writes `demo.raw` and `demo_meta.json` (about 76 MB). The
+second opens the window in **simulation mode**: a blue banner reading
+"SIMULATION — no instrument, no stimulus leaves this machine".
 
-**What is built:** all of it. Acquisition, the stimulation engine, combined
-recording-and-stimulation sessions, the window, online spike detection, spike
-sorting with three selectable techniques, and closed-loop stimulation. §14 has
-the phase-by-phase status.
+**The demo is synthetic.** It is not a recording of neurons, and nothing read
+off it is science. It contains:
 
-**Built is not the same as proven.** None of this software has ever run on the
-instrument — not one recording, not one stimulus. It was written against the
-vendor's documentation and assemblies and reviewed by hand. The open
-`hardware-verification` issues list what has never executed and how to check
-each one; #16 is the ten-minute first session, #21 the first stimulation step.
-§14 gives the current status; do not assume anything not listed there works.
+- **1024 electrodes (32 × 32)** instead of 4096, at the real sample rate. That
+  makes 2 seconds and 37,115 frames. The window sizes its grid to the file.
+- **A 3 Hz sine wave** (±120 counts, about ±240 µV) on every electrode. This
+  is the slow wave in the traces.
+- **Random noise** that differs per electrode, raised in two soft
+  **hotspots** centred on electrodes (10,13) and (23,20). These are the yellow
+  patches on the array.
+- **40 dead electrodes** with no signal, which show as black squares.
+- **Planted spikes**, in two shapes, on **10,13 · 11,13 · 10,14 · 11,12 ·
+  23,20 · 24,21**. Select these to see spikes in the traces, and to give
+  detection and sorting something to find.
 
----
-
-## Table of contents
-
-1. [What this is](#1-what-this-is)
-2. [Before you run an experiment](#2-before-you-run-an-experiment)
-3. [Hardware and requirements](#3-hardware-and-requirements)
-4. [The DLL step](#4-the-dll-step)
-5. [Environment setup](#5-environment-setup)
-6. [Preflight check](#6-preflight-check)
-7. [Recording](#7-recording)
-8. [Data formats](#8-data-formats)
-9. [How the instrument works](#9-how-the-instrument-works)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Project layout](#11-project-layout)
-12. [Development](#12-development)
-13. [Before handing code to the lab](#13-before-handing-code-to-the-lab)
-14. [Roadmap and status](#14-roadmap-and-status)
-15. [Stimulation](#15-stimulation)
-16. [Recording and stimulating together](#16-recording-and-stimulating-together)
-17. [The operator window](#17-the-operator-window)
-18. [Spike detection and sorting](#18-spike-detection-and-sorting)
+Try this: click 10,13 and 23,20 on the array, tick *Detect spikes*, press
+*Start recording*, then choose a sorting technique and press *Sort spikes so
+far* once it finishes. The replay ends after 2 seconds (`source_exhausted`),
+whatever duration you asked for.
 
 ---
 
-## 1. What this is
+## 4. The operator window
 
-This repository controls a 3Brain BioCAM DupleX: a 4096-channel high-density
-microelectrode array (MEA) system capable of both recording extracellular
-signal and delivering electrical stimulation.
+```
+python -m biocam.ui --live                                  # lab machine
+python -m biocam.ui --replay FILE.raw --meta FILE_meta.json # simulation
+```
 
-- **Built:** all seven phases. Acquisition (`biocam record`, all 4096
-  channels with gap detection and an integrity sidecar, plus HDF5
-  conversion), the stimulation engine (`biocam stim`), combined
-  recording-and-stimulation sessions, the operator window (`python -m
-  biocam.ui`), online spike detection, closed-loop stimulation, and spike
-  sorting with three selectable techniques (`biocam analyse`). See §14.
-- **Superseded:** `BioCam_DupleX_API/recorder.py` and `connector.py`, the
-  original scripts. They have known defects (§7, Appendix A of the design
-  spec); Phase 1 replaced them.
-- **Never executed on the instrument:** all of it. The development machine is
-  ~600 km from the BioCAM. A green test suite is evidence about Layers 2–3
-  only (§12) and proves nothing about the .NET interop.
+Add `--output-dir DIR` to change where recordings go (default `recordings`).
 
-If you were told "it can already do X" and X is not in the list above, ask
-before relying on it.
+**Which mode you are in.** A **red** banner and `LIVE INSTRUMENT` in the title
+bar mean stimuli reach the preparation. A **blue** banner and `SIMULATION` mean
+nothing leaves the machine. If in doubt, look at the banner.
 
----
+**Layout.** There are four columns above a session log. **Every section can be
+resized by dragging the edge between it and its neighbour**: the columns
+sideways, the log up and down. The array redraws its electrodes larger or
+smaller to fit, and the traces follow the column's width. No column can be
+dragged shut, so the reason written under a greyed-out button always stays
+visible.
 
-## 2. Before you run an experiment
+**Every refusal is explained in place.** If a button is greyed out, the reason
+is written beneath it and updates as you type.
 
-Read this section every time, even if you've run experiments before. It is
-short on purpose.
+### 4.1 Recording column
 
-1. **Close BrainWave** (and any other 3Brain software). The BioCAM can only be
-   controlled by one process at a time. If BrainWave (or a leftover Python
-   process) still holds the device, `TakeBioCamControl()` returns `None`, and
-   every script in this repository will fail with no clearer explanation than
-   that.
-2. **Seat the MEA plate** on the DupleX head before connecting. A recording
-   started with an unseated plate fails at `MeaPlate.IsConnected`.
-3. **Run preflight** (§6), **from the repository root**: `python -m
-   biocam.preflight`. It confirms the environment only — Python version,
-   `numpy`, and the seven DLLs on disk. It does **not** confirm the device is
-   detected or the plate is seated — that check is still not implemented, and
-   a clean preflight is not evidence the instrument is there.
-4. **Check free disk space.** Recording all 4096 channels consumes
-   **~152 MB per second — about 9 GB per minute**
-   (18,557.72 Hz × 4096 channels × 2 bytes/sample ≈ 152 MB/s; verify with
-   `python -c "print(18557.720703125*4096*2)"` — this one can be run from
-   anywhere — any time this figure is in doubt). A drive that looks empty
-   enough for "a quick recording" can fill up mid-session and lose the run —
-   there is no resume. A real 10-second session recorded on the development
-   machine this manual was verified on (its metadata sidecar is committed at
-   `BioCam_DupleX_API/recordings/20260624_140615_meta.json`; the `.raw` itself
-   is gitignored and is **not** in a fresh clone) is ~1.5 GB, consistent with
-   this rate.
-
-   **Where the recording is written matters as much as how much room there is.**
-   Never record into a OneDrive or other synced folder, onto a network share, or
-   onto the Windows drive — each loses data in a way this software cannot yet
-   detect. Setting a machine up correctly, including a sustained-write test the
-   drive must pass, is covered in
-   [`docs/lab/storage-setup.md`](docs/lab/storage-setup.md). Read it before the
-   first recording on any new machine.
-
----
-
-## 3. Hardware and requirements
-
-- 3Brain BioCAM DupleX instrument
-- MEA plate
-- Windows 10 or 11 — **this project is Windows-only.** The 3Brain driver
-  targets .NET Framework, loaded through `pythonnet`'s `netfx` runtime; there
-  is no cross-platform path.
-- .NET Framework 4.7 or later installed (4.8 satisfies this)
-- USB connection to the BioCAM
-
-A **development machine** (no instrument attached, running only the test
-suite) needs none of the above — not the instrument, not USB, not even
-Windows or .NET Framework. It only needs Python 3.12 and the packages in
-`requirements-dev.txt` (§5). Everything in this section is required on the
-**lab machine** only.
-
----
-
-## 4. The DLL step
-
-This is usually the first thing that blocks a fresh clone, so it gets its own
-section.
-
-The 3Brain driver requires seven DLLs that are **not committed to this
-repository** — `.gitignore` excludes all `*.dll` files. Reasons:
-
-- One full set is **~70 MB** (measured: sum of the sizes in the table below).
-  They are needed in **two directories** (below); as populated on the
-  development machine this manual was verified on, `API/` (all seven) plus
-  `SampleApp_BioCamCL/Dependencies/` (six of the seven — see below) together
-  measure **140,236,048 bytes, ≈ 140 MB** — unnecessary repository weight for
-  files that never change per-commit, in either count.
-- They are 3Brain's licensed SDK, not code we wrote, and not ours to
-  redistribute.
-
-They come from the **3Brain SDK / BrainWave installation** on the lab machine,
-and are read from **two directories**:
-
-- `BioCam_DupleX_API/API/` — used by the Python scripts (`connector.py`,
-  `recorder.py`, `Hello_BioCam.py`) and by `biocam.preflight`, which checks
-  **only this directory** (§6) — a clean preflight pass says nothing about
-  the second directory below.
-- `BioCam_DupleX_API/SampleApp_BioCamCL/Dependencies/` — used by 3Brain's own
-  C# reference application (§11), which you will want buildable if you're
-  cross-checking a .NET call against known-working code rather than against
-  the XML alone. Its `.csproj` explicitly references five of the seven from
-  here (`3Brain.BioCamDriver`, `3Brain.Common`, `3Brain.Deployment.Drivers`,
-  `3Brain.Diagnostic`, `3Brain.Processing.Core`), plus `FTD3XX_NET.dll` — an
-  FTDI USB driver assembly that preflight does not track and that is not in
-  this repository at all; get it from the 3Brain/FTDI install if you need to
-  build the sample app. `3Brain.Processing.Native.dll` is also present here
-  (a native runtime dependency, not a compile-time `<Reference>`).
-  `Newtonsoft.Json.dll` is the one file **not** currently present in this
-  directory and not referenced by the `.csproj` — there is no evidence it is
-  needed here; copy it in only if a build or run specifically reports it
-  missing.
-
-For the DLLs preflight does check (`API/`), copy the full set:
-
-| File | Size (bytes) |
+| Control | Meaning |
 |---|---|
-| `3Brain.BioCamDriver.dll` | 4,191,232 |
-| `3Brain.Common.dll` | 545,792 |
-| `3Brain.Deployment.Drivers.dll` | 2,174,976 |
-| `3Brain.Diagnostic.dll` | 18,944 |
-| `3Brain.Processing.Core.dll` | 12,108,288 |
-| `3Brain.Processing.Native.dll` | 50,722,816 |
-| `Newtonsoft.Json.dll` | 711,952 |
+| Output folder | Where files are written |
+| Name (optional) | File name prefix; a timestamp if empty |
+| Duration (s) / Run until I press Stop | How long to record |
+| Start recording / Stop | Begin, or end early |
+| Status, Elapsed | State, and wall-clock time since Start |
+| Acquisition time | How much signal has been recorded, and which clock it comes from (see below) |
+| Frames / Frames missing | Time points written / time points lost in gaps |
+| Verdict | `clean`, `gaps_detected`, or `unknown` (§12) |
+| Stimuli delivered | Stimuli sent in this recording |
 
-Sizes above come from a real preflight run on this development machine (§6).
-Preflight does **not** compare against them — it only confirms each file
-exists and is not zero-length, then reports the size it found so **you** can
-eyeball it against this table. A DLL that is truncated to a small but
-nonzero size, or is simply the wrong version, will still pass — only a
-completely empty (0-byte) file is caught automatically. If your copy's
-reported size differs noticeably from the table, re-copy it from the SDK
-rather than assuming it's fine; a size of a similar order but not identical
-can be legitimate (SDK versions differ across installs), a size wildly off
-or near-zero is not.
+Brown text under the status is a warning the run survived; red is an error.
+Both are also written to the session log. The label after *Acquisition time*
+tells you which clock is being used:
 
-**Check that all seven are present, from the repository root:**
+- `device` — the instrument's own clock, with a conversion factor read from
+  the device. This is the only case that is cross-checked.
+- `device-calibrated` — the conversion factor was estimated from the same
+  packets. The cross-check is then circular and cannot detect anything, and a
+  warning says so. This always happens in simulation.
+- `frames` — no usable device timestamps, so the time is estimated from the
+  frame count and the nominal rate.
 
-```
-python -m biocam.preflight
-```
+### 4.2 Electrode array column
 
-This also checks the Python version and `numpy` — see §6 for real pass/fail
-output.
+- **The array.** One cell per electrode. Brightness is **peak-to-peak
+  activity** over about 3.5 ms of a recent packet, refreshed about 10 times a
+  second. The scale runs from the quietest to the loudest electrode, and the
+  line under the array shows that range in µV.
+- **Selecting electrodes.** **Left-click** chooses a *positive* electrode
+  (red); **right-click** a *negative* one (blue). Click again to clear;
+  drag to paint several. *Clear* removes all of them.
+  Hovering shows an electrode's coordinates and reading.
+- **One selection drives three things.** It sets where a stimulus is delivered,
+  which electrodes spikes are detected on, and which electrodes are traced.
+- **Traces.** One lane per selected electrode (maximum 8), each with its own
+  vertical scale. Each screen column shows the minimum and maximum of its time
+  slice, so no spike can be missed. Traces work whether or not detection is on.
+- **The electrode set for traces and detection is fixed when you press
+  Start.** Changing the selection during a recording affects the next one.
+  Electrodes that are not on the array are skipped for traces and detection;
+  the Stimulus column still refuses them in red.
 
----
+**The picture assumes row-major channel order** (channel *i* is row
+*i* ÷ columns, column *i* mod columns). No vendor document states the order.
+If the picture looks transposed on the instrument, clicking one electrode would
+stimulate another. Checking this is the first thing to do in the lab (§11).
 
-## 5. Environment setup
+### 4.3 Stimulus column
 
-**Python 3.12** is required (`biocam/preflight.py` enforces `>= 3.12`; this
-manual was verified against 3.12.10).
-
-Two dependency files exist, and which one you need depends on the machine:
-
-- **Lab machine** (BioCAM attached): `requirements.txt` — pins `numpy` and
-  `pythonnet`. Requires Windows + .NET Framework 4.7+ (§3).
-- **Development machine** (no instrument, running only the test suite):
-  `requirements-dev.txt` — pins `numpy` and `pytest`, and deliberately
-  **excludes** `pythonnet`. The whole point of this split is that the test
-  suite runs without the 3Brain SDK installed at all
-  (`tests/test_no_hardware_imports.py` enforces this).
-
-### conda
-
-```
-conda create -n biocam python=3.12
-conda activate biocam
-pip install -r requirements.txt        # lab machine
-pip install -r requirements-dev.txt    # development machine
-```
-
-### venv
-
-The activation command depends on which shell you're using. Getting this
-wrong is easy to miss: the wrong command does not error, it just fails to
-activate, and `pip install` then silently installs into your global Python
-instead of the venv.
-
-**PowerShell:**
-
-```
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt        # lab machine
-pip install -r requirements-dev.txt    # development machine
-```
-
-**cmd.exe:**
-
-```
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r requirements.txt        # lab machine
-pip install -r requirements-dev.txt    # development machine
-```
-
-Do **not** use plain `.venv\Scripts\activate` (no extension) in PowerShell —
-that file is a POSIX shell script. PowerShell does not error on it or run it;
-it silently does nothing, `$env:VIRTUAL_ENV` stays empty, and every `pip
-install` after that goes into the global interpreter with no sign anything is
-wrong. After activating (either shell), confirm it worked before installing
-anything: `echo $env:VIRTUAL_ENV` (PowerShell) or `echo %VIRTUAL_ENV%`
-(cmd.exe) should print the path to `.venv`, not be empty.
-
-(`conda` was not available to re-verify on the machine this README was written
-on — the syntax above is standard conda usage. The **venv path was run
-end-to-end in PowerShell** on this machine: a fresh venv, `.\.venv\Scripts\
-Activate.ps1`, `pip install -r requirements-dev.txt`, then `python -m pytest`
-and `python -m biocam.preflight` (from the repository root — see §6) both
-succeeded from inside it — see the real output in §6 and §12.)
-
----
-
-## 6. Preflight check
-
-Run this before every experiment (§2) and any time the environment might have
-changed, **from the repository root** (the directory containing this
-README and the `biocam/` folder — not from inside `BioCam_DupleX_API/`;
-`python -m biocam.preflight` needs `biocam` importable from the current
-directory, and it fails with `ModuleNotFoundError: No module named 'biocam'`
-from anywhere else, including `BioCam_DupleX_API/`, which §7 sends you into):
-
-```
-python -m biocam.preflight
-```
-
-It checks Python version, `numpy`, and the seven DLLs (§4) — nothing that
-requires the instrument to be attached. Exits `0` if everything passes, `1` if
-anything fails.
-
-### Real pass output
-
-Captured on this development machine with all seven DLLs present in
-`BioCam_DupleX_API/API/` (re-run and confirmed identical while writing this
-manual):
-
-```
-[PASS] Python version                 found 3.12.10, need >= 3.12
-[PASS] package numpy                  2.5.2
-[PASS] 3Brain.BioCamDriver.dll        4191232 bytes
-[PASS] 3Brain.Common.dll              545792 bytes
-[PASS] 3Brain.Deployment.Drivers.dll  2174976 bytes
-[PASS] 3Brain.Diagnostic.dll          18944 bytes
-[PASS] 3Brain.Processing.Core.dll     12108288 bytes
-[PASS] 3Brain.Processing.Native.dll   50722816 bytes
-[PASS] Newtonsoft.Json.dll            711952 bytes
-
-ALL CHECKS PASSED
-```
-Exit code: `0`
-
-### Real fail output
-
-Captured pointing preflight at an empty DLL directory (identical failure path
-to a DLL being missing or misnamed, e.g. after a rename):
-
-```
-=== FAIL case: DLL directory empty ===
-[PASS] Python version                 found 3.12.10, need >= 3.12
-[PASS] package numpy                  2.5.2
-[FAIL] 3Brain.BioCamDriver.dll        not found in \tmp\nodlls
-[FAIL] 3Brain.Common.dll              not found in \tmp\nodlls
-[FAIL] 3Brain.Deployment.Drivers.dll  not found in \tmp\nodlls
-[FAIL] 3Brain.Diagnostic.dll          not found in \tmp\nodlls
-[FAIL] 3Brain.Processing.Core.dll     not found in \tmp\nodlls
-[FAIL] 3Brain.Processing.Native.dll   not found in \tmp\nodlls
-[FAIL] Newtonsoft.Json.dll            not found in \tmp\nodlls
-
-7 CHECKS FAILED
-```
-Exit code: `1`
-
-On your machine the "not found in ..." path will be
-`BioCam_DupleX_API/API/` — the directory shown above is a test directory used
-to produce this example, not the real DLL location.
-
-**What preflight does not check:** device detection or MEA plate connection.
-Both would need to claim the instrument, which preflight deliberately does not
-do — it must be safe to run while something else holds the BioCAM. A clean
-preflight pass tells you the environment is correct; it does not tell you the
-BioCAM is connected, powered, or ready.
-
----
-
-## 7. Recording
-
-Recording is done by `BioCam_DupleX_API/recorder.py`. It is a legacy script —
-it works, but it has known defects (see the Appendix A defect list in
-`docs/superpowers/specs/2026-08-03-claude-project-setup-design.md`) and is
-being rebuilt on the three-layer architecture in Phase 1 (§14). In particular:
-data loss is currently silent (no subscription to loss/error events), disk
-writes happen inside the time-critical data callback, and the stimulator's
-`Start()` call is missing (§9, §10). Treat its output as usable but not
-provably complete.
-
-**Command line**, run from inside `BioCam_DupleX_API/` (not the repository
-root):
-
-```
-python recorder.py --duration 10 --name test1
-```
-
-The cwd requirement here is **not** about the DLLs — `connector.py` finds
-`API/` from its own file location (`os.path.dirname(__file__)`, connector.py
-line 26), not from the current working directory, so DLL loading works
-regardless of where you run from. The cwd matters for two other reasons:
-`--output-dir` defaults to `recordings`, a path resolved relative to the
-current working directory (see the table below); and `recorder.py` imports
-`connector` by bare module name (`from connector import ...`), which only
-resolves when `BioCam_DupleX_API/` is on the Python path — guaranteed when
-you run `python recorder.py` from inside that directory. If you see a DLL
-error, the cause is a missing/misplaced file in `API/` (§4), not the working
-directory.
-
-Options (from `recorder.py`'s `argparse` definitions):
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--duration` | `10.0` | Recording length in seconds |
-| `--name` | current timestamp (`YYYYMMDD_HHMMSS`) | Base filename for the two output files |
-| `--output-dir` | `recordings` | Output folder — **relative to the current working directory when you invoke the script**, not to the script's own location. Running from `BioCam_DupleX_API/` puts files in `BioCam_DupleX_API/recordings/`; running from the repo root puts them in `./recordings/` instead. |
-| `--packet-ms` | driver default | Acquisition packet interval in ms (§9) |
-
-Each run writes two files: `<name>.raw` (the signal, §8) and
-`<name>_meta.json` (the metadata sidecar, §8). Only the `_meta.json` files are
-committed to git — `.raw` files are gitignored everywhere except
-`tests/fixtures/` (§12), because a single session is gigabytes (§2).
-
-**Reading a recording back**, programmatically. As with the CLI above, run
-this from inside `BioCam_DupleX_API/` (or otherwise put that directory on
-`sys.path`) — `recorder.py` imports `connector` by bare module name, which
-only resolves when `BioCam_DupleX_API/` is the working directory:
-
-```python
-from recorder import load_recording
-
-data, meta = load_recording("recordings/test1.raw", "recordings/test1_meta.json")
-# data: float64 array, shape (n_frames, total_channels), in microvolts
-# meta: dict — see §8 for every field
-```
-
-Pass `as_analog=False` to `load_recording` to get raw ADC counts (`uint16`)
-instead of microvolts.
-
-**Return to the repository root when you're done recording.** Both commands
-above must be run from inside `BioCam_DupleX_API/`, but preflight (§6) and
-the full gate checklist (§13, item 4) must be run from the repository root —
-staying inside `BioCam_DupleX_API/` after a recording session will make the
-next preflight run fail with `ModuleNotFoundError: No module named 'biocam'`.
-
----
-
-## 8. Data formats
-
-### `.raw` layout
-
-Frame-major, raw ADC counts, no header: all channels for frame 0, then all
-channels for frame 1, and so on.
-
-- dtype: `uint16`, little-endian
-- 4096 channels × 2 bytes/channel = **8192 bytes per frame**
-- file size is always an exact multiple of 8192 bytes for a full-width
-  recording (`tests/test_fixture_integrity.py` checks this for the committed
-  fixtures)
-
-### `_meta.json` fields
-
-Written by `recorder.py` alongside every `.raw` file:
-
-| Field | Meaning |
+| Control | Meaning |
 |---|---|
-| `frame_rate_hz` | Sample rate (18,557.720703125 Hz for this instrument) |
-| `n_wells` | Number of wells (1 for the DupleX) |
-| `n_channels_per_well` | Channels per well |
-| `total_channels` | `n_wells × n_channels_per_well` — the row width of the reshaped array |
-| `ch_sample_byte_size` | Bytes per sample (2 → `uint16`) |
-| `bit_depth` | ADC resolution in bits (12 → digital range 0–4095) |
-| `adc_counts_to_value` | Multiplicative factor, counts → µV |
-| `offset` | Additive offset, counts → µV |
-| `min_digital_value`, `max_digital_value` | Valid ADC count range (0–4095 for 12-bit) |
-| `n_frames_total` | Frame count — `.raw` size ÷ 8192 should equal this |
-| `duration_sec` | Recording length in seconds |
-| `packet_log` | List of `{timestamp, frame_offset, n_frames}` — one entry per packet received, wall-clock based (see the known defect about hardware timestamps in §9/design-spec Appendix A) |
+| Amplitude (µA), Phase duration (µs) | The first phase of the pulse |
+| Inter-phase gap (µs) | The pause between phases |
+| Second phase mirrors the first | When ticked, the second phase is the exact opposite of the first, so the pulse is charge-balanced |
+| Second amplitude / Second duration | Editable when the box is unticked, so the second phase can be shaped (e.g. short and strong, then long and weak). The two phases must still cancel: an unbalanced pulse is refused. |
+| Positive / Negative electrode(s) | Same as the red/blue cells: `row,col`, separated by `;`, 1-based |
+| Clock resolution (µs) | Simulation only: the stimulator's time step. On the instrument it is read from the device. |
+| Stimulate now | Send one pulse now; recording must be running |
+| Train: Pulses, Rate (Hz), Starts in (ms), Send train | A series of identical pulses. The start is converted to acquisition time before sending (§5.2). Recording must be running. |
 
-The committed test fixtures (`tests/fixtures/`, §12) additionally carry
-`source_recording` and `source_channels`, recording which real session and
-channel subset they were cut from; they have no `packet_log` because they are
-static slices, not live recordings.
+What the window refuses, and why:
 
-### Counts → microvolts
+| Refused | Because |
+|---|---|
+| Stimulating with nothing recording | A stimulus with no recording leaves no evidence of what it did |
+| A pulse whose two phases do not cancel | Net charge drives electrolysis at the electrode |
+| Amplitude or duration outside the stimulator's limits, or off its grid | The driver would silently clamp or round it (§5.1) |
+| An electrode outside the array, or `0,0` | Coordinates are 1-based, and the driver does not bounds-check |
+| A positive and a negative electrode in the same column | The vendor's API document forbids it |
+| A train with no acquisition-clock reading yet | It would be sent to an unknown point in time |
 
-```
-microvolts = offset + counts * adc_counts_to_value
-```
+### 4.4 Spikes and closed loop column
 
-For the reference recording these two fields are `offset = -4125.0` and
-`adc_counts_to_value = 2.0146520146520146` — but **read them from each
-recording's own `_meta.json` rather than hardcoding these**; that is exactly
-why they are written per-session instead of assumed constant.
+| Control | Meaning |
+|---|---|
+| Detect spikes on the selected electrodes | Live detection. Keep the set small: detection on all 4096 electrodes needs about three CPU cores. |
+| Draw traces for the selected electrodes | The trace strip (§4.2) |
+| Threshold (sigmas) | A spike is a dip below −threshold × the electrode's noise level (§8) |
+| Sorting technique, Units per electrode, Sort spikes so far | Sort the spike waveforms collected so far. Disabled while recording, because it would slow the thread that writes data. |
+| Close the loop (stimulate on a spike) | Stimulate automatically using the Stimulus column's pulse. Requires detection. |
+| Policy | *echo*: one stimulus per spike. *rate*: stimulate when firing drops below a target. |
+| Min interval (ms), Max rate (Hz) | The safety envelope: hard limits applied after the policy decides |
 
-### Worked example
-
-Verified against the committed fixture `tests/fixtures/sample_32ch_2s`
-(37,115 frames × 32 channels, 2,375,360 bytes):
-
-```python
-import json
-import numpy as np
-
-meta = json.load(open("tests/fixtures/sample_32ch_2s_meta.json"))
-raw = np.fromfile("tests/fixtures/sample_32ch_2s.raw", dtype=np.uint16)
-data = raw.reshape(-1, meta["total_channels"])  # (37115, 32) ADC counts
-
-microvolts = meta["offset"] + data.astype(np.float64) * meta["adc_counts_to_value"]
-```
-
-Actual output on this fixture: counts range 686–3050 (within the declared
-0–4095 digital range); converted, µV range is about −2743 to +2020, mean
-≈ 1.27 µV — a plausible noise-and-signal range for extracellular recording,
-which is the sanity check to apply to any new recording.
+The grey text at the bottom summarises what the **next** recording will do
+with these settings.
 
 ---
 
-## 9. How the instrument works
+## 5. Stimulation: what you must understand first
 
-Condensed from `3Brain_BioCamDriverAPI_v2.6_Introduction.pdf`. Read the PDF
-for anything not covered here.
+### 5.1 The driver adjusts pulses instead of rejecting them
 
-- Data arrives as **packets**, each carrying a hardware timestamp
-  (`DataPacketReceivedEventArgs.Header.Timestamp`). `recorder.py` does not
-  currently read this timestamp — it logs wall-clock time instead, which is a
-  known defect (§7, design spec Appendix A item 1–2).
-- The **acquisition time period** (how often a packet, and a callback, fires)
-  is configurable from **1 to 250 ms** (`recorder.py --packet-ms`).
-- **Closed-loop latency** (detect → decide → stimulate) is published at
-  **≈1.15 ms mean, ≈1.52 ms worst case**, measured at a 1 ms acquisition
-  period. Closed-loop stimulation is now implemented (Phase 6, §14) and this
-  figure is the budget it has to fit inside — most of which is consumed by
-  whatever work runs on the packet path (§12 callback rule). What it costs
-  here, and what still has to be measured in the lab, is in
-  [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md).
-- **Stimulation** is delivered through positive/negative electrode endpoint
-  pairs. Constraints that are easy to violate and fail silently or ignore
-  extra data rather than erroring loudly:
-  - Positive and negative endpoints of a pulse may **never share an electrode
-    column**.
-  - **≤1000 endpoints** per spatial configuration.
-  - **≤1000 queued** future stimuli.
-  - Per `Send` call: **≤64 pulse values and ≤288 endpoint values** — the
-    documented behavior on overflow is that the *next* call's values are
-    silently ignored, not an error.
-  - **Chip reconfiguration** between different spatial patterns costs
-    **26 µs + 8.4 µs × (rows − 1)**, which bounds how fast stimulation
-    patterns can be cycled.
+Measured against the real assembly:
 
-The stimulation engine is in `biocam/stim/` and `biocam/interop/stimulator.py`
-— see §15, and Phase 2 in
-`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md` for the design
-(three `Send` overloads, an on-device protocol engine, and why scheduling
-belongs on the instrument rather than in a Python loop).
-
----
-
-## 10. Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `TakeBioCamControl` returns `None` | BrainWave, or another 3Brain program (including a previous crashed Python process), still holds the device — only one process may control the BioCAM at a time | Close BrainWave and any other 3Brain software, then retry (§2) |
-| No device found / connection times out | USB not connected, or BioCAM not powered | Check the USB cable and power; confirm the BioCAM's status LED is on |
-| `MeaPlate.IsConnected` is `False` after `TakeBioCamControl` succeeds | The MEA plate is not seated on the DupleX head | Reseat the MEA plate on the DupleX head and retry |
-| **No stimulation output from `connector.py`** | **Known defect, but not the one this table used to claim.** The stimulator lifecycle is `Initialize → Start → Stop → Close`; `BioCam_DupleX_API/connector.py` calls only `Initialize` and `Close`. What that is, precisely, is an **incomplete lifecycle** — not an observed silent failure. The XML documents every `Send` overload as throwing `InvalidOperationException` "when the stimulator has not started", and `connector.py` never calls `Send` at all, so nothing about it is silent. What the DupleX actually does is issue #22 | Use `biocam stim` (§15), which runs all four calls and checks every return. Do not assume stimulation is working just because nothing errored |
-| Data-loss warnings, or gaps that look like signal but aren't | Acquisition period too short for the work being done per packet, or slow work inside the data callback (`recorder.py` writes to disk and prints inside the callback — a known defect, §7, and the reason it was replaced) | Increase `--packet-ms`, and use `biocam record` rather than `recorder.py`: it hands the payload to a bounded queue and returns (§12 callback rule). If the closed loop is armed, see [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md) — 32 watched channels at `--packet-ms 1` does not fit |
-| `ModuleNotFoundError: No module named 'clr'` | `pythonnet` is not installed — you are on a development machine, not the lab machine | Use `requirements-dev.txt`, not `requirements.txt` (§5). Installing `pythonnet` is neither necessary nor sufficient without Windows + .NET Framework anyway (§3) |
-
----
-
-## 11. Project layout
-
-One line per top-level path:
-
-- `README.md` — this document
-- `CLAUDE.md` — project briefing for Claude Code sessions; not duplicated here, see there for AI-agent-specific rules
-- `.claude/` — agent definitions (`biocam-api-verifier`, `realtime-safety-reviewer`, `dsp-implementer`) and tool permissions (`settings.json`)
-- `biocam/` — the Python package under active development, split by testability (§12):
-  - `biocam/interop/` — **Layer 1**: .NET interop via `pythonnet`. The only package allowed to import `clr`. Mostly needs the instrument; `reflect.py` and `verify_stim_model.py` are the exceptions, needing the DLLs but no BioCAM (§15).
-  - `biocam/data/` — **Layer 2**: pure byte/number logic (payload decoding, frame reassembly, unit conversion, integrity). Fully testable with synthetic buffers.
-  - `biocam/stim/` — **Layer 2**: stimulation modelling — pulses, electrode patterns, trains, arbitrary sequences, and the validation that keeps the driver from silently altering any of them (§15). Pure arithmetic; no `clr`, no device.
-  - `biocam/analysis/` — **Layer 3**: signal processing (§18) — `filters.py` (streaming high-pass), `spikes.py` (noise estimate, threshold crossings, waveform collection), `sorting.py` (three techniques and the null-corrected separation score). Fully testable against fixtures.
-  - `biocam/ui/` — **Layer 2**: the operator window (§17), Tkinter. `app.py` is the window, `arrayview.py` the electrode picture, `traceview.py` the trace strip, `controller.py` the thread boundary, and `factories.py` the one place the live and simulated paths differ.
-  - `biocam/loop.py` — **Layer 2**: closed-loop stimulation (§17.5) — the policy that decides, and the safety envelope that decides whether the policy may
-  - `biocam/control.py` — **Layer 2**: the bounded hand-off that lets a UI request a stimulus without touching the acquisition thread (§16.2)
-  - `biocam/manifest.py` — **Layer 2**: the session record written beside every recording, holding what the experiment *was* (§17.7)
-  - `biocam/cli.py` — the `record`, `convert`, `stim` and `analyse` subcommands
-  - `biocam/session.py` — the recording loop that joins a packet source to a writer
-  - `biocam/preflight.py` — the environment check run by `python -m biocam.preflight` (§6)
-- `BioCam_DupleX_API/` — legacy, pre-layer-split code and vendor material:
-  - `connector.py`, `recorder.py`, `Hello_BioCam.py` — the working-but-defective scripts described in §7 and §10
-  - `API/` — the seven DLLs (§4, gitignored) plus `3Brain.BioCamDriver.xml`, the reference documentation for every .NET member
-  - `SampleApp_BioCamCL/` — 3Brain's own C# reference application; the second ground-truth source alongside the XML
-  - `recordings/` — output of `recorder.py`; `.raw` files are gitignored, `_meta.json` sidecars are committed
-- `tests/` — the pytest suite (§12) and `tests/fixtures/` — the two committed real-signal fixtures
-- `tools/make_fixtures.py` — the one-off script that produced the committed fixtures from a full (uncommitted) recording
-- `tools/make_demo_recording.py` — builds the synthetic recording the window is learned on (§17); plants spikes and then runs the real detector over its own output to check they are findable
-- `docs/lab/` — **read these before a session.** [`storage-setup.md`](docs/lab/storage-setup.md) (where recordings may be written, and the write test a drive must pass), [`closed-loop-budget.md`](docs/lab/closed-loop-budget.md) (what detection and the loop cost per packet, and what must be measured on the instrument), [`stimulus-timing.md`](docs/lab/stimulus-timing.md) (how a stimulus is placed in time, and how precisely)
-- `docs/api/` — what the assemblies themselves say, read by reflection rather than transcribed from the XML: [`stimulation-reference.md`](docs/api/stimulation-reference.md) and [`device-reference.md`](docs/api/device-reference.md). Regenerate rather than trusting either
-- `docs/superpowers/` — specs (`specs/`) and plans (`plans/`) for this project's own development, including the setup spec and the phase roadmap referenced throughout this document
-- `requirements.txt` / `requirements-dev.txt` — pinned dependencies for the lab machine and a development machine respectively (§5)
-- `pytest.ini` — test configuration
-- `3Brain_BioCamDriverAPI_v2.6_Introduction.pdf` — vendor manual, source for §9
-
----
-
-## 12. Development
-
-### The three-layer rule
-
-New code belongs in exactly one of the three layers under `biocam/`
-(§11) by whether a laptop with no instrument can prove it correct:
-
-- **Layer 1** (`biocam/interop/`) — anything that calls into the 3Brain
-  assemblies or depends on a device responding. Not testable here; written and
-  reviewed by hand against `API/3Brain.BioCamDriver.xml` and
-  `SampleApp_BioCamCL/MainForm.cs`.
-- **Layer 2** (`biocam/data/`) — pure functions from bytes/numbers to
-  bytes/numbers: decoding, frame reassembly, unit conversion, gap detection.
-  Fully testable with synthetic buffers. Never write Layer 2 code without
-  tests — it's testable, so untested Layer 2 code is a choice, not a
-  limitation.
-- **Layer 3** (`biocam/analysis/`) — signal processing, tested against the
-  replay fixtures below.
-
-### Running the suite
-
-```
-python -m pytest
-```
-
-Runs the entire suite with **no BioCAM and no 3Brain DLLs installed** — this
-is a structural guarantee, enforced by `tests/test_no_hardware_imports.py`,
-not a convention someone has to remember. Verified on this machine, from a
-freshly created virtual environment with only `requirements-dev.txt`
-installed: every test passed, with `test_no_hardware_imports.py` confirming
-that nothing under `tests/` or `biocam/` (outside `biocam/interop/`) imports
-`clr`, `pythonnet`, or `clr_loader`. Run the command yourself for the current
-pass/fail count and test names — pasting them here would go stale the moment
-Phase 1 adds a test.
-
-### Fixtures
-
-`tests/fixtures/`, used by **Layer 3** tests as a **replay source** — real
-recorded signal rather than synthetic data, because real recordings contain
-noise, drift, and artifacts nobody thinks to simulate. Layer 2 tests use
-synthetic buffers instead, not these fixtures: a decoder test needs an exact
-expected output, and only a constructed input lets you assert one (§12 "The
-three-layer rule"; `.claude/agents/dsp-implementer.md`).
-
-- `sample_32ch_2s` — 37,115 frames × 32 channels (2,375,360 bytes). The 32
-  most active channels (by variance) from a real session, 2 seconds.
-- `sample_full_100frames` — 100 frames × 4096 channels (819,200 bytes). Full
-  channel width, for testing anything that depends on `total_channels == 4096`.
-
-Both are cut from the same source recording (`20260624_140615`), byte-for-byte
-identical to it over the slices taken. That source recording's own
-completeness was never verifiable: no subscription to `DataLoss` existed when
-it was captured, and its packet log recorded wall-clock time rather than
-hardware timestamps, so a dropped packet during capture would be invisible in
-hindsight (design spec Appendix A, item 2). The fixtures are still useful —
-they carry real noise and artifacts synthetic data wouldn't — just don't treat
-them as certified gap-free.
-
-Load either with `load_fixture(name)` from `tests/test_fixture_integrity.py`,
-returning `(data, meta)` — `data` is raw ADC counts, shape
-`(n_frames, total_channels)`.
-
-### The callback rule
-
-`DataReceived` runs on the acquisition thread and is time-critical: no disk
-I/O, no printing or logging, no unbounded allocation, no locks. Hand the
-payload off to a bounded queue and return immediately. A blocked callback
-drops samples silently — the recording looks like real signal, not an error
-(§9, §10).
-
-### What a green suite does not prove
-
-`python -m pytest` passing is evidence for **Layers 2 and 3 only.** It proves
-nothing about Layer 1 — that code is never executed by the suite, by
-construction (§11). Never report a green suite as evidence that
-instrument-facing code works. Say instead exactly what has and hasn't been
-verified — that is what §13 exists to force.
-
----
-
-## 13. Before handing code to the lab
-
-The gate that actually matters — reproduced here in full so it survives
-independently of `CLAUDE.md` or any tooling. A commit is cheap and reversible;
-a lab session consumes a colleague's day on a shared instrument and cannot be
-repeated on demand. Work through all five before code goes to the lab machine:
-
-1. **`biocam-api-verifier` clean across all interop code**, not just what
-   changed since the last session.
-2. **`realtime-safety-reviewer` clean across the whole data path** (everything
-   reachable from `DataReceived`).
-3. **Full test suite passing** (`python -m pytest`) — noting that this covers
-   Layers 2 and 3 only and proves nothing about Layer 1 (§12).
-4. **Preflight runs and reports correctly** (`python -m biocam.preflight`,
-   §6) — this confirms the environment, not the device.
-5. **Every known-untested assumption written down explicitly**, so the
-   colleague running the session knows what is being tried for the first time
-   and exactly what to report back. Since Layer 1 has no automated coverage
-   by construction, **every Layer 1 change since the last session belongs on
-   this list** — that is what turns "untested" from a vague worry into a
-   finite, checkable set.
-
----
-
-## 14. Roadmap and status
-
-The full six-phase build order, findings, and rationale live in
-`docs/superpowers/specs/2026-08-12-api-roadmap-decomposition.md` — read it
-there rather than trusting a restatement here, which will go stale. Summary
-only:
-
-| Phase | Contents | Status |
-|---|---|---|
-| 0 | Setup: `CLAUDE.md`, verifier agents, test scaffolding, this README | **Done** |
-| 1 | Acquisition: recording, saving, data integrity, on the three-layer split | **Done and merged.** Gate 1 clean. Never run on the instrument — issues #11–#18 |
-| 2 | Stimulation engine + manual and scheduled triggering | **Merged** (PR #25), Gate 1 clean. No stimulus ever delivered — issues #21–#24 (§15) |
-| 3 | Session control: recording and stimulation together, changing live | **Merged** (PR #28). Clock, stimulus log and control queue (§16). Driven by the window in §17 — issues #26, #27 |
-| 4 | UI | **Merged** (PR #29). `python -m biocam.ui` — runs with or without the instrument (§17). Live path untested |
-| 5 | Spike detection | **Merged** (PR #35). Streaming high-pass, Quiroga noise estimate, threshold crossings across packet boundaries |
-| 6 | Closed-loop stimulation (depends on Phase 5) | **Merged** (PR #36). Policy, safety envelope, `warm_up` — issues #26, #27, #38, #39 |
-| 7 | Spike sorting, and making the above reachable | **Merged** (PR #37). Three techniques, a null-corrected separation score, `biocam analyse`, the analysis panel |
-| 8 | Live traces and scheduled trains | **Merged** (PR #41). Peak-preserving trace strip (§17.6), trains sent from the window (§17.3) |
-| 9 | A recording that describes its own experiment | **Merged** (PR #42). `name_session.json` (§17.7), and an independently-shaped second phase for the pulse |
-| 10 | Stimulus timing, and the API review it came from | **Merged** (PR #43). Every stimulus now carries an acquisition time (§17.7, `docs/lab/stimulus-timing.md`); the API verification's findings fixed; issue #17 closed by reflection |
-
-Nothing in phases 4–7 has ever run on the instrument either. The closed loop's
-per-packet budget, and what still has to be measured in the lab, are in
-[`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md).
-
-If this table and the roadmap document ever disagree, the roadmap document is
-correct — this table is a pointer, not a second source of truth.
-
----
-
-## 15. Stimulation
-
-**Nothing in this section has ever run on the instrument.** The API was
-recovered by reading the shipped assemblies; the code was checked against them;
-no stimulus has been delivered. Issues #21–#24 carry the procedures, and #21
-comes first because everything here is parameterised on numbers only the
-instrument can report.
-
-### 15.1 The thing to understand before you use it
-
-The driver's `RectangularStimPulse` **adjusts pulses it does not like instead
-of rejecting them.** Measured against the real assembly:
-
-| You ask for | You get | Anything raised? |
+| You ask for | You get | Error raised? |
 |---|---|---|
 | amplitude 2000 µA (range ±1000) | 1000 µA | no |
 | amplitude 7.0 µA on a 5 µA grid | 5.0 µA | no |
-| widths 8000/0/8000 ticks (cap 10000) | **8000/0/2000** | no |
+| phase widths 8000 / 0 / 8000 ticks (cap 10000) | **8000 / 0 / 2000** | no |
 
-The last row is why this layer exists. A **charge-balanced** request — equal
-and opposite phases, net charge zero — comes back as one that injects a net
-600 nC, because the overflow is taken off the *later* phases. And
-`IsBiphasic` still reports `True`, so there is no signal in the returned object
-that anything happened.
+The last row matters most. A charge-balanced request comes back injecting net
+charge, because the overflow is taken off the *later* phase, and the driver
+still reports the pulse as biphasic. Net DC through a microelectrode drives
+electrolysis and corrodes it, and the run does not fail.
 
-Net DC through a microelectrode drives electrolysis and corrodes it. The run
-does not fail; it looks fine.
+So this software **refuses rather than adjusts**. Every pulse is checked
+against the device's reported limits before it is built, and read back
+afterwards to confirm the driver kept it unchanged. The recovered API and the
+measurements behind this table are in
+[`docs/api/stimulation-reference.md`](docs/api/stimulation-reference.md).
 
-So `biocam/stim/` **refuses rather than adjusts**. A pulse either passes
-unchanged or is rejected with every reason listed at once, because a colleague
-on the instrument gets one attempt per turnaround. After the driver builds the
-pulse, `verify_built_pulse()` reads back all five fields and compares them to
-what was asked, which also catches limits this repository does not know about.
+### 5.2 Scheduled stimuli are timed from the start of the acquisition
 
-### 15.2 Check a protocol without an instrument
+The driver takes stimulus timestamps in microseconds **from the beginning of
+the acquisition**, not from when you send them. A train planned as "start in
+0.5 s" and sent ten minutes into a recording would have every timestamp ten
+minutes in the past. What the instrument does then is untested (§11).
 
-`--dry-run` needs no BioCAM and no DLLs. Use it before a lab session, not
-during one:
+The window handles this for you: *Send train* shifts the plan by the current
+acquisition time, and refuses if there is no clock reading yet. The command
+line does not (§6.2). How precisely a stimulus is placed in time is covered in
+[`docs/lab/stimulus-timing.md`](docs/lab/stimulus-timing.md).
+
+### 5.3 Rules to remember
+
+- Coordinates are **1-based**: the first electrode is `1,1`.
+- The positive and negative electrodes of a pulse must be in **different
+  columns**.
+- The stimulator can hold at most **1000 queued stimuli**. Each `Send` call is
+  limited to **64 pulse values and 288 endpoint values**; on overflow the vendor
+  documents that the *next* call's values are ignored silently.
+- Switching between spatial patterns costs **26 µs + 8.4 µs × (rows − 1)**.
+
+---
+
+## 6. Command line
+
+There is no installed `biocam` command. Run everything as a module **from the
+repository root**:
+
+```
+python -m biocam.cli record|stim|convert|analyse ...
+```
+
+`--help` after any subcommand lists all its options.
+
+### 6.1 Record
+
+```
+python -m biocam.cli record --duration 60 --name slice1
+python -m biocam.cli record                  # until Ctrl+C
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--duration` | run until Ctrl+C | Seconds to record |
+| `--name` | timestamp | Base name for the output files |
+| `--output-dir` | `recordings` | Relative to where you run the command |
+| `--packet-ms` | `2` | Acquisition period, integer 1–250 ms |
+
+It writes `name.raw` and `name_meta.json` (§7) and prints a summary ending in
+the integrity verdict and an `ACQUISITION CLOCK:` line. It does not stimulate
+and does not write a session record; use the window for that.
+
+### 6.2 Stimulate
+
+Check a protocol without an instrument or DLLs first:
 
 ```
 python -m biocam.cli stim --dry-run --time-resolution-us 10 \
     --amplitude 100 --phase-us 200 --gap-us 100 \
-    --positive 10,10 --negative 20,30 \
-    --count 5 --rate-hz 10
+    --positive 10,10 --negative 20,30 --count 5 --rate-hz 10
 ```
 
-```
-cli-train: 5 x [cli-pulse: +100 uA for 200 us, gap 100 us, -100 uA for 200 us
-                (500 us total, 50 ticks; balanced)]
-           every 100000 us (10 Hz), starting at 0 us, lasting 400500 us
-positive: (10,10)
-negative: (20,30)
-timestamps (us from start of acquisition): 0, 100000, 200000, 300000, 400000
-train net charge: +0 pC
+`--time-resolution-us` is required with `--dry-run` and has no default. It is
+the stimulator's clock period, and a wrong value makes every duration wrong by
+that ratio.
 
-NOT SENT (--dry-run). The constraints above were supplied on the command line,
-not read from an instrument; if they differ from the device's, this plan is wrong.
-```
-
-`--time-resolution-us` is **required** for `--dry-run` and deliberately has no
-default. It is the stimulator's clock period, and every duration is an integer
-count of it — guess it wrong and every pulse is wrong by that ratio, silently.
-Get the real value from issue #21.
-
-Amplitudes are µA and durations are µs throughout. The second phase mirrors the
-first unless you say otherwise, because that is the charge-balanced pulse.
-
-### 15.3 Sending for real
-
-Drop `--dry-run`. The constraints are then read from the device and the
-command-line limits are ignored:
+To send for real, drop `--dry-run`. The limits are then read from the device:
 
 ```
 python -m biocam.cli stim --amplitude 100 --phase-us 200 --gap-us 100 \
-    --positive 10,10 --negative 20,30
+    --positive 10,10 --negative 20,30 --log recordings/stim_log.json
 ```
 
-**Electrode coordinates are 1-based**, matching `ChCoord`: the first electrode
-is `1,1`, not `0,0`. `--grid` (default `64x64`) bounds-checks them — and it is
-the *only* thing that does, because `ChCoord.IsValid` reports `(65,65)` as
-valid on a 64×64 plate.
-
-### 15.4 What will refuse to run, and why
-
-| Refusal | Reason |
+| Option | Meaning |
 |---|---|
-| net charge is not zero | electrolysis; pass `--allow-unbalanced` if deliberate |
-| total duration over `MaxPulseDuration` | the driver would shorten the later phases silently |
-| amplitude out of range, or off the resolution grid | the driver would clamp or round it silently |
-| a duration that is not a whole number of ticks | the driver would snap it silently |
-| electrode outside the grid, or 0-indexed | `ChCoord` would not catch it |
-| positive and negative sharing a column | the API PDF forbids it; `--no-column-rule` overrides |
-| train period shorter than the pulse | the stimuli would overlap — never waived, it is arithmetic |
-| train period below 1000 µs | the driver's own minimum; `--allow-short-period` overrides |
+| `--amplitude`, `--phase-us`, `--gap-us` | First phase (µA, µs) and the gap |
+| `--amplitude2`, `--phase2-us` | Second phase; defaults mirror the first |
+| `--positive`, `--negative` | `row,col` pairs separated by `;`, 1-based |
+| `--count`, `--rate-hz` / `--period-us`, `--delay-us` | A train (`--dry-run` only; see below). `--count` must be at least 1. `--delay-us` counts from the start of the acquisition, not from now. |
+| `--grid` | Array size for bounds checking (default `64x64`) |
+| `--log PATH` | Write a JSON record of every attempt. Keep it beside the recording. |
+| `--allow-unbalanced`, `--allow-short-period`, `--no-column-rule` | Waive a safety check deliberately |
 
-### 15.5 Scheduled trains fire on acquisition time, not wall-clock
+Caveats for the command line:
 
-The XML is explicit that timestamps are *"in microsecond relative to the
-beginning of the acquisition"* — **not** relative to when you send them.
+- **`stim` starts no acquisition.** A single pulse is sent, but the latency it
+  reports is then meaningless, and it says so.
+- **A train (`--count` above 1) is refused without `--dry-run`.** Its
+  timestamps count from the start of an acquisition, and `stim` never runs
+  one. **Send trains from the window**, which records at the same time and
+  converts the timing; use `--dry-run` to check a train's plan here.
+- `Start()` and `Send()` have never been tried with no acquisition running. If
+  the very first `stim` throws, that is the likely reason. Report it (§11).
 
-A train planned as "start in half a second" and sent ten minutes into a
-recording has every timestamp ten minutes in the past. What the instrument does
-then is untested (issue #24), and the plausible outcomes include firing the
-whole train at once. `TrainPlan.shifted_by(current_acquisition_time_us)` does
-the conversion.
-
-**`biocam stim --count N` still cannot run on its own.** Nothing on the `stim`
-path starts an acquisition, so a scheduled train has no time origin there, and
-the command refuses with a clear message rather than sending one into an
-undefined one.
-
-**Send trains from the window instead** (§17). It records and stimulates in one
-session, so the acquisition clock has a reading, and the "Send train" button
-shifts the plan by it before queueing. If the clock has no reading yet the
-train is refused rather than sent to an unknown point in time.
-Single pulses work. Trains wait on issue #24 and on Phase 3, where recording
-and stimulation are driven together.
-
-One more thing to expect on the first session: **`Start()` and `Send()` have
-never been tried with no acquisition running**, and `biocam stim` without a
-recording is exactly that case. The XML does not list streaming among `Send`'s
-preconditions and the vendor's sample never tests it, so this software warns
-rather than refusing — but if the very first `biocam stim` throws, that is the
-likely reason, and it is worth reporting on issue #22 rather than working
-around.
-
-### 15.6 Reading the API yourself
-
-`_3Brain.Common` ships no XML here, but the assembly can be read directly.
-This needs the DLLs and no instrument:
+### 6.3 Convert to HDF5
 
 ```
-python -m biocam.interop.reflect RectangularStimPulse StimProperties
-python -m biocam.interop.reflect --all-stim
-python -m biocam.interop.verify_stim_model
+python -m biocam.cli convert recordings/slice1.raw recordings/slice1_meta.json recordings/slice1.h5
 ```
 
-The last one checks `biocam/stim/`'s rules against the real driver in **both**
-directions: every pulse it accepts must come back unchanged, and every pulse it
-refuses must be one the driver would have altered. A rule that blocks a pulse
-the driver builds correctly is a bug, not caution. Run it after any change to
-the validation.
+The HDF5 file holds a `data` dataset of shape (frames × channels) in raw
+counts, a `gaps` dataset, and the sidecar's fields and integrity counters as
+attributes. It loads the whole recording into memory, so it is only practical
+for short recordings; long recordings need more RAM than a PC has.
 
-The full recovered surface, the measurements behind every claim above, and the
-list of what still needs the instrument are in
-`docs/api/stimulation-reference.md`.
+### 6.4 Analyse a finished recording
+
+```
+python -m biocam.cli analyse recordings/slice1.raw recordings/slice1_meta.json \
+    --channels 300,301 --sort pca --units 2 --out spikes.json
+```
+
+`--channels` takes 0-based channel indices (`'0-31'` or `'4,9,17'`); electrode
+(row, col) is channel (row − 1) × columns + (col − 1). The other options are
+`--threshold-sigmas` (default 5), `--refractory-ms` (1), `--cutoff-hz` (300),
+`--sort amplitude|pca|template`, `--units`, and `--suggest-units`.
+Analysing all 4096 channels is slow.
 
 ---
 
-## 16. Recording and stimulating together
+## 7. What a session leaves on disk
 
-**Built, never run on the instrument.** Two things here can only be settled in
-the lab, and both have issues: how long a stimulus takes to dispatch (#26) and
-whether the arrangement below is required or merely cautious (#27).
-
-### 16.1 Where "now" comes from
-
-Scheduled stimulation takes timestamps measured **from the beginning of the
-acquisition**, so sending one requires knowing how far into the acquisition
-you are. Phase 2 could not answer that, which is why `biocam stim --count N`
-shipped unable to run.
-
-The answer was already in every packet: `DataPacketHeader.Timestamp`.
-`biocam.data.clock.AcquisitionClock` turns it into a clock, fed by
-`record_session` as packets are written.
-
-Three things it is careful about, each a way of being *silently* wrong:
-
-- **A timestamp of `0` means "not available", not "time zero".** The
-  difference is the whole elapsed duration of the recording.
-- **Frames lost to gaps still count as elapsed time.** The instrument kept
-  acquiring; counting only what arrived would schedule early by exactly the
-  duration of the loss.
-- **The device clock and the frame count are compared** — but only when the
-  conversion factor came from the instrument. When the clock calibrates its
-  own factor, the comparison reduces to an identity and cannot detect
-  anything, and it says so rather than reporting a pass.
-
-Every recording now ends with an `ACQUISITION CLOCK:` line saying where it
-got to, which estimate it used, and anything it distrusts.
-
-### 16.2 Stimulation runs on the acquisition thread
-
-`biocam.control.StimulationQueue` takes requests from any thread and hands
-them to the recording loop, which dispatches them between packets.
-
-That is the arrangement 3Brain's own sample uses, and it is deliberate: **the
-documentation nowhere states whether `Send` may be called from another
-thread**, so this avoids depending on the answer. Issue #27 asks for it.
-
-The cost is that a stimulus spends part of the packet queue's drain budget. At
-`--packet-ms 1` the consumer has 1000 µs per packet for *everything*. So:
-
-- requesting never blocks — a full queue drops and counts rather than growing;
-- at most one stimulus is dispatched per packet, so a backlog cannot become a
-  burst;
-- every dispatch is timed, and `summary()` reports the slowest.
-
-**Watch `queue_overflows` in the sidecar.** If a recording with stimulation
-shows overflows and the same recording without shows none, stimulating is
-costing you packets. That is what issue #26 measures.
-
-### 16.3 The stimulus log
-
-`biocam.stim.StimulusLog`, written with `biocam stim --log <path>`.
-
-Keep it beside the recording. Without it there is no way to say afterwards
-which stimulus corresponds to which moment in the signal, and **that
-correspondence cannot be reconstructed** — a 4096-channel recording with no
-stimulus times is not an experiment.
-
-Two details worth knowing when you read one:
-
-- **Refusals are recorded too.** A stimulus that did not fire looks, in the
-  signal, exactly like one that evoked nothing. `outcome` is `sent`,
-  `refused` (this software declined) or `rejected` (the driver did).
-- **`time_is_measured` tells you which clock you are reading.**
-  `best_time_us` prefers the latency the driver reported, which is a
-  measurement; it falls back to the acquisition clock, which is only a lower
-  bound on when the stimulus went out.
-
-### 16.4 What is still missing
-
-The **CLI** still has no single command that records and stimulates in one
-run: `biocam record` and `biocam stim` remain separate, and scheduled trains
-are not usable from the CLI at all (§15.5). The **window** does both — it
-records and stimulates in one session, and can send scheduled trains (§17).
-
----
-
-## 17. The operator window
-
-```
-python -m biocam.ui --live                      # on the lab machine
-```
-
-**Try it first without the instrument.** The same window, the same recorder,
-the same clock and the same stimulation path run against a recorded file:
-
-```
-python tools/make_demo_recording.py demo
-python -m biocam.ui --replay demo.raw --meta demo_meta.json
-```
-
-That is not a toy mode. Only the packets and the stimulator are stand-ins;
-everything else is the code that will run on the instrument. Learn the
-controls this way before spending bench time on them — and if something about
-the window confuses you, say so from here rather than at the BioCAM.
-
-### 17.1 What is on screen
-
-One window, four columns above a log:
-
-```
-┌──────────────┬─────────────────────┬──────────────┬────────────────────┐
-│ Recording    │ Electrode array     │ Stimulus     │ Spikes and         │
-│              │                     │              │ closed loop        │
-│ name         │  ████ 64x64 grid,   │ amplitude    │                    │
-│ duration     │  ██▓▒ one cell per  │ phase / gap  │ ☐ detect spikes    │
-│ until stopped│  ░░▒▓ electrode,    │ second phase │ ☑ draw traces      │
-│              │  ████ brightness =  │ electrodes   │ threshold          │
-│ [ Start ]    │       activity      │              │                    │
-│ [ Stop  ]    │                     │ [Stimulate]  │ sorting technique  │
-│              │  click to select    │              │ units / [ Sort ]   │
-│ status:      │  ─────────────────  │ Train:       │                    │
-│  elapsed     │  ╱╲__╱╲_ traces,    │ pulses/rate  │ ☐ close the loop   │
-│  frames      │  ─╲╱──╲╱ one lane   │ starts in    │ policy / limits    │
-│  missing     │         per chosen  │ [Send train] │                    │
-│  verdict     │         electrode   │              │ what will happen   │
-├──────────────┴─────────────────────┴──────────────┴────────────────────┤
-│ Session log — every event, with a timestamp                            │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-**The array is the centre of it.** Clicking an electrode selects it, and that
-one selection drives three things at once: the electrodes a stimulus is
-delivered through, the electrodes spikes are detected on, and the electrodes
-drawn as traces. Brightness is live activity, so you can see which sites carry
-signal before choosing any.
-
-Everything the window refuses, it explains in place — the reason a greyed-out
-button is greyed out is written directly beneath it, live, as you type.
-
-### 17.2 It always tells you which one it is
-
-A red banner and `LIVE INSTRUMENT` in the title bar mean stimuli reach the
-preparation. A blue banner and `SIMULATION` mean nothing leaves the machine.
-If you are ever unsure which you are looking at, look at the banner — a
-simulated run mistaken for a real one is worse than no run at all.
-
-### 17.3 What it will not let you do
-
-| It refuses | Because |
-|---|---|
-| Stimulate with nothing recording | A stimulus with no recording leaves no evidence of what it did |
-| A charge-unbalanced pulse | The second phase is built as the mirror of the first, so this is not expressible |
-| An amplitude or duration outside the stimulator's limits | The driver would silently clamp it (§15.1) |
-| An electrode outside the array, or `0,0` | Coordinates are 1-based and `ChCoord` does not bounds-check |
-| Positive and negative on the same column | The API PDF forbids it |
-
-**Every refusal is written next to the button**, live, as you type. If
-`Stimulate now` is greyed out, the reason is directly beneath it.
-
-**The second phase.** By default it mirrors the first, which is
-charge-balanced by construction. Untick *Second phase mirrors the first* to
-shape it independently — a short high-amplitude phase followed by a long
-low-amplitude recovery is a standard configuration and was previously not
-expressible at all. The charge constraint still holds: the fields let you
-shape the two phases, not escape it.
-
-**Trains.** Count, rate and a start delay. The plan is shifted by the
-acquisition clock before it is queued, because stimulation timestamps are
-counted from the beginning of the acquisition rather than from now (§15.5).
-With no clock reading yet, the train is refused rather than sent to an unknown
-point in time.
-
-### 17.4 Reading the status panel
-
-- **Acquisition time** is what a scheduled stimulus would be timed against,
-  and it names where it came from. `device` means the instrument's own clock
-  with a factor read from the device — the only case where the clock is
-  cross-checked. `device-calibrated` means the factor was derived from the
-  packets, so the cross-check cannot detect anything. `frames` means the
-  device reported no usable timestamp at all.
-- **Frames missing** is data the instrument acquired that never reached the
-  disk. Non-zero means the sidecar's `gaps` list is worth reading.
-- The **coloured line at the bottom of the panel** is the one to watch. Amber
-  is a warning the run survived; red is an error. Both are also in the
-  session log with a timestamp.
-
-### 17.5 Spikes, sorting and the closed loop
-
-The fourth panel turns on everything downstream of the recording. All of it
-watches **the electrodes selected on the array** — clicking an electrode is
-how you choose what to detect on, trace, and sort.
-
-- **Detect spikes** — a streaming high-pass and a threshold in units of the
-  noise, not of microvolts, so it adapts per electrode.
-- **Sorting technique** — Amplitude, PCA + k-means, or Template matching, run
-  on the spikes collected so far. Sorting is **per electrode**: a unit is a
-  neuron as heard by one site. The separation score is corrected against a
-  null, so a technique cannot report an impressive number for noise (§18.3).
-- **Close the loop** — stimulate on a detected spike, under a safety envelope
-  that the policy cannot override.
-
-Sorting is disabled while a recording runs. It competes with the thread
-draining the packet queue, and losing that race costs packets.
-
-Keep the watched set small. Detection over the whole array costs about three
-times a core, and [`docs/lab/closed-loop-budget.md`](docs/lab/closed-loop-budget.md)
-has the measured per-packet numbers.
-
-### 17.6 Traces
-
-Under the array, one lane per selected electrode, each with its own vertical
-scale — one shared scale means a single saturated electrode flattens
-everything else to a line.
-
-Each column shows the **minimum and maximum** over its time bin rather than a
-sampled value. That matters: a spike is ~20 samples long and a column spans
-far more than that, so a subsampled trace would drop most spikes and change
-the height of the rest at random. The envelope cannot miss one.
-
-Capped at eight electrodes — past that the lanes are too thin to read and the
-cost stops being negligible.
-
-### 17.7 What a session leaves behind
-
-Four files, named after the recording:
-
-| file | what it holds |
-|---|---|
-| `name.raw` | the signal |
-| `name_meta.json` | acquisition parameters and integrity |
-| `name_stimuli.json` | every stimulus: delivered, refused, or rejected |
-| `name_session.json` | **what the experiment was** |
-
-The last is the one to read first. The others say what was acquired and what
-fired; only this says which electrodes were watched, at what threshold, under
-which policy, inside what limits, whether the loop was actually armed, and
-whether the run was live or simulated. Two sessions driven by completely
-different rules are otherwise indistinguishable on disk — and six weeks later,
-on a shared instrument, that is the difference between data and an unlabelled
-file.
-
-Every field is read off the objects that ran, not off what the window believed
-it had configured, so the record cannot quietly disagree with the session.
-
-### 17.8 What it does not do yet
-
-- **Trains are scheduled, not verified.** The window can send them: it shifts
-  the plan by the acquisition clock's reading, and refuses if there is no
-  reading yet. Whether the instrument honours the schedule is untested —
-  issue #24.
-- **Sorting runs on what was collected, not on the file.** For a whole
-  recording use `biocam analyse` (§18).
-- **The array display assumes row-major channel ordering.** If the instrument
-  disagrees, clicking one electrode would stimulate another — issue #31, and
-  it is the first thing to check in the lab.
-- **Nothing here has run on the instrument.** The whole live path is
-  untested; the simulation path is what the tests cover.
-
----
-
-## 18. Spike detection and sorting
-
-```
-biocam analyse recording.raw recording_meta.json --channels 300,301        --sort pca --units 2
-```
-
-Detection and sorting on a finished recording. The same code the window runs
-live, so a result here and a result there mean the same thing.
-
-### 18.1 Detection
-
-A second-order Butterworth high-pass (300 Hz by default) and a threshold in
-units of the noise rather than microvolts, so it adapts to each electrode. The
-noise estimate is Quiroga's `median(|x|) / 0.6745`, which a burst cannot
-inflate the way a standard deviation can.
-
-`--suggest-units` reports how many units each electrode looks like it has,
-before you commit to a number.
-
-### 18.2 The three techniques
-
-| `--sort` | What it separates on | Fails when |
+| File | Written by | Contents |
 |---|---|---|
-| `amplitude` | trough depth | two neurons at similar distance from the site |
-| `pca` | shape, projected onto its main axes | one unit is rare, so it contributes little variance |
-| `template` | correlation against per-unit mean shapes | shapes are similar but amplitudes differ |
+| `name.raw` | window, `record` | The signal, exactly as received |
+| `name_meta.json` | window, `record` | Acquisition parameters and integrity evidence (the **sidecar**) |
+| `name_session.json` | window | **What the experiment was.** Read this first. |
+| `name_stimuli.json` | window, **only if something was stimulated** | Every stimulus attempt |
 
-They fail differently, which is why there are three. If all three agree, that
-is worth more than any one of their scores.
+**`.raw`.** Frame after frame, with no header. Each frame holds one `uint16`
+(little-endian) sample per channel. So a frame is 8192 bytes for 4096
+channels, or 2048 bytes for the 1024-channel demo. Convert counts to
+microvolts with the sidecar's own values:
 
-### 18.3 Read the separation score, not the silhouette
+```python
+import json, numpy as np
+meta = json.load(open("recordings/slice1_meta.json"))
+data = np.fromfile("recordings/slice1.raw", dtype="<u2").reshape(-1, meta["total_channels"])
+microvolts = meta["offset"] + data * meta["adc_counts_to_value"]
+```
 
-**A silhouette score on one-dimensional data is high almost regardless of the
-data.** Split any single hump down the middle and you get two tidy halves. The
-amplitude technique scored **0.61 on pure noise** — a number that reads as
-"these units are convincing".
+Or use `biocam.data.recording.load_recording(raw, meta)`, which returns
+`(microvolts, sidecar)`. Pass `as_microvolts=False` for raw counts.
 
-So what is reported is the silhouette **minus what the same clustering scores
-on structureless data of the same shape**. On one synthetic fixture — 150
-waveforms, two units against pure noise:
+**`_meta.json`** (the sidecar). Key fields:
 
-| technique | noise, raw | noise, corrected | real, raw | real, corrected |
-|---|---|---|---|---|
-| amplitude | **0.61** | 0.05 | 0.76 | 0.21 |
-| pca | 0.21 | −0.02 | 0.85 | 0.33 |
-| template | 0.03 | −0.00 | 0.69 | 0.57 |
+- **Acquisition parameters:** `frame_rate_hz`, `total_channels`,
+  `adc_counts_to_value`, `offset`, and the others needed to read the file.
+- **`status`:** `in_progress` is written at the start; it becomes `complete`
+  or `failed` at the end. A file left at `in_progress` came from a run that
+  was killed.
+- **`stop_reason`, `error`, `n_frames_written`, `duration_sec`.**
+- **`integrity`:**
+  - `verdict`;
+  - `n_frames_missing`, and `gaps` (where each gap is and how long);
+  - `driver_loss_events`, `queue_overflows` and `callback_errors`;
+  - `payload_length_mismatches` and `counter_anomalies` (a packet counter
+    that repeated or jumped implausibly; either makes the verdict `unknown`);
+  - `discarded_at_stop`, the first and last device timestamps, and
+    `timestamps_unavailable`.
 
-Read the amplitude row. Raw, it scores **0.61 on pure noise** and 0.76 on real
-units — those are not distinguishable by eye, and 0.61 alone would read as a
-solid result. Corrected, it is 0.05 against 0.21.
+Any non-zero loss counter means the verdict deserves a look.
 
-The exact values depend on the fixture; what does not is that the corrected
-score for noise sits near zero for every technique. Both numbers are printed,
-so you can see the correction being applied — and below `0.10` the sorter says
-outright that its units are not to be trusted.
+**`_session.json`.** Records the following, all read off the objects that
+actually ran rather than off what the window believed:
 
-### 18.4 Sorting is per electrode
+- live or simulated, and the source;
+- the start and finish times, and the requested duration;
+- the detection settings;
+- the closed-loop settings, and whether the loop was really armed;
+- the traced channels;
+- the stimulus and its electrodes;
+- the outcome: frames, acquisition time, clock source, verdict, stop reason,
+  stimuli delivered and failed, spikes, and loop counts;
+- the warnings.
 
-A unit is a neuron **as heard by one site**. Pooling waveforms across
-electrodes does not find neurons; it finds electrodes, and it does so
-convincingly, because the structure is real. Each electrode is fitted
-separately and reported separately.
+**`_stimuli.json`.** One record per attempt:
 
-### 18.5 What this is not
+- `outcome`: `sent`, `refused` (this software declined), or `rejected` (the
+  driver did);
+- `kind`, the pulse and electrodes, `requested_timestamps_us` and
+  `net_charge_pc`;
+- `best_time_us`, the best estimate of when the stimulus went out;
+- `time_is_measured`: `true` when that time is the driver's reported latency,
+  `false` when it is only the acquisition clock, a lower bound;
+- `simulated`.
 
-- **Not a spike sorter of record.** It is enough to see whether a preparation
-  has separable units and to drive a closed loop. For publication-grade
-  sorting, export to HDF5 (§8) and use a dedicated tool.
-- **Never run on instrument data.** Every number above comes from a
-  synthetic recording with known planted units. Real cultures are harder.
+Refusals are kept because in the signal a stimulus that never fired looks
+exactly like one that evoked nothing.
+
+---
+
+## 8. Spike detection and sorting
+
+**Detection** is the same code live and on a file:
+
+1. A second-order Butterworth high-pass at 300 Hz removes slow drift. It uses
+   only past samples, so it works live, at the cost of slightly distorting
+   spike shape.
+2. The noise level is estimated as `median(|x|) / 0.6745`, which spikes barely
+   inflate.
+3. A spike is a dip below −threshold × noise (default 5).
+4. A refractory period (default 1 ms) stops one spike being counted twice.
+
+**Sorting** is **per electrode**: a *unit* is a neuron as heard by one site.
+
+| Technique | Separates on | Fails when |
+|---|---|---|
+| `amplitude` | trough depth | two neurons are at a similar distance from the site |
+| `pca` | shape, via principal components + k-means | one unit is rare |
+| `template` | correlation with per-unit mean shapes | shapes are similar but amplitudes differ |
+
+**Read the separation score, not the raw silhouette.** Clustering scores high
+even on pure noise; the amplitude technique scored 0.61 on noise. So the score
+reported is the silhouette **minus what the same clustering scores on
+structureless data**. Below 0.10, the sorter says its units are not to be
+trusted. If all three techniques agree, that is worth more than any one score.
+
+This is enough to see whether a preparation has separable units and to drive a
+closed loop. It is **not** a publication-grade sorter: export to HDF5 and use a
+dedicated tool for that. Every number here comes from synthetic data.
+
+---
+
+## 9. Troubleshooting
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| `TakeBioCamControl` returns `None` | BrainWave or another process holds the device | Close all 3Brain software and stray Python processes, then retry |
+| No device found / timeout | USB not connected, or BioCAM not powered | Check the cable, power, and status LED |
+| `MeaPlate.IsConnected` is `False` | Plate not seated | Reseat the MEA plate and retry |
+| `ModuleNotFoundError: No module named 'biocam'` | Not run from the repository root | `cd` to the folder containing this README |
+| `ModuleNotFoundError: No module named 'clr'` | `pythonnet` missing (preflight reports it) | On the lab machine: `pip install -r requirements.txt` |
+| Verdict `gaps_detected`, or `queue_overflows` > 0 | Too much work per packet, or a slow disk | Increase `--packet-ms`, watch fewer electrodes, check the drive against [`storage-setup.md`](docs/lab/storage-setup.md). For the closed loop, see [`closed-loop-budget.md`](docs/lab/closed-loop-budget.md): 32 watched channels at 1 ms packets do not fit. |
+| Warning "activity sample(s) took longer than 500 us" | The array display was slow on the data thread | Harmless once; if frequent, report it |
+| *Stimulate now* greyed out | Its reason is written beneath it; usually "no recording running" | Start a recording first. Drag the log's edge down if the reason is hidden. |
+| *Sort spikes so far* greyed out | Recording is running, no technique chosen, or no spikes collected (detection off) | Stop, tick detection, record, then sort |
+
+---
+
+## 10. Known limitations before a closed-loop session
+
+These describe the **current** code. Do not close the loop on a live
+preparation until they are resolved:
+
+- **No stimulus-artefact blanking.** Detection watches the same electrodes
+  that are stimulated. With the *echo* policy, a stimulus artefact can be
+  detected as a spike and trigger the next stimulus. The loop can then run
+  itself at the envelope's maximum rate for the whole session.
+- **The charge budget is inert.** The envelope supports a charge-per-second
+  limit, but the window never gives it the pulse's charge, so it limits
+  nothing. Only the minimum interval and the maximum rate are enforced.
+- **`nan` and `inf` are accepted as loop limits.** A max rate of `nan` or
+  `inf` switches the rate cap off. Very large values are not rejected either.
+- **Manual and loop stimuli are limited separately.** Neither path counts the
+  other's stimuli.
+- **The first second after detection starts is noisy.** The noise estimate
+  settles over about a second, so false detections are more likely then.
+
+---
+
+## 11. What is untested, and what to report
+
+Everything that talks to the instrument is being tried for the first time. The
+open `hardware-verification` issues hold the procedures; this is what each
+checks:
+
+| Issue | Question |
+|---|---|
+| #16 | The first session protocol and handover checklist. **Start here.** |
+| #11 | Do the five undocumented `BioCamDataFormat` properties hold the values assumed? |
+| #12 | How long does the data callback take at the real data rate? |
+| #13 | Is each packet's payload a whole number of frames, and is `PayloadLength` in bytes? |
+| #14 | Does the driver honour the requested acquisition period (`--packet-ms`)? |
+| #15 | Do the data-loss events (`DataLossAsync`, `DataStreamingError`) actually fire? |
+| #18 | Can `StartDataStreaming` throw after the hardware has started? |
+| #31 | Is the channel order row-major? If not, the array picture and electrode selection are wrong. |
+| #32 | What does the activity display cost on the lab PC? |
+| #21 | What are the DupleX's real stimulator limits (`StimProperties`: time resolution, amplitude range and step, max duration)? |
+| #22 | Is `Start()` what makes stimuli fire? Test on the external endpoints with an oscilloscope, not on tissue. |
+| #23 | Are the endpoint rules real: `GetInternalEndPoint`, and positive and negative in different columns? |
+| #24 | What does the instrument do with stimulus timestamps in the past: fire them all at once, drop them, or refuse? |
+| #26 | How long does `Send` take on the acquisition thread? |
+| #27 | Is `Send` safe to call from another thread? |
+
+Changed since the last lab session, and so also tried for the first time:
+
+- **Preflight loads the assemblies** (`3Brain assemblies load` line). Report
+  that line from the first preflight on the lab machine, pass or fail.
+- **An interrupted connect hands the BioCAM back.** Ctrl+C while waiting for a
+  free slot (BrainWave still open), or during the connection checks, now
+  releases the slot and deactivates the pool. Check: after such an interrupt,
+  a fresh `record` finds the device without restarting the PC.
+- **A stimulator `Start()` that raises is followed by `Stop()`.** If the
+  stimulator never started, the driver documents `Stop()` as throwing, so a
+  warning `IBioCamStim.Stop() raised ...` right after a failed start is
+  expected, not a second fault. Report whether `Close()` then succeeds.
+- **After a failed connect** (timeout, plate unseated), check that a new run
+  claims the BioCAM without unplugging USB or restarting the PC.
+- **Traces without detection** now run during recordings. For one run with
+  traces on and detection off, report `queue_overflows` and the trace timing
+  warnings from `_session.json`.
+- **A repeated packet counter now makes the verdict `unknown`.** If a real
+  recording shows `counter_anomalies` above zero, report it: it answers
+  whether the driver ever repeats a packet.
+
+After any lab run, report:
+
+- the console output;
+- the `_meta.json`, and specifically its `integrity` block;
+- the `_session.json` warnings;
+- for stimulation, the `_stimuli.json`;
+- anything that looked different from this manual.
+
+---
+
+## 12. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Frame** | One sample from every channel at one instant. 18,557.72 frames per second. |
+| **Packet** | A block of frames the driver delivers at once, every `--packet-ms` milliseconds, with a header holding a counter, a timestamp and a length |
+| **Sidecar** | The `_meta.json` beside each `.raw`: how to read the file, and whether it is complete |
+| **Gap** | Packets that never arrived, detected from a skip in the packet counter |
+| **Verdict** | `clean`: no loss detected. `gaps_detected`: loss found and recorded. `unknown`: completeness could not be established (e.g. a crashed run, or anomalies) |
+| **Acquisition time** | Time since the instrument started acquiring. Stimulus timestamps are counted from this. |
+| **Replay / simulation** | Running the window against a `.raw` file instead of the instrument. Nothing is stimulated. |
+| **Tick** | The stimulator's time step. Every pulse duration must be a whole number of ticks. |
+| **Charge balance** | A pulse's two phases cancel: amplitude₁ × duration₁ + amplitude₂ × duration₂ = 0. Unbalanced pulses drive electrolysis. |
+| **Sigma** | The noise level of one electrode, estimated as `median(|x|)/0.6745`. The threshold is a multiple of it. |
+| **Unit** | A putative neuron, as heard by one electrode, found by sorting |
+| **Policy** | What the closed loop wants to do: *echo* (a stimulus per spike) or *rate* (stimulate when firing drops) |
+| **Safety envelope** | Hard limits applied after the policy (minimum interval, maximum rate) that the policy cannot override |
