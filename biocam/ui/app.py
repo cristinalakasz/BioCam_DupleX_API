@@ -133,26 +133,37 @@ class BioCamWindow:
         )
         banner.pack(fill="x")
 
-        body = ttk.Frame(self.root, padding=8)
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, minsize=260)
-        body.columnconfigure(1, weight=1)
-        body.columnconfigure(2, minsize=240)
-        body.columnconfigure(3, minsize=280)
-        body.rowconfigure(1, weight=1)
+        # Every section can be resized by dragging the edge between it and
+        # its neighbour: the four columns side by side, and the log below
+        # them. tk's PanedWindow rather than ttk's, because only tk's has a
+        # per-pane minsize - and a column dragged shut would hide the reason
+        # written under a greyed-out button, which this window promises
+        # never to hide.
+        sash = dict(sashwidth=6, sashrelief="raised", opaqueresize=True,
+                    borderwidth=0)
+        self.rows = tk.PanedWindow(self.root, orient="vertical", **sash)
+        self.rows.pack(fill="both", expand=True, padx=8, pady=8)
+        self.columns = tk.PanedWindow(self.rows, orient="horizontal", **sash)
+        self.rows.add(self.columns, minsize=200, stretch="never")
 
-        self._build_recording(ttk.LabelFrame(body, text="Recording", padding=8))
-        self._build_array(
-            ttk.LabelFrame(body, text="Electrode array", padding=6))
-        self._build_stimulation(
-            ttk.LabelFrame(body, text="Stimulus", padding=8))
-        self._build_analysis(
-            ttk.LabelFrame(body, text="Spikes and closed loop", padding=8))
-        self._build_log(ttk.LabelFrame(body, text="Session log", padding=6))
+        # The array column takes whatever the window gains or loses; the
+        # others keep the width they were dragged to.
+        for build, title, padding, minsize, stretch in (
+            (self._build_recording, "Recording", 8, 200, "never"),
+            (self._build_array, "Electrode array", 6, 240, "always"),
+            (self._build_stimulation, "Stimulus", 8, 200, "never"),
+            (self._build_analysis, "Spikes and closed loop", 8, 220, "never"),
+        ):
+            frame = ttk.LabelFrame(self.columns, text=title, padding=padding)
+            build(frame)
+            self.columns.add(frame, minsize=minsize, stretch=stretch)
+
+        log = ttk.LabelFrame(self.rows, text="Session log", padding=6)
+        self._build_log(log)
+        self.rows.add(log, minsize=80, stretch="always")
 
     def _build_recording(self, frame):
         tk, ttk = self.tk, self.ttk
-        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
         self.var_duration = tk.StringVar(value="10")
         self.var_until_stopped = tk.BooleanVar(value=False)
@@ -223,13 +234,24 @@ class BioCamWindow:
             NEGATIVE_COLOUR, POSITIVE_COLOUR, ElectrodeArrayView,
         )
 
-        frame.grid(row=0, column=1, sticky="nsew", padx=6)
+        # The array fills whatever room its column has left once the rows
+        # below it are placed, and grows or shrinks its cells to match. The
+        # holder does not propagate, so the array's own size never pushes
+        # back on the pane that is sizing it.
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        holder = ttk.Frame(frame, width=self.n_cols * 9 + 2,
+                           height=self.n_rows * 9 + 2)
+        holder.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        holder.pack_propagate(False)
 
         self.array = ElectrodeArrayView(
-            frame, n_rows=self.n_rows, n_cols=self.n_cols, cell=9,
+            holder, n_rows=self.n_rows, n_cols=self.n_cols, cell=9,
             on_change=self._on_array_selection, on_hover=self._on_array_hover,
         )
-        self.array.canvas.grid(row=0, column=0, columnspan=3)
+        self.array.canvas.pack(anchor="n")
+        holder.bind("<Configure>",
+                    lambda e: self.array.fit(e.width, e.height))
 
         from biocam.ui.traceview import TraceStripView
 
@@ -238,8 +260,10 @@ class BioCamWindow:
         # something the operator has to remember rather than see.
         self.traces = TraceStripView(
             frame, tk, width=self.n_cols * self.array.cell, height=200)
-        self.traces.canvas.grid(row=3, column=0, columnspan=3,
+        self.traces.canvas.grid(row=4, column=0, columnspan=3,
                                 sticky="ew", pady=(8, 0))
+        self.traces.canvas.bind("<Configure>",
+                                lambda e: self.traces.fit(e.width))
 
         legend = ttk.Frame(frame)
         legend.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -301,7 +325,6 @@ class BioCamWindow:
 
     def _build_stimulation(self, frame):
         tk, ttk = self.tk, self.ttk
-        frame.grid(row=0, column=2, sticky="nsew")
 
         self.var_amplitude = tk.StringVar(value="100")
         self.var_phase = tk.StringVar(value="200")
@@ -423,7 +446,6 @@ class BioCamWindow:
         tk, ttk = self.tk, self.ttk
         from biocam.analysis.sorting import SORTER_LABELS
 
-        frame.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
 
         self.var_detect = tk.BooleanVar(value=False)
         self.var_traces = tk.BooleanVar(value=True)
@@ -649,7 +671,6 @@ class BioCamWindow:
 
     def _build_log(self, frame):
         tk = self.tk
-        frame.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -973,6 +994,7 @@ class BioCamWindow:
             raw_path=self.replay_source, params=self.replay_params,
             output_path=output, duration_sec=duration,
             frames_per_packet=200, pace_hz=50.0,
+            **self._display_settings(),
             **self._analysis_settings(),
         )
 
@@ -1046,17 +1068,12 @@ class BioCamWindow:
         detection over the whole array is unaffordable on the thread that
         drains the packet queue.
         """
-        from biocam.ui.arrayview import channel_index
-
         if not self.var_detect.get():
             return {}
-        chosen = list(self.array.positive) + list(self.array.negative)
-        channels = sorted({channel_index(row, col, self.n_cols)
-                           for row, col in chosen})
+        channels = self._selected_channels()
         if not channels:
             return {}
         return {
-            "trace_channels": self._trace_channels(),
             "detect_channels": tuple(channels),
             "threshold_sigmas": _as_float(self.var_sigmas, 5.0),
             "collect_waveforms": self.sort_technique is not None,
@@ -1064,6 +1081,37 @@ class BioCamWindow:
             "policy_name": self.var_policy.get(),
             "min_interval_ms": _as_float(self.var_min_interval, 20.0),
             "max_rate_hz": _as_float(self.var_max_rate, 10.0),
+        }
+
+    def _selected_channels(self) -> list:
+        """Channel indices of the chosen electrodes that exist on this array.
+
+        The text fields accept any coordinates, and the stimulus panel already
+        refuses the ones off the array, in red, with the reason. Watching or
+        tracing them is a different matter: the recorder would refuse the
+        channel and the whole recording would fail - losing the data over a
+        display aid.
+        """
+        from biocam.ui.arrayview import channel_index
+
+        chosen = list(self.array.positive) + list(self.array.negative)
+        return sorted({channel_index(row, col, self.n_cols)
+                       for row, col in chosen
+                       if 1 <= row <= self.n_rows and 1 <= col <= self.n_cols})
+
+    def _display_settings(self) -> dict:
+        """What the factory needs to draw what this window shows.
+
+        Separate from `_analysis_settings`, which is empty whenever detection
+        is off. Traces were once carried in there and so vanished with it,
+        and the grid shape was never passed at all - the factory kept its
+        64x64 default, and a 32x32 replay gave the monitor 1024 values for
+        4096 cells, which it declines to draw.
+        """
+        return {
+            "n_rows": self.n_rows,
+            "n_cols": self.n_cols,
+            "trace_channels": self._trace_channels(),
         }
 
     def _trace_channels(self) -> tuple:
@@ -1076,13 +1124,10 @@ class BioCamWindow:
         are the ones you chose".
         """
         from biocam.data.traces import MAX_TRACE_CHANNELS
-        from biocam.ui.arrayview import channel_index
 
         if not self.var_traces.get():
             return ()
-        chosen = list(self.array.positive) + list(self.array.negative)
-        channels = sorted({channel_index(row, col, self.n_cols)
-                           for row, col in chosen})
+        channels = self._selected_channels()
         if len(channels) > MAX_TRACE_CHANNELS:
             self._log(
                 f"{len(channels)} electrodes are selected but only "
@@ -1112,6 +1157,7 @@ class BioCamWindow:
             listener=self.controller.listener,
             warn=self._warn_from_any_thread,
             loop_plan=plan, loop_pattern=pattern,
+            **self._display_settings(),
             **self._analysis_settings(),
         )
 

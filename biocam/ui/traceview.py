@@ -118,6 +118,20 @@ class TraceStripView:
 
     # -- geometry ---------------------------------------------------------
 
+    def fit(self, width: int) -> None:
+        """Draw to the width the layout actually gave the canvas.
+
+        `width` is the canvas's own size from a <Configure> event, border
+        included. The canvas is not reconfigured - it is stretched by its
+        parent, and asking for a new size from inside its own resize would
+        feed back into the next one.
+        """
+        border = int(self.canvas.cget("highlightthickness"))
+        width = max(120, int(width) - 2 * border)
+        if width != self.width:
+            self.width = width
+            self._redraw()
+
     def resize(self, width: int, height: int) -> None:
         self.width, self.height = max(120, int(width)), max(60, int(height))
         self.canvas.configure(width=self.width, height=self.height)
