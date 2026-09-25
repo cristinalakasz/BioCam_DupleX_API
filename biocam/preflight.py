@@ -2,15 +2,19 @@
 
 Run before an experiment to confirm the machine is set up correctly. Checks only
 things that can be verified without the instrument: interpreter version,
-required packages, and presence of the 3Brain DLLs.
+required packages, presence of the 3Brain DLLs, and that those DLLs load into
+the .NET runtime. Loading an assembly makes no USB call, so this is safe to
+run while BrainWave or another process holds the BioCAM.
 
-Device detection is Layer 1 and is added in Phase 1.
+It does not detect the device or the MEA plate: both need the instrument
+claimed, which preflight deliberately never does.
 
 Usage:
     python -m biocam.preflight
 """
 
 import importlib
+import importlib.util
 import shutil
 import sys
 from dataclasses import dataclass
@@ -28,7 +32,9 @@ REQUIRED_DLLS = [
     "Newtonsoft.Json.dll",
 ]
 
-REQUIRED_PACKAGES = ["numpy"]
+# Everything requirements.txt installs. pythonnet fails on a development
+# machine, correctly: that machine cannot drive the instrument.
+REQUIRED_PACKAGES = ["numpy", "h5py", "pythonnet"]
 
 DEFAULT_DLL_DIR = Path(__file__).resolve().parent.parent / "BioCam_DupleX_API" / "API"
 
@@ -45,8 +51,36 @@ def check_environment(dll_dir):
     dll_dir = Path(dll_dir)
     results = [_check_python_version()]
     results.extend(_check_package(name) for name in REQUIRED_PACKAGES)
-    results.extend(_check_dll(dll_dir, name) for name in REQUIRED_DLLS)
+    dlls = [_check_dll(dll_dir, name) for name in REQUIRED_DLLS]
+    results.extend(dlls)
+    results.append(_check_assemblies_load(dll_dir, all(r.ok for r in dlls)))
     return results
+
+
+def _pythonnet_available() -> bool:
+    return importlib.util.find_spec("pythonnet") is not None
+
+
+def _check_assemblies_load(dll_dir, dlls_present):
+    """Load the 3Brain assemblies into .NET, exactly as a recording would.
+
+    Present on disk is not the same as loadable: a missing .NET Framework, a
+    32/64-bit mismatch, or DLLs Windows has blocked as downloaded from the
+    internet all pass the file checks above and fail here. Loading makes no
+    USB call; nothing is claimed.
+    """
+    name = "3Brain assemblies load"
+    if not dlls_present:
+        return CheckResult(name, False, "not attempted: DLLs missing (above)")
+    if not _pythonnet_available():
+        return CheckResult(name, False, "not attempted: pythonnet missing (above)")
+    from biocam.interop import device
+
+    try:
+        device.load_assemblies(dll_dir)
+    except Exception as exc:  # noqa: BLE001 - reported, the point of the check
+        return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
+    return CheckResult(name, True, ", ".join(device.ASSEMBLIES))
 
 
 def _check_python_version():

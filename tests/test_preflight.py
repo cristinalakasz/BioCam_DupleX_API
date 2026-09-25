@@ -77,3 +77,54 @@ def test_disk_check_names_the_directory_it_examined(tmp_path):
     from biocam.preflight import check_disk_space
     result = check_disk_space(tmp_path, planned_seconds=1, bytes_per_sec=1)
     assert str(tmp_path) in result.detail
+
+
+# --------------------------------------------------------------------------
+# what recording actually needs
+# --------------------------------------------------------------------------
+
+def _named(results, name):
+    return next(r for r in results if r.name == name)
+
+
+def test_every_package_recording_needs_is_checked(tmp_path):
+    # numpy alone let preflight pass on a lab machine where `record` then
+    # died importing pythonnet, or `convert` importing h5py.
+    names = {r.name for r in check_environment(tmp_path)}
+    assert {"package numpy", "package h5py", "package pythonnet"} <= names
+
+
+def test_the_assembly_load_is_not_attempted_without_the_dlls(tmp_path):
+    result = _named(check_environment(tmp_path), "3Brain assemblies load")
+    assert not result.ok
+    assert "DLLs" in result.detail
+
+
+def test_the_assembly_load_failure_is_reported_not_raised(tmp_path, monkeypatch):
+    # A missing .NET Framework, a 32/64-bit mismatch, or DLLs Windows has
+    # blocked as downloaded all surface here - with no instrument involved.
+    import biocam.preflight as preflight
+    import biocam.interop.device as device_module
+
+    for name in REQUIRED_DLLS:
+        (tmp_path / name).write_bytes(b"x")
+    monkeypatch.setattr(preflight, "_pythonnet_available", lambda: True)
+
+    def broken(dll_dir=None):
+        raise RuntimeError("could not load .NET runtime")
+
+    monkeypatch.setattr(device_module, "load_assemblies", broken)
+    result = _named(check_environment(tmp_path), "3Brain assemblies load")
+    assert not result.ok
+    assert "could not load .NET runtime" in result.detail
+
+
+def test_the_assembly_load_passes_when_it_succeeds(tmp_path, monkeypatch):
+    import biocam.preflight as preflight
+    import biocam.interop.device as device_module
+
+    for name in REQUIRED_DLLS:
+        (tmp_path / name).write_bytes(b"x")
+    monkeypatch.setattr(preflight, "_pythonnet_available", lambda: True)
+    monkeypatch.setattr(device_module, "load_assemblies", lambda dll_dir=None: None)
+    assert _named(check_environment(tmp_path), "3Brain assemblies load").ok

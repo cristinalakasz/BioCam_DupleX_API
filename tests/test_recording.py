@@ -682,3 +682,53 @@ def test_finalise_calls_fsync(tmp_path, monkeypatch):
         writer.finalise("duration_reached")
 
     assert len(fsync_calls) == 1
+
+
+# --- a close() that fails on a full disk ---
+
+class _FileThatFailsToClose:
+    """Wraps the real file; close() flushes into a full disk and raises."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def close(self):
+        self._real.close()
+        raise OSError(28, "No space left on device")
+
+
+def test_a_close_failure_does_not_mask_the_original_exception(tmp_path):
+    # On a full disk close() retries the flush and raises. That must not
+    # replace the error the recording actually died of.
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(ValueError, match="boom"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            writer._file = _FileThatFailsToClose(writer._file)
+            raise ValueError("boom")
+
+
+def test_a_close_failure_still_marks_the_sidecar_failed(tmp_path):
+    # Otherwise the sidecar stays "in_progress": the one file meant to say
+    # what went wrong says the run is still going.
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(ValueError):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            writer._file = _FileThatFailsToClose(writer._file)
+            raise ValueError("boom")
+    assert read_sidecar(meta)["status"] == "failed"
+
+
+def test_a_close_failure_on_an_otherwise_clean_exit_is_raised(tmp_path):
+    # Nothing else is propagating, so the close failure is the news - data
+    # may not have reached the disk, and the run must not look successful.
+    raw, meta = _paths(tmp_path)
+    with pytest.raises(OSError, match="No space left"):
+        with RecordingWriter(raw, meta, PARAMS) as writer:
+            writer.write_packet(timestamp=1, counter=1, payload=_frame([1, 2, 3, 4]))
+            writer._file = _FileThatFailsToClose(writer._file)
+    assert read_sidecar(meta)["status"] == "failed"

@@ -209,3 +209,33 @@ def test_dry_run_says_the_constraints_were_not_read_from_a_device(capsys):
     run()
     out = capsys.readouterr().out
     assert "not read from an instrument" in out
+
+
+# --------------------------------------------------------------------------
+# counts, and trains with no acquisition
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("count", ["0", "-3"])
+def test_a_count_below_one_is_refused_not_sent_as_one_pulse(count):
+    with pytest.raises(SystemExit):
+        run(["--count", count])
+
+
+def test_a_live_train_is_refused_before_the_instrument_is_touched(
+        capsys, monkeypatch):
+    # `stim` never starts an acquisition, and nothing else can be running
+    # one: only one process may control the BioCAM. A train's timestamps
+    # count from the beginning of an acquisition, so here they count from
+    # nothing. Refuse, and point at the window, which records while it
+    # stimulates.
+    import biocam.interop.device as device_module
+
+    def must_not_connect(*a, **k):
+        raise AssertionError("the instrument was contacted")
+
+    monkeypatch.setattr(device_module, "BioCamDevice", must_not_connect)
+    argv = [a for a in BASE if a not in ("--dry-run",)]
+    argv.remove("--time-resolution-us")
+    argv.remove("10")
+    assert run(["--count", "5", "--rate-hz", "10"], argv=argv) == 2
+    assert "python -m biocam.ui" in capsys.readouterr().err

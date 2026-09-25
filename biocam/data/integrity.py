@@ -102,7 +102,10 @@ class GapTracker:
             return None
 
         delta = (counter - previous) % COUNTER_MODULUS
-        if delta > COUNTER_ANOMALY_THRESHOLD:
+        # A repeat is not loss, but the writer has already appended its
+        # payload, so the file may now hold the same packet twice. That is
+        # an anomaly - it makes the verdict "unknown" - not a clean step.
+        if delta == 0 or delta > COUNTER_ANOMALY_THRESHOLD:
             self._counter_anomalies += 1
             return None
 

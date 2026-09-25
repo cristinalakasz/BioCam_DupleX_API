@@ -440,8 +440,10 @@ class Stimulator:
                     ...
                 ...StopDataStreaming...
         """
-        self.start()
+        # start() inside the try: a Start() that raises may already have
+        # engaged the stimulator, and stop() is a no-op unless it might have.
         try:
+            self.start()
             yield self
         finally:
             self.stop()
