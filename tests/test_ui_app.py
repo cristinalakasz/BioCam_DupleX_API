@@ -967,3 +967,135 @@ def test_a_finished_session_writes_a_readable_record(root, tmp_path, demo):
     # without it a spike count in this recording belongs to nothing.
     assert data["detection"]["channels"] == [0, 3]
     assert data["closed_loop"]["armed"] is False
+
+
+# --------------------------------------------------------------------------
+# resizable sections
+# --------------------------------------------------------------------------
+
+def shown(root):
+    """Lay the window out for real. Sash positions mean nothing unmapped."""
+    root.deiconify()
+    root.update()
+
+
+def test_the_four_columns_and_the_log_are_draggable_panes(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    assert len(window.columns.panes()) == 4
+    assert len(window.rows.panes()) == 2
+
+
+def test_dragging_a_sash_resizes_the_columns_either_side(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    recording, array = (root.nametowidget(p) for p in window.columns.panes()[:2])
+    before = recording.winfo_width(), array.winfo_width()
+    x, y = window.columns.sash_coord(0)
+    window.columns.sash_place(0, x - 80, y)
+    root.update()
+    assert recording.winfo_width() == before[0] - 80
+    assert array.winfo_width() == before[1] + 80
+
+
+def test_dragging_the_log_sash_resizes_the_log(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    log = root.nametowidget(window.rows.panes()[1])
+    before = log.winfo_height()
+    x, y = window.rows.sash_coord(0)
+    window.rows.sash_place(0, x, y - 60)
+    root.update()
+    assert log.winfo_height() == before + 60
+
+
+def test_no_column_can_be_dragged_shut(root, tmp_path, demo):
+    # A collapsed Stimulus column would hide the reason a button is greyed
+    # out - the one thing this window promises never to hide.
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    for pane in window.columns.panes():
+        assert int(window.columns.panecget(pane, "minsize")) > 0
+    x, y = window.columns.sash_coord(2)
+    window.columns.sash_place(2, x - 2000, y)
+    root.update()
+    stimulus = root.nametowidget(window.columns.panes()[2])
+    minsize = int(window.columns.panecget(stimulus, "minsize"))
+    assert stimulus.winfo_width() >= minsize
+
+
+def test_widening_the_array_column_enlarges_the_array(root, tmp_path, demo):
+    params = AcquisitionParameters(
+        frame_rate_hz=1000.0, total_channels=4096, ch_sample_byte_size=2,
+        bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+        min_digital_value=0, max_digital_value=4095,
+    )
+    window = a_window(root, tmp_path, demo, params=params)
+    root.geometry("1800x1200")
+    shown(root)
+    before = window.array.cell
+    x, y = window.columns.sash_coord(1)
+    window.columns.sash_place(1, x + 400, y)
+    root.update()
+    assert window.array.cell > before
+
+
+def test_the_traces_follow_the_width_of_their_column(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    before = window.traces.width
+    x, y = window.columns.sash_coord(1)
+    window.columns.sash_place(1, x + 120, y)
+    root.update()
+    assert window.traces.width == before + 120
+
+
+def test_the_traces_do_not_sit_on_top_of_the_scale_label(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    traces = window.traces.canvas.grid_info()
+    scale = window.lbl_scale.grid_info()
+    assert (traces["row"], traces["column"]) != (scale["row"], scale["column"])
+
+
+# --------------------------------------------------------------------------
+# a test run must show something
+# --------------------------------------------------------------------------
+
+def test_a_replay_that_is_not_64_by_64_still_paints_the_array(root, tmp_path, demo):
+    # The window derives a 2x2 grid from the 4-channel demo. The monitor
+    # must be built with the same shape: built 64x64, it has 4 values for
+    # 4096 cells, `as_grid` returns None, and the array stays black while
+    # the scale label above it reports signal.
+    window = a_window(root, tmp_path, demo)
+    window._on_start()
+    pump(root, window)
+    assert window.array._grid is not None
+    assert window.array._grid.shape == (window.n_rows, window.n_cols)
+
+
+def test_traces_are_drawn_with_detection_off(root, tmp_path, demo):
+    # "Draw traces" is its own checkbox. Tying it to "Detect spikes" left
+    # the trace strip empty, with a message telling the operator to tick
+    # the box they had already ticked.
+    window = a_window(root, tmp_path, demo)
+    window.var_detect.set(False)
+    window.var_traces.set(True)
+    window.var_positive.set("1,1")
+    root.update()
+    window._on_start()
+    pump(root, window)
+    assert window.controller.trace_channels() == [0]
+
+
+def test_an_electrode_off_the_array_does_not_fail_the_recording(root, tmp_path, demo):
+    # 10,10 does not exist on the demo's 2x2 array. The stimulus panel says
+    # so; traces and detection skip it rather than refuse the channel and
+    # take the recording down with them.
+    window = a_window(root, tmp_path, demo)
+    window.var_detect.set(True)
+    window.var_positive.set("10,10;1,2")
+    root.update()
+    window._on_start()
+    snapshot = pump(root, window)
+    assert snapshot.error == ""
+    assert snapshot.frames > 0
+    assert window.controller.trace_channels() == [1]

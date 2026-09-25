@@ -40,6 +40,16 @@ POSITIVE_COLOUR = "#ff3b30"
 NEGATIVE_COLOUR = "#0a84ff"
 GRID_COLOUR = "#000000"
 
+# Pixels per electrode when the operator resizes the array's pane. Below
+# MIN_CELL a single electrode is too small to click reliably on a 64x64
+# array; MAX_CELL stops a 2x2 demo grid filling the whole column.
+MIN_CELL = 3
+MAX_CELL = 48
+
+# The canvas's highlight border, on each side. The drawing area is the
+# canvas's size minus twice this.
+_BORDER = 1
+
 
 def colour_for(value, low, high):
     """Map a value in [low, high] onto the ramp. Returns (r, g, b)."""
@@ -134,10 +144,11 @@ class ElectrodeArrayView:
         self._image = None
         self._overlay = []
         self._low, self._high = 0.0, 1.0
+        self._grid = None
 
         self.canvas = tk.Canvas(
             parent, width=n_cols * cell, height=n_rows * cell,
-            highlightthickness=1, highlightbackground="#888888",
+            highlightthickness=_BORDER, highlightbackground="#888888",
             background="#101428", cursor="crosshair",
         )
         self.canvas.bind("<Button-1>", lambda e: self._click(e, "positive"))
@@ -156,6 +167,7 @@ class ElectrodeArrayView:
         if grid is None:
             return
         self._low, self._high = snapshot.range()
+        self._grid = grid
         self._redraw_image(grid)
 
     def _redraw_image(self, grid):
@@ -170,6 +182,26 @@ class ElectrodeArrayView:
             self.canvas.tag_lower(self._image)
         else:
             self.canvas.itemconfigure(self._image, image=self._photo)
+
+    # -- size -------------------------------------------------------------
+
+    def fit(self, width, height):
+        """Resize the cells to the largest that fit `width` x `height` pixels.
+
+        Cells stay square and whole, so every electrode is still exactly
+        `cell` pixels and `electrode_at` and `cell_bounds` still agree - the
+        picture and the click cannot drift apart at any size.
+        """
+        cell = min((int(width) - 2 * _BORDER) // self.n_cols,
+                   (int(height) - 2 * _BORDER) // self.n_rows)
+        cell = max(MIN_CELL, min(MAX_CELL, cell))
+        if cell == self.cell:
+            return
+        self.cell = cell
+        self.canvas.configure(width=self.n_cols * cell,
+                              height=self.n_rows * cell)
+        self._redraw_image(self._grid)
+        self._redraw_overlay()
 
     # -- selection --------------------------------------------------------
 

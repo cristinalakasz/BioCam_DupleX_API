@@ -283,3 +283,56 @@ def test_an_activity_snapshot_with_no_data_is_ignored(root):
     v = view(root)
     v.set_activity(MonitorSnapshot(None, 8, 8, 0, 0, 0.0, "uV"))
     root.update()
+
+
+# --------------------------------------------------------------------------
+# resizing: the operator drags the pane, the array follows
+# --------------------------------------------------------------------------
+
+def test_fitting_a_larger_space_enlarges_the_cells(root):
+    v = view(root)                          # 8x8 at 10 px
+    v.fit(8 * 20 + 2, 8 * 20 + 2)           # +2: the canvas border
+    assert v.cell == 20
+    assert int(v.canvas.cget("width")) == 8 * 20
+
+
+def test_the_tighter_dimension_decides(root):
+    # Square cells, whole array visible: a wide, short space is limited by
+    # its height, not stretched to its width.
+    v = view(root)
+    v.fit(8 * 30 + 2, 8 * 12 + 2)
+    assert v.cell == 12
+
+
+def test_the_cells_never_shrink_below_legibility(root):
+    from biocam.ui.arrayview import MIN_CELL
+
+    v = view(root)
+    v.fit(10, 10)
+    assert v.cell == MIN_CELL
+
+
+def test_a_tiny_demo_grid_does_not_balloon(root):
+    from biocam.ui.arrayview import MAX_CELL
+
+    v = view(root, n_rows=2, n_cols=2)
+    v.fit(2000, 2000)
+    assert v.cell == MAX_CELL
+
+
+def test_a_click_after_resizing_lands_on_the_electrode_drawn_there(root):
+    # The picture and the click must agree at every size, or dragging a
+    # pane quietly changes which electrode gets stimulated.
+    v = view(root)
+    v.fit(8 * 17 + 2, 8 * 17 + 2)
+    click(v, 6, 3)
+    assert v.positive == [(6, 3)]
+    item = v._overlay[0]
+    assert v.canvas.coords(item)[:2] == [2 * 17, 5 * 17]
+
+
+def test_the_selection_is_redrawn_at_the_new_size(root):
+    v = view(root)
+    click(v, 2, 2)
+    v.fit(8 * 25 + 2, 8 * 25 + 2)
+    assert v.canvas.coords(v._overlay[0])[:2] == [25, 25]
