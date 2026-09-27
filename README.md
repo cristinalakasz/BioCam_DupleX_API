@@ -313,10 +313,23 @@ There is no installed `biocam` command. Run everything as a module **from the
 repository root**:
 
 ```
-python -m biocam.cli record|stim|convert|analyse ...
+python -m biocam.cli probe|record|stim|convert|analyse ...
 ```
 
 `--help` after any subcommand lists all its options.
+
+### 6.0 Probe: read the instrument, send nothing
+
+```
+python -m biocam.cli probe --output-dir D:\biocam-test
+```
+
+Claims the BioCAM, reads what it reports about itself (data format, clock,
+stimulator limits, and which electrodes can be stimulation endpoints), and
+releases it. It initializes the stimulator but never starts it and never sends
+a pulse, so it is safe with anything on the chip. The output is also saved as
+`probe_<date>_<time>.txt` for attaching to an issue. Step T2 of
+[`docs/lab/first-hardware-test.md`](docs/lab/first-hardware-test.md).
 
 ### 6.1 Record
 
@@ -546,6 +559,12 @@ preparation until they are resolved:
 ---
 
 ## 11. What is untested, and what to report
+
+**To test on the instrument, follow
+[`docs/lab/first-hardware-test.md`](docs/lab/first-hardware-test.md)**: the
+step-by-step protocol (what to click, what to expect, how to report on GitHub).
+It needs no cells, and starts with `python -m biocam.cli probe`, which reads the
+instrument without sending anything.
 
 Everything that talks to the instrument is being tried for the first time. The
 open `hardware-verification` issues hold the procedures; this is what each

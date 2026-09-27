@@ -229,6 +229,17 @@ def build_parser() -> argparse.ArgumentParser:
              "documented setting - doubles the callback budget at no cost, "
              "reversible once issue #12 measures real callback latency)")
 
+    probe = sub.add_parser(
+        "probe",
+        help="read what the instrument reports about itself; sends nothing")
+    probe.add_argument(
+        "--grid", type=_grid, default="64x64",
+        help="array size whose electrodes are checked for a stimulation "
+             "endpoint (default 64x64)")
+    probe.add_argument(
+        "--output-dir", type=str, default="recordings",
+        help="where probe_<time>.txt is written (default recordings)")
+
     convert = sub.add_parser("convert", help="convert a recording to HDF5")
     convert.add_argument("raw")
     convert.add_argument("meta")
@@ -1346,8 +1357,40 @@ def _busiest_channel(shaped):
     return max(by_channel.items(), key=lambda pair: len(pair[1]))
 
 
+def probe_command(args) -> int:
+    """Claim the BioCAM, read its reports, release it. No stimulus, no data.
+
+    Everything printed is also written to recordings/probe_<time>.txt, so the
+    whole output can be attached to an issue rather than retyped.
+    """
+    from biocam.interop.probe import printable, run_probe
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"probe_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    lines = []
+
+    def emit(line):
+        lines.append(line)
+        print(line)
+
+    status = 2
+    try:
+        status = run_probe(args.grid.n_rows, args.grid.n_cols, emit)
+    except KeyboardInterrupt:
+        emit("INTERRUPTED (Ctrl+C). The BioCAM was released.")
+    except Exception as exc:  # noqa: BLE001 - reported, with the file written
+        emit(f"FAILED: {printable(exc)}")
+    finally:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"\nsaved: {path}")
+    return status
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "probe":
+        return probe_command(args)
     if args.command == "record":
         return record_command(args)
     if args.command == "stim":
