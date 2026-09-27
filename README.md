@@ -109,17 +109,21 @@ python tools/make_demo_recording.py demo
 python -m biocam.ui --replay demo.raw --meta demo_meta.json
 ```
 
-The first command writes `demo.raw` and `demo_meta.json` (about 76 MB). The
-second opens the window in **simulation mode**: a blue banner reading
+The first command writes `demo.raw` and `demo_meta.json`: 2 seconds, about
+76 MB, which replays in about 4 seconds. For time to click around while it
+runs, make a longer one: `python tools/make_demo_recording.py demo --seconds 30`
+(about 38 MB per second). The second command opens the window in **simulation mode**: a blue banner reading
 "SIMULATION — no instrument, no stimulus leaves this machine".
 
 **The demo is synthetic.** It is not a recording of neurons, and nothing read
 off it is science. It contains:
 
-- **1024 electrodes (32 × 32)** instead of 4096, at the real sample rate. That
-  makes 2 seconds and 37,115 frames. The window sizes its grid to the file.
+- **1024 electrodes (32 × 32)** instead of 4096, at the real sample rate
+  (37,115 frames for the default 2 seconds). The window sizes its grid to the
+  file.
 - **A 3 Hz sine wave** (±120 counts, about ±240 µV) on every electrode. This
-  is the slow wave in the traces.
+  is the slow wave in the traces, and on most electrodes it is all there is:
+  a trace that shows only a sine wave is working correctly.
 - **Random noise** that differs per electrode, raised in two soft
   **hotspots** centred on electrodes (10,13) and (23,20). These are the yellow
   patches on the array.
@@ -199,10 +203,16 @@ tells you which clock is being used:
 - **Traces.** One lane per selected electrode (maximum 8), each with its own
   vertical scale. Each screen column shows the minimum and maximum of its time
   slice, so no spike can be missed. Traces work whether or not detection is on.
-- **The electrode set for traces and detection is fixed when you press
-  Start.** Changing the selection during a recording affects the next one.
-  Electrodes that are not on the array are skipped for traces and detection;
-  the Stimulus column still refuses them in red.
+- **Traces follow your clicks live.** During a recording, click an electrode
+  and its trace appears (the lane starts empty and fills from that moment);
+  click it again to remove it. Ticking *Draw traces* mid-recording works too.
+  The session record notes that the traced set changed.
+- **Detection is fixed when you press Start.** What detection watches is part
+  of the experiment, so changing the selection mid-recording affects the next
+  recording, not this one.
+- Electrodes that are not on the array are skipped for traces and detection;
+  the Stimulus column still refuses them in red. Emptying an electrode field
+  clears that polarity on the array.
 
 **The picture assumes row-major channel order** (channel *i* is row
 *i* ÷ columns, column *i* mod columns). No vendor document states the order.

@@ -78,6 +78,9 @@ class ReplayFactory:
     # Electrodes whose signal is drawn as a rolling trace. Empty means the
     # trace panel does no work at all on the acquisition thread.
     trace_channels: tuple = ()
+    # Build the recorder even with nothing chosen yet, so electrodes clicked
+    # during the recording can be traced.
+    live_traces: bool = False
 
     log: object = None
     pace_hz: float = None
@@ -184,14 +187,17 @@ class ReplayFactory:
         return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
 
     def make_traces(self):
-        """Build the rolling trace window, or None if no electrode is chosen.
+        """Build the rolling trace window, or None if traces are not wanted.
 
-        None means nothing extra runs on the acquisition thread. Traces are
+        With `live_traces` it is built even with no electrode chosen yet, so
+        electrodes clicked during the recording can be traced; with nothing
+        chosen it returns at once on every packet. None means nothing extra
+        runs on the consumer thread at all. Traces are
         not decimated in time - a trace with gaps lies about what the
         electrode did - so what keeps the cost down is watching few channels,
         which `TraceRecorder` enforces rather than trusts.
         """
-        if not self.trace_channels:
+        if not self.trace_channels and not self.live_traces:
             return None
         from biocam.data.traces import TraceRecorder
 
@@ -319,6 +325,9 @@ class LiveFactory:
     # Electrodes whose signal is drawn as a rolling trace. Empty means the
     # trace panel does no work at all on the acquisition thread.
     trace_channels: tuple = ()
+    # Build the recorder even with nothing chosen yet, so electrodes clicked
+    # during the recording can be traced.
+    live_traces: bool = False
     _params: object = field(default=None, init=False)
 
     def __post_init__(self):
@@ -455,14 +464,17 @@ class LiveFactory:
         return LiveMonitor(self.params, n_rows=self.n_rows, n_cols=self.n_cols)
 
     def make_traces(self):
-        """Build the rolling trace window, or None if no electrode is chosen.
+        """Build the rolling trace window, or None if traces are not wanted.
 
-        None means nothing extra runs on the acquisition thread. Traces are
+        With `live_traces` it is built even with no electrode chosen yet, so
+        electrodes clicked during the recording can be traced; with nothing
+        chosen it returns at once on every packet. None means nothing extra
+        runs on the consumer thread at all. Traces are
         not decimated in time - a trace with gaps lies about what the
         electrode did - so what keeps the cost down is watching few channels,
         which `TraceRecorder` enforces rather than trusts.
         """
-        if not self.trace_channels:
+        if not self.trace_channels and not self.live_traces:
             return None
         from biocam.data.traces import TraceRecorder
 

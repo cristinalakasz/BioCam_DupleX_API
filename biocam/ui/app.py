@@ -297,6 +297,27 @@ class BioCamWindow:
         self._refresh_stim_validity()
         if hasattr(self, "lbl_analysis"):
             self._refresh_analysis()
+        self._update_live_traces()
+
+    def _on_traces_toggled(self):
+        self._refresh_analysis()
+        self._update_live_traces()
+
+    def _update_live_traces(self):
+        """Point a running recording's traces at the current selection.
+
+        Traces are a display: changing them mid-recording touches nothing on
+        disk, so unlike detection and the loop they follow the array live.
+        Detection does not - what it watches is part of the experiment, and
+        is fixed at Start.
+        """
+        if not getattr(self, "controller", None) or not self.controller.running:
+            return
+        channels = self._trace_channels(warn=False) if self.var_traces.get() else ()
+        try:
+            self.controller.set_trace_channels(channels)
+        except ValueError as exc:
+            self._log(f"Traces not changed: {exc}", "warn")
 
     def _on_array_hover(self, found):
         if found is None:
@@ -313,15 +334,22 @@ class BioCamWindow:
         """Follow the text fields when they are edited directly."""
         if getattr(self, "_syncing", False):
             return
+        def parse(text):
+            # Empty means none. `_electrodes` refuses it - right for building
+            # a stimulus, wrong here, where ignoring it left the picture on
+            # electrodes no longer written anywhere.
+            return self._electrodes(text) if text.strip() else ()
+
         try:
-            positive = self._electrodes(self.var_positive.get())
-            negative = self._electrodes(self.var_negative.get())
+            positive = parse(self.var_positive.get())
+            negative = parse(self.var_negative.get())
         except Exception:  # noqa: BLE001 - a half-typed field is not an error
             return
         self.array.set_selection(
             [(e.row, e.col) for e in positive],
             [(e.row, e.col) for e in negative],
         )
+        self._update_live_traces()
 
     def _build_stimulation(self, frame):
         tk, ttk = self.tk, self.ttk
@@ -465,7 +493,7 @@ class BioCamWindow:
         row += 1
         ttk.Checkbutton(
             frame, text="Draw traces for the selected electrodes",
-            variable=self.var_traces, command=self._refresh_analysis,
+            variable=self.var_traces, command=self._on_traces_toggled,
         ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         ttk.Label(frame, text="Threshold (sigmas)").grid(
@@ -570,7 +598,9 @@ class BioCamWindow:
 
             if not selected:
                 lines.append(
-                    "Traces on, but no electrodes are selected - click some.")
+                    "Traces on, but no electrodes are selected - click some. "
+                    "During a recording, traces follow the electrodes you "
+                    "click.")
             elif selected > MAX_TRACE_CHANNELS:
                 lines.append(
                     f"Traces: the first {MAX_TRACE_CHANNELS} of {selected} "
@@ -606,7 +636,9 @@ class BioCamWindow:
                     "is delivered anywhere.")
 
         if self.controller.running:
-            lines.append("Settings apply to the NEXT recording.")
+            lines.append(
+                "Detection, sorting and loop settings apply to the NEXT "
+                "recording. Traces follow the selection now.")
         self.lbl_analysis.configure(text="\n\n".join(lines))
         if self.controller.running:
             # Sorting is not a background job. It fits k-means and a silhouette
@@ -1112,9 +1144,13 @@ class BioCamWindow:
             "n_rows": self.n_rows,
             "n_cols": self.n_cols,
             "trace_channels": self._trace_channels(),
+            # Always: with nothing chosen the recorder returns at once, and
+            # it lets "Draw traces" be ticked, or electrodes clicked, after
+            # Start.
+            "live_traces": True,
         }
 
-    def _trace_channels(self) -> tuple:
+    def _trace_channels(self, warn: bool = True) -> tuple:
         """The electrodes whose signal is drawn, in array order.
 
         The array selection again, capped: a trace is for looking at closely
@@ -1128,14 +1164,13 @@ class BioCamWindow:
         if not self.var_traces.get():
             return ()
         channels = self._selected_channels()
-        if len(channels) > MAX_TRACE_CHANNELS:
+        if len(channels) > MAX_TRACE_CHANNELS and warn:
             self._log(
                 f"{len(channels)} electrodes are selected but only "
                 f"{MAX_TRACE_CHANNELS} can be traced at once; tracing the "
                 f"first {MAX_TRACE_CHANNELS}. Detection still watches all of "
                 "them.", "warn")
-            channels = channels[:MAX_TRACE_CHANNELS]
-        return tuple(channels)
+        return tuple(channels[:MAX_TRACE_CHANNELS])
 
     def _make_live_factory(self, output, duration):
         # Imported here, never at module scope: this module must stay

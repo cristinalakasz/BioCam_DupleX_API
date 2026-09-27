@@ -84,6 +84,23 @@ class TraceSnapshot:
         return lo, hi
 
 
+def _validated(channels, total) -> tuple:
+    """Channels as a tuple of ints, or ValueError saying what is wrong."""
+    channels = tuple(int(c) for c in channels)
+    if len(channels) > MAX_TRACE_CHANNELS:
+        raise ValueError(
+            f"traces are for looking at closely, so at most "
+            f"{MAX_TRACE_CHANNELS} channels can be watched at once; "
+            f"{len(channels)} were given"
+        )
+    for channel in channels:
+        if not 0 <= channel < total:
+            raise ValueError(
+                f"channel {channel} is outside the {total}-channel array"
+            )
+    return channels
+
+
 class TraceRecorder:
     """Keeps a rolling, peak-preserving window for a few channels.
 
@@ -95,19 +112,8 @@ class TraceRecorder:
     def __init__(self, params, channels, *, columns: int = DEFAULT_COLUMNS,
                  span_sec: float = DEFAULT_SPAN_SEC,
                  as_microvolts: bool = True):
-        channels = [int(c) for c in channels]
-        if len(channels) > MAX_TRACE_CHANNELS:
-            raise ValueError(
-                f"traces are for looking at closely, so at most "
-                f"{MAX_TRACE_CHANNELS} channels can be watched at once; "
-                f"{len(channels)} were given"
-            )
         total = params.total_channels
-        for channel in channels:
-            if not 0 <= channel < total:
-                raise ValueError(
-                    f"channel {channel} is outside the {total}-channel array"
-                )
+        channels = _validated(channels, total)
         if columns < 1:
             raise ValueError("a trace needs at least one column")
 
@@ -117,7 +123,6 @@ class TraceRecorder:
         self.as_microvolts = as_microvolts
 
         self._np = np
-        self._indices = np.asarray(channels, dtype=np.intp)
         self._dtype = DTYPE_BY_BYTE_SIZE[params.ch_sample_byte_size]
         self._total_channels = total
         self._bytes_per_frame = params.bytes_per_frame
@@ -131,14 +136,6 @@ class TraceRecorder:
         self.seconds_per_column = (
             self._frames_per_column / params.frame_rate_hz)
 
-        n = len(channels)
-        # Ring buffers. Written at `_write`, which wraps; `filled` says how
-        # much of the ring has ever been written, so a partly-filled window
-        # draws correctly instead of showing zeros as signal.
-        self._min = np.zeros((n, self.columns), dtype=np.float64)
-        self._max = np.zeros((n, self.columns), dtype=np.float64)
-        self._write = 0
-        self.filled = 0
         # Held for the array writes in `_append` and the copy in `snapshot`,
         # and for nothing else.
         #
@@ -154,16 +151,75 @@ class TraceRecorder:
         # the trace update already costs; the decode and the min/max reduction
         # stay outside it, so only the few columns being written are covered.
         self._lock = threading.Lock()
+        self._allocate(channels)
 
-        # Frames carried over from the previous packet, so a column spans the
-        # right number of frames even when packets do not divide evenly into
-        # columns. Bounded by `_frames_per_column`.
-        self._carry = np.zeros((0, n), dtype=np.float64)
+        # A change of channels asked for by the UI thread, as (number,
+        # channels). Posted there and applied here, on the consumer thread,
+        # at the start of the next packet - so the buffers are never
+        # reallocated under a packet being folded in, and the UI thread never
+        # waits on the data path. A single attribute store is atomic, and the
+        # number means a request posted while the previous one is being
+        # applied is not lost.
+        self._request = None
+        self._applied_request = 0
+        self.channel_changes = 0
 
         self.packets_seen = 0
         self.decode_errors = 0
         self.max_observation_us = 0.0
         self.slow_observations = 0
+
+    def _allocate(self, channels) -> None:
+        """Empty buffers for `channels`, installed under the lock.
+
+        Allocated first and only assigned under the lock, which is held "for
+        the array writes and for nothing else" - a snapshot on the UI thread
+        waits for seven assignments, not for the allocation.
+        """
+        n = len(channels)
+        indices = np.asarray(channels, dtype=np.intp)
+        # Ring buffers. Written at `_write`, which wraps; `filled` says how
+        # much of the ring has ever been written, so a partly-filled window
+        # draws correctly instead of showing zeros as signal.
+        lows = np.zeros((n, self.columns), dtype=np.float64)
+        highs = np.zeros((n, self.columns), dtype=np.float64)
+        # Frames carried over from the previous packet, so a column spans the
+        # right number of frames even when packets do not divide evenly into
+        # columns. Bounded by `_frames_per_column`.
+        carry = np.zeros((0, n), dtype=np.float64)
+        with self._lock:
+            self.channels = channels
+            self._indices = indices
+            self._min, self._max = lows, highs
+            self._write = 0
+            self.filled = 0
+            self._carry = carry
+
+    # -- the UI thread's entry point for changing channels ----------------
+
+    def request_channels(self, channels) -> None:
+        """Watch `channels` from the next packet on. UI thread only.
+
+        One posting thread is assumed: the request number is read, incremented
+        and stored without a lock, so two concurrent callers could post the
+        same number and one request would be dropped.
+
+        Validated here, on the caller's thread, where a refusal can be shown
+        to the operator. The window restarts empty: keeping the old columns
+        under a new channel's name would draw one electrode's history as
+        another's.
+        """
+        channels = _validated(channels, self._total_channels)
+        number = (self._request[0] if self._request else 0) + 1
+        self._request = (number, channels)
+
+    def _apply_request(self) -> None:
+        request = self._request
+        if request is None or request[0] == self._applied_request:
+            return
+        self._applied_request = request[0]
+        self._allocate(request[1])
+        self.channel_changes += 1
 
     # -- the consumer thread's entry point --------------------------------
 
@@ -174,9 +230,12 @@ class TraceRecorder:
         closed loop, a failure here disconnects the traces rather than the
         recording: nobody loses a session because a picture stopped drawing.
         """
+        # Started before the request is applied, so a reallocation after a
+        # click is counted in the timing like any other cost on this thread.
+        started = time.perf_counter()
+        self._apply_request()
         if not self.channels:
             return False
-        started = time.perf_counter()
         try:
             np_ = self._np
             frames = len(packet.payload) // self._bytes_per_frame
@@ -261,11 +320,15 @@ class TraceRecorder:
         # rejects subsampling to avoid.
         unit = "uV" if self.as_microvolts else "counts"
         with self._lock:
+            # Read with the arrays: a change of channels reallocates both
+            # under this lock, and names read outside it could belong to
+            # different buffers.
+            channels = self.channels
             filled, write = self.filled, self._write
             if not filled:
-                return TraceSnapshot(self.channels,
-                                     np.zeros((len(self.channels), 0)),
-                                     np.zeros((len(self.channels), 0)),
+                return TraceSnapshot(channels,
+                                     np.zeros((len(channels), 0)),
+                                     np.zeros((len(channels), 0)),
                                      0, self.seconds_per_column, unit)
             if filled < self.columns:
                 lows = self._min[:, :filled].copy()
@@ -276,7 +339,7 @@ class TraceRecorder:
                 # new array, so this is already a copy.
                 lows = np.roll(self._min, -write, axis=1)
                 highs = np.roll(self._max, -write, axis=1)
-        return TraceSnapshot(self.channels, lows, highs, filled,
+        return TraceSnapshot(channels, lows, highs, filled,
                              self.seconds_per_column, unit)
 
     def warnings(self) -> list:
@@ -289,7 +352,7 @@ class TraceRecorder:
         if self.slow_observations:
             problems.append(
                 f"{self.slow_observations} trace updates took longer than "
-                f"{SLOW_OBSERVATION_US:g} us on the acquisition thread "
+                f"{SLOW_OBSERVATION_US:g} us on the consumer thread "
                 f"(slowest {self.max_observation_us:.0f} us). That time comes "
                 "out of the packet queue's drain - watch fewer channels."
             )
@@ -302,4 +365,5 @@ class TraceRecorder:
             "trace_decode_errors": self.decode_errors,
             "trace_max_observation_us": round(self.max_observation_us, 1),
             "trace_slow_observations": self.slow_observations,
+            "trace_channel_changes": self.channel_changes,
         }
