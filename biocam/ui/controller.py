@@ -404,6 +404,19 @@ class SessionController:
             return None
         return recorder.snapshot()
 
+    def set_trace_channels(self, channels) -> bool:
+        """Trace `channels` from the next packet on. UI thread.
+
+        Returns False when there is nothing to change: no recording, or one
+        started with traces off. Raises ValueError for channels the recorder
+        refuses, so the caller can say why.
+        """
+        recorder = self._traces
+        if recorder is None or not self.running:
+            return False
+        recorder.request_channels(channels)
+        return True
+
     def trace_channels(self) -> list:
         recorder = self._traces
         return [] if recorder is None else list(recorder.channels)
@@ -479,7 +492,11 @@ class SessionController:
             requested_duration_sec=requested_duration_sec,
             detection=detection_settings(self._loop),
             closed_loop=closed_loop_settings(self._loop),
-            traces={"channels": self.trace_channels()},
+            traces={
+                "channels": self.trace_channels(),
+                "changed_during_run": (
+                    self._traces.channel_changes if self._traces else 0),
+            },
             stimulus=stimulus_settings(stimulus_plan, stimulus_pattern),
             outcome=outcome_from(state, self._loop),
             warnings=tuple(state.warnings),

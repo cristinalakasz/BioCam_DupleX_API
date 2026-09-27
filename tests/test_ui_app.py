@@ -1099,3 +1099,70 @@ def test_an_electrode_off_the_array_does_not_fail_the_recording(root, tmp_path, 
     assert snapshot.error == ""
     assert snapshot.frames > 0
     assert window.controller.trace_channels() == [1]
+
+
+# --------------------------------------------------------------------------
+# clicking an electrode while recording shows its trace
+# --------------------------------------------------------------------------
+
+def test_clicking_an_electrode_while_recording_traces_it(root, tmp_path, demo):
+    from biocam.ui.arrayview import cell_bounds
+
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("")
+    window.var_negative.set("")
+    root.update()
+    while_running(root, window)
+    x0, y0, _, _ = cell_bounds(2, 1, window.array.cell)
+    window.array._click(type("E", (), {"x": x0 + 1, "y": y0 + 1})(), "positive")
+    deadline = time.time() + 10
+    while time.time() < deadline and window.controller.trace_channels() != [2]:
+        root.update()
+        time.sleep(0.02)
+    window._on_stop()
+    pump(root, window)
+    assert window.controller.trace_channels() == [2]
+
+
+def test_traces_can_be_switched_on_mid_recording(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_traces.set(False)
+    window.var_positive.set("1,2")
+    root.update()
+    while_running(root, window)
+    window.var_traces.set(True)
+    window._on_traces_toggled()
+    deadline = time.time() + 10
+    while time.time() < deadline and window.controller.trace_channels() != [1]:
+        root.update()
+        time.sleep(0.02)
+    window._on_stop()
+    pump(root, window)
+    assert window.controller.trace_channels() == [1]
+
+
+def test_the_panel_says_traces_follow_the_selection_live(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,2")
+    root.update()
+    while_running(root, window)
+    window._refresh_analysis()
+    text = window.lbl_analysis.cget("text")
+    window._on_stop()
+    pump(root, window)
+    assert "follow" in text
+
+
+def test_emptying_the_electrode_fields_clears_the_array(root, tmp_path, demo):
+    # An empty field is "none", not a half-typed entry. Ignoring it left the
+    # picture - and the traces and detection that follow it - on electrodes
+    # no longer written anywhere.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    root.update()
+    window.var_positive.set("")
+    window.var_negative.set("  ")
+    root.update()
+    assert window.array.positive == []
+    assert window.array.negative == []

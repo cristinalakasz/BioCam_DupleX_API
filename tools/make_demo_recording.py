@@ -1,14 +1,19 @@
 """Make a small synthetic recording, so the UI can be driven with no instrument.
 
     python tools/make_demo_recording.py demo
+    python tools/make_demo_recording.py demo --seconds 60
 
-Writes `demo.raw` and `demo_meta.json`. The signal is not physiological and
+Writes `demo.raw` and `demo_meta.json`. Two seconds by default, which replays
+in about four; pass `--seconds` for a run long enough to click electrodes and
+watch their traces (about 38 MB per second of recording). The signal is not physiological and
 is not meant to be: it exists so the window has packets to move, gaps to
 report and a clock to advance. Anything read off it as science would be read
 off a sine wave and some noise.
 """
 
+import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -36,23 +41,34 @@ N_CHANNELS = 1024        # 32 x 32; the DupleX is 64 x 64
 SECONDS = 2.0
 
 
+def _seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--seconds must be a number, got {value!r}") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--seconds must be above zero, got {value!r}")
+    return seconds
+
+
 def main(argv=None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ("-h", "--help"):
-        print(__doc__ or "")
-        print("usage: python tools/make_demo_recording.py [prefix]")
-        print()
-        print("  prefix  what to name the pair of files (default: demo),")
-        print("          producing <prefix>.raw and <prefix>_meta.json")
-        return 0
-    if argv and argv[0].startswith("-"):
-        # Otherwise an unrecognised flag becomes the filename, and asking for
-        # help writes a 76 MB file called --help.raw. Which it did.
-        print(f"error: unknown option {argv[0]!r}. This takes a filename "
-              "prefix, not flags; try --help.", file=sys.stderr)
-        return 2
-    stem = Path(argv[0]) if argv else Path("demo")
-    n_frames = int(FRAME_RATE_HZ * SECONDS)
+    # argparse rather than hand parsing: an unrecognised flag is an error,
+    # not a filename - asking for help once wrote a 76 MB file called
+    # --help.raw.
+    parser = argparse.ArgumentParser(
+        prog="python tools/make_demo_recording.py",
+        description="Write a synthetic recording to drive the window with.")
+    parser.add_argument("prefix", nargs="?", default="demo",
+                        help="names the pair of files: <prefix>.raw and "
+                             "<prefix>_meta.json (default: demo)")
+    parser.add_argument("--seconds", type=_seconds, default=SECONDS,
+                        help=f"length of the recording (default {SECONDS:g}); "
+                             "about 38 MB per second")
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    stem = Path(args.prefix)
+    n_frames = int(FRAME_RATE_HZ * args.seconds)
 
     rng = np.random.default_rng(20260817)
     side = int(round(N_CHANNELS ** 0.5))
@@ -102,7 +118,8 @@ def main(argv=None) -> int:
         times = []
         frame = int(rng.integers(200, 800))
         while frame < n_frames - len(wide) - 2:
-            times.append((frame, rng.random() < 0.5))
+            shape = narrow if rng.random() < 0.5 else wide
+            times.append((frame, shape * rng.normal(1.0, 0.06)))
             # Busy enough that two seconds gives each electrode well over
             # the twenty waveforms a sorter needs. A demo that cannot reach
             # the minimum only ever demonstrates the refusal.
@@ -110,23 +127,31 @@ def main(argv=None) -> int:
                                       0.05 * FRAME_RATE_HZ))
         spike_times[channel] = times
 
-    data = np.empty((n_frames, N_CHANNELS), dtype=np.uint16)
-    # Written in blocks: the whole array as float64 would be several GB.
+    # Written block by block straight to disk: the whole recording in memory
+    # is 38 MB a second, which a long demo cannot afford. Only the spiking
+    # channels are kept, for the self-check below.
+    channels = sorted(spike_times)
+    kept = np.empty((n_frames, len(channels)), dtype=np.uint16)
     block = 500
-    for start in range(0, n_frames, block):
-        stop = min(start + block, n_frames)
-        drift = 2048 + 120 * np.sin(2 * np.pi * 3.0 * t[start:stop])[:, None]
-        chunk = drift + rng.normal(0, 1, (stop - start, N_CHANNELS)) * gain
-        for channel, times in spike_times.items():
-            for frame, is_narrow in times:
-                shape = narrow if is_narrow else wide
-                if start <= frame < stop - len(shape):
-                    at = frame - start
-                    chunk[at:at + len(shape), channel] += (
-                        shape * rng.normal(1.0, 0.06))
-        np.clip(chunk, 0, 4095, out=chunk)
-        data[start:stop] = chunk.astype(np.uint16)
-    data.tofile(stem.with_suffix(".raw"))
+    with open(stem.with_suffix(".raw"), "wb") as raw:
+        for start in range(0, n_frames, block):
+            stop = min(start + block, n_frames)
+            drift = 2048 + 120 * np.sin(2 * np.pi * 3.0 * t[start:stop])[:, None]
+            chunk = drift + rng.normal(0, 1, (stop - start, N_CHANNELS)) * gain
+            for channel, times in spike_times.items():
+                for frame, waveform in times:
+                    # The part of the spike inside this block. A spike that
+                    # straddles two blocks is drawn in both halves; it used
+                    # to be skipped, and still counted as planted.
+                    lo = max(frame, start)
+                    hi = min(frame + len(waveform), stop)
+                    if lo < hi:
+                        chunk[lo - start:hi - start, channel] += (
+                            waveform[lo - frame:hi - frame])
+            np.clip(chunk, 0, 4095, out=chunk)
+            out = chunk.astype(np.uint16)
+            out.tofile(raw)
+            kept[start:stop] = out[:, channels]
 
     planted = sum(len(v) for v in spike_times.values())
     print(f"  {planted} spikes planted on {len(spiking)} electrodes "
@@ -134,7 +159,7 @@ def main(argv=None) -> int:
     print("  spiking electrodes (1-based row,col): "
           + ", ".join(f"{r},{c}" for r, c in spiking))
 
-    _check_the_spikes_are_findable(data, spike_times, planted)
+    _check_the_spikes_are_findable(kept, planted)
 
     meta = {
         "frame_rate_hz": FRAME_RATE_HZ,
@@ -146,16 +171,17 @@ def main(argv=None) -> int:
         "min_digital_value": 0,
         "max_digital_value": 4095,
         "note": ("Synthetic. Generated by tools/make_demo_recording.py for "
-                 "driving the UI without an instrument. Not real signal, and "
-                 "the frame rate is 1 kHz rather than the instrument's "
-                 "18.5 kHz so that a 4096-electrode demo stays a sane size."),
+                 "driving the UI without an instrument. Not real signal: a "
+                 "3 Hz sine, noise, two hotspots, dead electrodes and planted "
+                 "spikes, on a 32x32 array at the instrument's real frame "
+                 "rate (the DupleX is 64x64)."),
     }
     meta_path = stem.with_name(stem.stem + "_meta.json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     size_mb = stem.with_suffix(".raw").stat().st_size / 1e6
     print(f"{stem.with_suffix('.raw')}  ({size_mb:.1f} MB, {n_frames:,} frames, "
-          f"{N_CHANNELS} channels, {SECONDS:g} s)")
+          f"{N_CHANNELS} channels, {args.seconds:g} s)")
     print(f"{meta_path}")
     print()
     print("Drive the window with it:")
@@ -164,7 +190,7 @@ def main(argv=None) -> int:
     return 0
 
 
-def _check_the_spikes_are_findable(data, spike_times, planted):
+def _check_the_spikes_are_findable(block, planted):
     """Run the real detector over what was just written, and say what it found.
 
     A generator that reports planting spikes while planting empty arrays is
@@ -176,9 +202,8 @@ def _check_the_spikes_are_findable(data, spike_times, planted):
     """
     from biocam.analysis.spikes import SpikeDetector
 
-    channels = sorted(spike_times)
-    block = data[:, channels].astype(np.float64)
-    detector = SpikeDetector(len(channels), FRAME_RATE_HZ,
+    block = block.astype(np.float64)
+    detector = SpikeDetector(block.shape[1], FRAME_RATE_HZ,
                              threshold_sigmas=5.0)
     found = 0
     for start in range(0, block.shape[0], 512):

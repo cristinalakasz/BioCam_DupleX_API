@@ -219,3 +219,60 @@ def test_the_snapshot_is_a_copy():
     # The UI draws from a snapshot on another thread; it must not change
     # underneath while it is being drawn.
     assert snap.maxima[0, 0] == 50
+
+
+# --------------------------------------------------------------------------
+# choosing different electrodes while it runs
+# --------------------------------------------------------------------------
+
+def test_a_channel_request_takes_effect_on_the_next_packet():
+    # The UI thread only posts the request; the consumer thread applies it,
+    # so the buffers are never resized under a packet being folded in.
+    r = recorder(channels=(0, 1), columns=4, span_sec=0.004)
+    r.observe(packet_from(flat(4)))
+    r.request_channels((5,))
+    assert r.channels == (0, 1)
+    r.observe(packet_from(flat(4)))
+    assert r.channels == (5,)
+    assert r.snapshot().channels == (5,)
+
+
+def test_the_new_channels_start_from_an_empty_window():
+    # Keeping the old columns under a new channel's name would draw one
+    # electrode's history as another's.
+    r = recorder(channels=(0,), columns=4, span_sec=0.004)
+    values = flat(1)                 # one frame = one column here
+    values[:, 3] = 900
+    r.observe(packet_from(flat(4)))
+    r.request_channels((3,))
+    r.observe(packet_from(values))
+    snap = r.snapshot()
+    assert snap.filled == 1
+    assert snap.maxima[0, 0] == 900
+
+
+def test_a_recorder_can_start_with_nothing_and_be_given_channels():
+    r = recorder(channels=())
+    assert not r.observe(packet_from(flat(4)))
+    r.request_channels((2,))
+    assert r.observe(packet_from(flat(4)))
+
+
+def test_a_bad_request_is_refused_on_the_callers_thread():
+    # Refused where the operator can be told, not discovered later on the
+    # consumer thread where it could only be counted.
+    r = recorder()
+    with pytest.raises(ValueError):
+        r.request_channels(tuple(range(MAX_TRACE_CHANNELS + 1)))
+    with pytest.raises(ValueError):
+        r.request_channels((99,))
+    assert r.channels == (0, 1)
+
+
+def test_changes_are_counted_for_the_session_record():
+    r = recorder()
+    r.request_channels((2,))
+    r.observe(packet_from(flat(4)))
+    r.request_channels((3,))
+    r.observe(packet_from(flat(4)))
+    assert r.summary()["trace_channel_changes"] == 2
