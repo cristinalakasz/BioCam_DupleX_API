@@ -1166,3 +1166,48 @@ def test_emptying_the_electrode_fields_clears_the_array(root, tmp_path, demo):
     root.update()
     assert window.array.positive == []
     assert window.array.negative == []
+
+
+# --------------------------------------------------------------------------
+# nothing the operator must read can end up out of reach
+# --------------------------------------------------------------------------
+
+def test_the_reason_sits_directly_under_stimulate_now(root, tmp_path, demo):
+    # The README and the lab protocol both say so, and the operator is told
+    # to copy that text word for word. It used to be below the whole Train
+    # section, and was pushed off the bottom once the train text grew.
+    window = a_window(root, tmp_path, demo)
+    button = window.btn_stim.grid_info()
+    reason = window.lbl_stim.grid_info()
+    assert reason["row"] == button["row"] + 1
+    assert reason["in"] is button["in"]
+
+
+def test_a_column_too_tall_for_the_window_scrolls(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    root.geometry("1320x420")
+    shown(root)
+    column = window.scrollers["Stimulus"]
+    assert column.scrollbar.winfo_ismapped()
+    column.canvas.yview_moveto(1.0)
+    root.update()
+    # The last widget in the column is now inside the visible area.
+    canvas_bottom = column.canvas.winfo_rooty() + column.canvas.winfo_height()
+    last = window.lbl_train
+    assert last.winfo_rooty() + last.winfo_height() <= canvas_bottom + 1
+
+
+def test_a_column_that_fits_shows_no_scrollbar(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    root.geometry("1400x1400")
+    shown(root)
+    assert not window.scrollers["Recording"].scrollbar.winfo_ismapped()
+
+
+def test_text_wraps_to_the_column_width(root, tmp_path, demo):
+    # The scrolling frame must be as wide as its column, or labels that wrap
+    # to the column would run under the scrollbar or leave a blank strip.
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    column = window.scrollers["Stimulus"]
+    assert abs(column.inner.winfo_width() - column.canvas.winfo_width()) <= 1
