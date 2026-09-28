@@ -1462,11 +1462,23 @@ class BioCamWindow:
         """Repaint the trace strip. UI thread only, from a copied snapshot."""
         if not hasattr(self, "traces"):
             return
-        snapshot = self.controller.traces()
-        if snapshot is None:
+        if not self.var_traces.get():
             self.traces.set_message(
-                "Traces are off. Tick \"Draw traces\" and select electrodes "
-                "on the array.")
+                "Traces are off. Tick \"Draw traces\" to see the selected "
+                "electrodes here.")
+            return
+        snapshot = self.controller.traces()
+        if snapshot is None or not self.controller.running and not (
+                snapshot and snapshot.has_data):
+            # Not recording, or a recording that traced nothing: say what
+            # will happen, rather than asking for a box already ticked.
+            self.traces.set_message(
+                "Traces appear here while recording: the selected electrodes, "
+                "and any you click during the recording.")
+            return
+        if not snapshot.channels:
+            self.traces.set_message(
+                "No electrodes traced yet - click some on the array.")
             return
         if not snapshot.has_data:
             self.traces.set_message("Waiting for the first packet...")
