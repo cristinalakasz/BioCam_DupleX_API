@@ -60,9 +60,12 @@ class TraceStripView:
         c.delete("all")
         snapshot = self._snapshot
         if snapshot is None or not snapshot.has_data:
+            # Wrapped to the box: a message wider than the strip ran off
+            # both edges.
             c.create_text(self.width // 2, self.height // 2,
                           text=self._message, fill=QUIET,
-                          font=("Segoe UI", 9))
+                          font=("Segoe UI", 9), justify="center",
+                          width=max(60, self.width - 16))
             return
 
         n = len(snapshot.channels)

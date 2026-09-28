@@ -189,6 +189,9 @@ class SessionController:
         from biocam.control import StimulationQueue
 
         self.stim_queue = stim_queue if stim_queue is not None else StimulationQueue()
+        # A queue passed in is kept across recordings (tests observe it); the
+        # default one is replaced at every start - see start().
+        self._own_stim_queue = stim_queue is None
         self._events = _EventRing(capacity=event_capacity)
         # maxlen, so appending IS the eviction - one atomic C call instead
         # of len() then popleft() then append(). The UI thread reads this
@@ -241,6 +244,15 @@ class SessionController:
         self._monitor = None
         self._loop = None
         self._traces = None
+        if self._own_stim_queue:
+            # A fresh queue per recording. Its counts go into the status
+            # panel and the session record, and carried over they read 4, 5,
+            # 6 for a recording that delivered 1, 2, 3; a suspension after
+            # slow dispatches also outlived the recording that earned it.
+            # Anything still queued belongs to the recording that ended.
+            from biocam.control import StimulationQueue
+
+            self.stim_queue = StimulationQueue()
         self._events.drain()
         self._waveforms.clear()
         self._waveforms_seen = 0

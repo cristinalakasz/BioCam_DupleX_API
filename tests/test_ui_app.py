@@ -1255,3 +1255,81 @@ def test_the_hover_and_scale_lines_wrap_instead_of_running_off(root, tmp_path, d
     for label in (window.lbl_hover, window.lbl_scale):
         assert int(label.cget("wraplength")) > 0
         assert label.winfo_reqwidth() <= label.winfo_width() + 1
+
+
+# --------------------------------------------------------------------------
+# each recording's numbers are its own
+# --------------------------------------------------------------------------
+
+def test_stimuli_delivered_counts_this_recording_only(root, tmp_path, demo):
+    # T6 asks for 1, 2, 3 on each repeat; a count carried over from the
+    # previous recording read 4, 5, 6 - and went into its session record.
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("1,1")
+    window.var_negative.set("2,2")
+    root.update()
+    while_running(root, window)
+    window._on_stimulate()
+    deadline = time.time() + 10
+    while time.time() < deadline and window.controller.snapshot().stimuli_delivered < 1:
+        root.update()
+        time.sleep(0.02)
+    window._on_stop()
+    pump(root, window)
+    assert window.controller.snapshot().stimuli_delivered == 1
+
+    while_running(root, window)
+    window._on_stop()
+    snapshot = pump(root, window)
+    assert snapshot.stimuli_delivered == 0
+
+
+# --------------------------------------------------------------------------
+# the trace box says what is actually going on
+# --------------------------------------------------------------------------
+
+def _trace_message(window):
+    return window.traces._message
+
+
+def test_before_recording_the_trace_box_says_traces_come_with_a_recording(
+        root, tmp_path, demo):
+    # It used to say to tick a box that was already ticked.
+    window = a_window(root, tmp_path, demo)
+    window._render_traces()
+    assert "recording" in _trace_message(window).lower()
+    assert "Tick" not in _trace_message(window)
+
+
+def test_with_traces_unticked_the_trace_box_says_so(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_traces.set(False)
+    window._render_traces()
+    assert "Draw traces" in _trace_message(window)
+
+
+def test_recording_with_nothing_selected_asks_for_a_click(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    window.var_positive.set("")
+    window.var_negative.set("")
+    root.update()
+    while_running(root, window)
+    pump_until = time.time() + 2
+    while time.time() < pump_until:
+        root.update()
+        time.sleep(0.02)
+    window._render_traces()
+    message = _trace_message(window)
+    window._on_stop()
+    pump(root, window)
+    assert "click" in message.lower()
+
+
+def test_the_trace_message_wraps_inside_the_box(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo)
+    shown(root)
+    window._render_traces()
+    canvas = window.traces.canvas
+    [item] = [i for i in canvas.find_all() if canvas.type(i) == "text"]
+    x0, _, x1, _ = canvas.bbox(item)
+    assert x0 >= 0 and x1 <= canvas.winfo_width()
