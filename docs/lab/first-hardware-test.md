@@ -119,6 +119,10 @@ Do this once, on the lab PC. Each step says what you should see.
    ```
    A recording writes about **152 MB per second** (9 GB per minute).
 
+**On a small screen**, a column of the window may show a **scrollbar** on its
+right. Scroll it (mouse wheel over the column) to reach anything below the
+bottom edge; nothing in the window is hidden without one.
+
 **Keep this PowerShell window open for the whole session**, in the repository
 folder, with `(.venv)` at the start of the prompt. Every command below is typed
 there.

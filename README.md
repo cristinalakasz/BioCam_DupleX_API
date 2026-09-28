@@ -156,8 +156,10 @@ nothing leaves the machine. If in doubt, look at the banner.
 resized by dragging the edge between it and its neighbour**: the columns
 sideways, the log up and down. The array redraws its electrodes larger or
 smaller to fit, and the traces follow the column's width. No column can be
-dragged shut, so the reason written under a greyed-out button always stays
-visible.
+dragged shut. When a column's content is taller than the window (a small
+screen, or Windows display scaling), a **scrollbar** appears on its right and
+the mouse wheel scrolls it, so the reason written under a greyed-out button can
+always be reached.
 
 **Every refusal is explained in place.** If a button is greyed out, the reason
 is written beneath it and updates as you type.
@@ -532,7 +534,7 @@ dedicated tool for that. Every number here comes from synthetic data.
 | `ModuleNotFoundError: No module named 'clr'` | `pythonnet` missing (preflight reports it) | On the lab machine: `pip install -r requirements.txt` |
 | Verdict `gaps_detected`, or `queue_overflows` > 0 | Too much work per packet, or a slow disk | Increase `--packet-ms`, watch fewer electrodes, check the drive against [`storage-setup.md`](docs/lab/storage-setup.md). For the closed loop, see [`closed-loop-budget.md`](docs/lab/closed-loop-budget.md): 32 watched channels at 1 ms packets do not fit. |
 | Warning "activity sample(s) took longer than 500 us" | The array display was slow on the data thread | Harmless once; if frequent, report it |
-| *Stimulate now* greyed out | Its reason is written beneath it; usually "no recording running" | Start a recording first. Drag the log's edge down if the reason is hidden. |
+| *Stimulate now* greyed out | Its reason is written beneath it; usually "no recording running" | Start a recording first. If the column has a scrollbar, scroll down to read the reason. |
 | *Sort spikes so far* greyed out | Recording is running, no technique chosen, or no spikes collected (detection off) | Stop, tick detection, record, then sort |
 
 ---

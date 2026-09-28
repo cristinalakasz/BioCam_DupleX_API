@@ -147,20 +147,50 @@ class BioCamWindow:
         self.rows.add(self.columns, minsize=200, stretch="never")
 
         # The array column takes whatever the window gains or loses; the
-        # others keep the width they were dragged to.
-        for build, title, padding, minsize, stretch in (
-            (self._build_recording, "Recording", 8, 200, "never"),
-            (self._build_array, "Electrode array", 6, 240, "always"),
-            (self._build_stimulation, "Stimulus", 8, 200, "never"),
-            (self._build_analysis, "Spikes and closed loop", 8, 220, "never"),
+        # others keep the width they were dragged to. Those three scroll when
+        # their content is taller than the window allows (a short screen, or
+        # Windows display scaling), so no reason written under a button can
+        # end up below the bottom edge. The array does not: it resizes.
+        from biocam.ui.scrollcolumn import ScrollableColumn
+
+        self.scrollers = {}
+        for build, title, padding, minsize, stretch, scrolls in (
+            (self._build_recording, "Recording", 8, 200, "never", True),
+            (self._build_array, "Electrode array", 6, 240, "always", False),
+            (self._build_stimulation, "Stimulus", 8, 200, "never", True),
+            (self._build_analysis, "Spikes and closed loop", 8, 220, "never",
+             True),
         ):
             frame = ttk.LabelFrame(self.columns, text=title, padding=padding)
-            build(frame)
+            if scrolls:
+                column = ScrollableColumn(frame, tk, ttk)
+                self.scrollers[title] = column
+                build(column.inner)
+            else:
+                build(frame)
             self.columns.add(frame, minsize=minsize, stretch=stretch)
+        self.root.bind_all("<MouseWheel>", self._on_mouse_wheel, add="+")
 
         log = ttk.LabelFrame(self.rows, text="Session log", padding=6)
         self._build_log(log)
         self.rows.add(log, minsize=80, stretch="always")
+
+    def _on_mouse_wheel(self, event):
+        """Scroll the column under the pointer, if it has anything to scroll.
+
+        Bound once for the whole window rather than per column: entering a
+        widget inside a column fires <Leave> on the column itself, so
+        enter/leave bookkeeping would drop the wheel over every entry field.
+        """
+        from biocam.ui.scrollcolumn import column_under, wheel_units
+
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, self.tk.TclError):
+            return
+        column = column_under(widget, self.scrollers.values())
+        if column is not None:
+            column.scroll(wheel_units(event.delta))
 
     def _build_recording(self, frame):
         tk, ttk = self.tk, self.ttk
@@ -175,8 +205,10 @@ class BioCamWindow:
             row=row, column=1, sticky="w")
         row += 1
         ttk.Label(frame, text="Name (optional)").grid(row=row, column=0, sticky="w")
+        # Shrinks with the column instead of running past its edge.
+        frame.columnconfigure(1, weight=1)
         ttk.Entry(frame, textvariable=self.var_name, width=22).grid(
-            row=row, column=1, sticky="w", pady=2)
+            row=row, column=1, sticky="ew", pady=2)
         row += 1
         ttk.Label(frame, text="Duration (s)").grid(row=row, column=0, sticky="w")
         self.entry_duration = ttk.Entry(
@@ -424,6 +456,14 @@ class BioCamWindow:
                                    command=self._on_stimulate, state="disabled")
         self.btn_stim.grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
         row += 1
+        # Directly beneath the button, as the README and the lab protocol say:
+        # it is the reason the button is greyed out, or the pulse it will send.
+        self.lbl_stim = tk.Label(frame, text="", fg=COLOURS["idle"],
+                                 wraplength=320, justify="left",
+                                 font=("Segoe UI", 9))
+        self.lbl_stim.grid(row=row, column=0, columnspan=2, sticky="w",
+                           pady=(0, 6))
+        row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=4)
@@ -453,12 +493,6 @@ class BioCamWindow:
                                   wraplength=320, justify="left",
                                   font=("Segoe UI", 9))
         self.lbl_train.grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
-
-        self.lbl_stim = tk.Label(frame, text="", fg=COLOURS["idle"],
-                                 wraplength=320, justify="left",
-                                 font=("Segoe UI", 9))
-        self.lbl_stim.grid(row=row, column=0, columnspan=2, sticky="w")
 
     def _build_analysis(self, frame):
         """Detection, sorting and the closed loop - the things that were
