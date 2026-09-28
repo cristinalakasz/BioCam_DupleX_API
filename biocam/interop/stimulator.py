@@ -177,6 +177,11 @@ class Stimulator:
         """
         try:
             return read()
+        except (KeyboardInterrupt, SystemExit):
+            # Not a driver failure. Wrapped, Ctrl+C became a StimulatorError
+            # that the recording thread counts as a failed stimulus and then
+            # carries on from.
+            raise
         except BaseException as exc:
             raise StimulatorError(
                 f"reading {what} raised {exc!r}. That is a driver-level "
@@ -826,6 +831,17 @@ class Stimulator:
                 "was delivered."
             )
 
+    def attach_log(self, log) -> None:
+        """Write this session's stimuli into `log` from now on.
+
+        Like the clock, a log belongs to one recording while the stimulator is
+        held for the window's lifetime. One log for the window put every
+        earlier recording's stimuli into each `_stimuli.json`.
+
+        Pure Python: no .NET call, nothing to verify on the instrument.
+        """
+        self._log = log
+
     def attach_clock(self, clock) -> None:
         """Give this stimulator the acquisition clock for the current session.
 
@@ -1035,15 +1051,34 @@ class Stimulator:
             # ChCoord is 1-based; biocam.stim.electrodes enforces that, and
             # ElectrodeGrid bounds-checks it - ChCoord.IsValid does not know
             # the array size and reports (65, 65) as valid.
-            endpoint = self._stimulator.GetInternalEndPoint(
-                ChCoord(int(electrode.row), int(electrode.col))
-            )
+            # Through _read, so a driver exception arrives as a
+            # StimulatorError naming the call, not obfuscated .NET text.
+            coord = ChCoord(int(electrode.row), int(electrode.col))
+            endpoint = self._read(
+                "IBioCamStim.GetInternalEndPoint",
+                lambda: self._stimulator.GetInternalEndPoint(coord))
             if endpoint is None:
                 raise StimulatorError(
                     f"GetInternalEndPoint returned nothing for electrode "
                     f"{electrode}. The coordinate is inside the array this "
                     "code was told about, so either the grid is wrong or that "
                     "electrode cannot be used for stimulation (issue #23)."
+                )
+            # The XML documents no null return from GetInternalEndPoint, only
+            # StimEndPoint.IsValid (XML:5179) and IsInternal (XML:5147). A
+            # non-null endpoint the driver marks invalid, or one that is not
+            # on the plate, must not reach Send.
+            valid = self._read("StimEndPoint.IsValid", lambda: endpoint.IsValid)
+            internal = self._read("StimEndPoint.IsInternal",
+                                  lambda: endpoint.IsInternal)
+            if not valid or not internal:
+                raise StimulatorError(
+                    f"GetInternalEndPoint gave an endpoint for electrode "
+                    f"{electrode} with IsValid={valid!r}, "
+                    f"IsInternal={internal!r}. It cannot be used for "
+                    "stimulation; choose another electrode and report this "
+                    "(issue #23; `python -m biocam.cli probe` lists every "
+                    "such electrode)."
                 )
             endpoints.append(endpoint)
         return System.Array[StimEndPoint](endpoints)

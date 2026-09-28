@@ -943,3 +943,70 @@ def test_a_session_without_a_service_is_unaffected(tmp_path):
         result = record_session(source, writer)
     assert result.n_frames == 100
     assert raw.read_bytes() == data.tobytes()
+
+
+# --------------------------------------------------------------------------
+# Gate 2: counters reach the sidecar AFTER the stop and the drain
+# --------------------------------------------------------------------------
+
+class _LateCountsSource(_FakeDrainSource):
+    """Counters that move during stop() and the drain, as the driver's can.
+
+    `loss_on_stop`: a DataLossAsync that lands while StopDataStreaming runs.
+    `every_packet_mismatched`: PayloadLength in a unit other than bytes, so
+    every packet - including the ones drained after the stop - mismatches.
+    """
+
+    def __init__(self, n_packets, stop_after, stop_event,
+                 loss_on_stop=False, every_packet_mismatched=False):
+        super().__init__(n_packets)
+        self.payload_length_mismatches = 0
+        self.last_payload_mismatch = None
+        self._stop_after = stop_after
+        self._stop_event = stop_event
+        self._loss_on_stop = loss_on_stop
+        self._mismatch = every_packet_mismatched
+        self._yielded = 0
+
+    def stop(self):
+        super().stop()
+        if self._loss_on_stop:
+            self.driver_loss_events += 1
+
+    def __iter__(self):
+        while self._buffer:
+            packet = self._buffer.popleft()
+            if self._mismatch:
+                self.payload_length_mismatches += 1
+                self.last_payload_mismatch = (4, 8)
+            self._yielded += 1
+            if self._yielded == self._stop_after:
+                self._stop_event.set()
+            yield packet
+
+
+def _run_until_stopped(tmp_path, **kwargs):
+    raw, meta = tmp_path / "out.raw", tmp_path / "out_meta.json"
+    stop = threading.Event()
+    source = _LateCountsSource(10, stop_after=3, stop_event=stop, **kwargs)
+    with RecordingWriter(raw, meta, PARAMS) as writer:
+        result = record_session(source, writer, stop_event=stop,
+                                counters=source, stop_source=source.stop)
+    return result, read_sidecar(meta)["integrity"]
+
+
+def test_a_loss_reported_while_streaming_stops_reaches_the_sidecar(tmp_path):
+    result, integrity = _run_until_stopped(tmp_path, loss_on_stop=True)
+    assert integrity["driver_loss_events"] == 1
+    assert result.verdict == "gaps_detected"
+
+
+def test_drained_packets_do_not_turn_a_unit_mismatch_into_false_gaps(tmp_path):
+    # Every packet mismatches: a unit error in this software, which leaves
+    # the verdict alone. Counted before the drain, the mismatches fell short
+    # of the packets written, and a clean recording read "gaps_detected" -
+    # sending the lab to rerun T3 over a misalignment that does not exist.
+    result, integrity = _run_until_stopped(tmp_path, every_packet_mismatched=True)
+    assert result.n_frames == 10
+    assert integrity["payload_length_mismatches"] == 10
+    assert result.verdict == "clean"

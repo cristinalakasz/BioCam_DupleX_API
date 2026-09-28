@@ -1333,3 +1333,54 @@ def test_the_trace_message_wraps_inside_the_box(root, tmp_path, demo):
     [item] = [i for i in canvas.find_all() if canvas.type(i) == "text"]
     x0, _, x1, _ = canvas.bbox(item)
     assert x0 >= 0 and x1 <= canvas.winfo_width()
+
+
+# --------------------------------------------------------------------------
+# the live factory, built around a real Stimulator (Gate 2, blocker)
+# --------------------------------------------------------------------------
+
+def _live_window_with_stimulator(root, tmp_path, demo, monkeypatch):
+    """A live window whose instrument claim is faked, with a REAL Stimulator.
+
+    Stimulator.__init__ is pure Python, so the attribute access that failed
+    on every live Start is exercised exactly as on the instrument.
+    """
+    from biocam.interop.stimulator import Stimulator
+    from biocam.stim import StimulusLog
+
+    window = a_window(root, tmp_path, demo, live=True)
+
+    def fake_claim():
+        # Once per window, like the real claim.
+        if window._live_stack is not None:
+            return
+        window._device = object()
+        window._stimulator = Stimulator(window._device, log=StimulusLog())
+        window._live_stack = object()
+
+    monkeypatch.setattr(window, "_ensure_live_instrument", fake_claim)
+    return window
+
+
+def test_a_live_factory_can_be_built_when_the_stimulator_is_available(
+        root, tmp_path, demo, monkeypatch):
+    # It read `self._stimulator.log`, which does not exist: every live Start
+    # failed with AttributeError whenever the stimulator had initialized.
+    window = _live_window_with_stimulator(root, tmp_path, demo, monkeypatch)
+    factory = window._make_live_factory(tmp_path / "a.raw", 10.0)
+    assert factory.stimulator is window._stimulator
+
+
+def test_each_live_recording_gets_its_own_stimulus_log(
+        root, tmp_path, demo, monkeypatch):
+    # One log for the window would put every earlier recording's stimuli in
+    # each _stimuli.json: T6's repeat would report n_attempted 6, not 3.
+    window = _live_window_with_stimulator(root, tmp_path, demo, monkeypatch)
+    first = window._make_live_factory(tmp_path / "a.raw", 10.0)
+    second = window._make_live_factory(tmp_path / "b.raw", 10.0)
+    assert first.log is not None and second.log is not None
+    assert first.log is not second.log
+    first.attach_clock(None)
+    assert window._stimulator._log is first.log
+    second.attach_clock(None)
+    assert window._stimulator._log is second.log

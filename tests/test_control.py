@@ -481,3 +481,49 @@ def test_the_clock_used_can_actually_express_these_intervals():
 
     resolution_us = time.get_clock_info("perf_counter").resolution * 1e6
     assert resolution_us < DEFAULT_MIN_INTERVAL_US / 10
+
+
+def test_slow_dispatches_far_apart_do_not_suspend_stimulation():
+    # T6 of the lab protocol: three single pulses, 5 s apart. Each first send
+    # pays one-off driver setup and may be slow, but three isolated slow sends
+    # seconds apart are not the sustained competition with the packet drain
+    # the brake exists for - and suspending on them showed an unexplained
+    # "suspended" warning after a correct test.
+    import time
+
+    q = a_queue(slow_dispatch_us=100.0, max_consecutive_slow=3,
+                slow_streak_window_sec=0.05)
+    for _ in range(10):
+        q.request("p", "e")
+    for _ in range(3):
+        q.service(lambda r: time.sleep(0.002))
+        time.sleep(0.08)                          # longer than the window
+    assert not q.suspended
+    assert q.slow_dispatches == 3                 # still counted and reported
+
+
+def test_slow_dispatches_close_together_still_suspend():
+    import time
+
+    q = a_queue(slow_dispatch_us=100.0, max_consecutive_slow=3,
+                slow_streak_window_sec=0.5)
+    for _ in range(10):
+        q.request("p", "e")
+    for _ in range(3):
+        q.service(lambda r: time.sleep(0.002))
+    assert q.suspended
+
+
+def test_sends_slower_than_the_window_still_suspend():
+    # The gap must be measured from the END of the previous send. Measured
+    # start to start, a send that hangs for longer than the window reset the
+    # streak every time - the worst case was the one the brake never caught.
+    import time
+
+    q = a_queue(slow_dispatch_us=100.0, max_consecutive_slow=3,
+                slow_streak_window_sec=0.01)
+    for _ in range(10):
+        q.request("p", "e")
+    for _ in range(3):
+        q.service(lambda r: time.sleep(0.02))
+    assert q.suspended

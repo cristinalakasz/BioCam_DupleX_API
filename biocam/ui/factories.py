@@ -441,6 +441,11 @@ class LiveFactory:
         self.clock = clock
         if self.stimulator is not None:
             self.stimulator.attach_clock(clock)
+            # And this recording's own log, so its _stimuli.json holds its
+            # stimuli only, not every earlier recording's in the window.
+            attach_log = getattr(self.stimulator, "attach_log", None)
+            if attach_log is not None:
+                attach_log(self.log)
 
     def send_loop_stimulus(self, trigger):
         """Deliver a closed-loop stimulus. Runs on the acquisition thread.

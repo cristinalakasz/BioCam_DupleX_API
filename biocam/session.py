@@ -216,6 +216,18 @@ class SessionResult:
     stop_reason: str
 
 
+def _transfer_counters(counters, writer) -> None:
+    """Copy the source's cumulative loss counters onto the writer."""
+    if counters is None:
+        return
+    writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
+    writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
+    writer.note_callback_errors(getattr(counters, "callback_errors", 0))
+    writer.note_payload_mismatches(
+        getattr(counters, "payload_length_mismatches", 0),
+        sample=getattr(counters, "last_payload_mismatch", None))
+
+
 def record_session(source, writer, duration_sec: Optional[float] = None,
                    stop_event=None, counters=None, drain: bool = False,
                    stop_source=None, clock=None, service=None,
@@ -497,13 +509,7 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
         # (however many packets short of COUNTER_CHECK_INTERVAL_PACKETS that
         # was) still gets reported before the session ends.
         _check_counters()
-        if counters is not None:
-            writer.note_driver_loss(getattr(counters, "driver_loss_events", 0))
-            writer.note_queue_overflow(getattr(counters, "queue_overflows", 0))
-            writer.note_callback_errors(getattr(counters, "callback_errors", 0))
-            writer.note_payload_mismatches(
-                getattr(counters, "payload_length_mismatches", 0),
-                sample=getattr(counters, "last_payload_mismatch", None))
+        _transfer_counters(counters, writer)
         if stop_source is not None:
             try:
                 stop_source()
@@ -563,6 +569,13 @@ def record_session(source, writer, duration_sec: Optional[float] = None,
             pending = get_pending() if callable(get_pending) else 0
             if pending:
                 writer.note_discarded(pending)
+        # Again, now that streaming has stopped and the backlog is written.
+        # Loss reported while StopDataStreaming ran, and the payload checks of
+        # every drained packet, happened after the first transfer; left out,
+        # the sidecar under-reported loss, and a unit mismatch on every packet
+        # read as mismatches < packets written - a false "gaps_detected".
+        # The note_* calls set totals, so repeating them is exact.
+        _transfer_counters(counters, writer)
 
     writer.finalise(stop_reason)
     return SessionResult(

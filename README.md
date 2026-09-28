@@ -584,7 +584,7 @@ checks:
 | #31 | Is the channel order row-major? If not, the array picture and electrode selection are wrong. |
 | #32 | What does the activity display cost on the lab PC? |
 | #21 | What are the DupleX's real stimulator limits (`StimProperties`: time resolution, amplitude range and step, max duration)? |
-| #22 | Is `Start()` what makes stimuli fire? Test on the external endpoints with an oscilloscope, not on tissue. |
+| #22 | Is `Start()` what makes stimuli fire? First checked without cells: T6 of the lab protocol, where (with liquid on the chip) each pulse leaves an artefact in the recording. |
 | #23 | Are the endpoint rules real: `GetInternalEndPoint`, and positive and negative in different columns? |
 | #24 | What does the instrument do with stimulus timestamps in the past: fire them all at once, drop them, or refuse? |
 | #26 | How long does `Send` take on the acquisition thread? |
@@ -610,6 +610,32 @@ Changed since the last lab session, and so also tried for the first time:
 - **A repeated packet counter now makes the verdict `unknown`.** If a real
   recording shows `counter_anomalies` above zero, report it: it answers
   whether the driver ever repeats a packet.
+- **Live recording from the window.** It could not start on the instrument at
+  all (every *Start recording* failed once the stimulator had initialized);
+  fixed, and each recording now gets its own stimulus log. T5 is the first
+  time a live window recording runs.
+- **Several recordings in one window, without releasing the BioCAM.** T5, T6
+  and T7 restart streaming (`StartDataStreaming` after `StopDataStreaming`)
+  and restart the stimulator (`Start` after `Stop`, without `Close` and a new
+  `Initialize`) on a device held throughout. 3Brain's sample never does
+  either. Report any error at the start of T6 or T7.
+- **Loss counters are written after the final drain.** A loss reported while
+  streaming stops now reaches `_meta.json`. Report the `integrity` block of
+  every recording, including T6 and T7.
+- **Slow stimulus sends only suspend stimulation when they come close
+  together** (within 1 s). Isolated slow sends are still counted as
+  `slow_dispatches`. If T6 or T7 shows "STIMULATION SUSPENDED", report it.
+- **Electrodes the driver marks invalid are refused before sending**
+  (`StimEndPoint.IsValid` / `IsInternal`). If a pulse is refused for that
+  reason, the session log names the electrode; report it with the T2 probe
+  output. **If every electrode is refused**, report that first: it would mean
+  these two flags do not read as expected, not that the electrodes are bad.
+- **Each live recording's `_stimuli.json` holds only that recording's
+  stimuli.** T6 run twice (10 µA, then 50 µA) in one window checks it: each
+  file should say `"n_attempted": 3`.
+- **Not exercised by the protocol:** more than 64 stimuli in one session (is
+  the stimulator's 64-pulse buffer per call or cumulative?), `Reset()`, and
+  `biocam stim` with no acquisition running. Do not rely on any of them yet.
 
 After any lab run, report:
 

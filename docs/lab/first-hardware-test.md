@@ -460,7 +460,10 @@ now **`_stimuli.json`**. Open `_stimuli.json` in Notepad: `"n_attempted": 3`,
 
 **Report:** the screenshot, the session log text, the terminal text, whether
 it was liquid or dry, the amplitude(s) used, where the bright cells appeared.
-**Attach** the `_stimuli.json` and `_session.json` of each run.
+**Attach** the `_meta.json`, `_stimuli.json` and `_session.json` of each run.
+The `_meta.json` matters here: these are the recordings where stimuli are
+sent from the same thread that saves the data, so its `integrity` block shows
+whether stimulating cost any data.
 
 ---
 
@@ -498,7 +501,8 @@ artefact in T6** (dry: `10`).
 `"requested_timestamps_us"`, each 100000 larger than the previous one.
 
 **Report:** the screenshot, the session log text, and what the artefacts did.
-**Attach** `t7_train_stimuli.json` and `t7_train_session.json`.
+**Attach** `t7_train_meta.json`, `t7_train_stimuli.json` and
+`t7_train_session.json`.
 
 ---
 
