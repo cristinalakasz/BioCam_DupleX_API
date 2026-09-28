@@ -64,6 +64,14 @@ SLOW_DISPATCH_US = 500.0
 # the brake, and it fails towards losing stimuli rather than losing data.
 MAX_CONSECUTIVE_SLOW = 3
 
+# ...and "consecutive" means close together in time. Slow dispatches further
+# apart than this do not add up: a few isolated slow sends seconds apart (the
+# first send pays one-off driver setup; a lab test clicks every few seconds)
+# are not sustained competition with the drain, and suspending on them showed
+# an unexplained warning after a correct test. They are still counted and
+# reported as slow_dispatches.
+SLOW_STREAK_WINDOW_SEC = 1.0
+
 # Minimum wall-clock spacing between dispatches. One-per-packet bounds the
 # count but not the rate: after any stall the consumer drains its backlog far
 # faster than 1 kHz, and every one of those packets triggers a dispatch, so
@@ -110,7 +118,8 @@ class StimulationQueue:
                  slow_dispatch_us: float = SLOW_DISPATCH_US,
                  max_consecutive_slow: int = MAX_CONSECUTIVE_SLOW,
                  min_interval_us: float = DEFAULT_MIN_INTERVAL_US,
-                 max_age_us: float = DEFAULT_MAX_AGE_US):
+                 max_age_us: float = DEFAULT_MAX_AGE_US,
+                 slow_streak_window_sec: float = SLOW_STREAK_WINDOW_SEC):
         if capacity < 1:
             raise ValueError(f"capacity must be at least 1, got {capacity}")
         self._queue = deque()
@@ -119,7 +128,13 @@ class StimulationQueue:
         self._max_consecutive_slow = max_consecutive_slow
         self._min_interval_us = min_interval_us
         self._max_age_us = max_age_us
+        self._slow_streak_window_sec = slow_streak_window_sec
         self._last_dispatch_at = None
+        # When the previous dispatch ENDED. The streak gap is measured from
+        # here: measured start to start it includes the previous send's own
+        # duration, so sends that hang longer than the window never formed a
+        # streak - the worst case was the one the brake could not catch.
+        self._last_dispatch_end = None
         self._consecutive_slow = 0
         self.suspended_reason = None
         self.stale = 0
@@ -247,6 +262,10 @@ class StimulationQueue:
                 self.max_dispatch_us = elapsed_us
             if elapsed_us > self._slow_dispatch_us:
                 self.slow_dispatches += 1
+                if (self._last_dispatch_end is not None
+                        and now - self._last_dispatch_end
+                        > self._slow_streak_window_sec):
+                    self._consecutive_slow = 0   # not a streak: too far apart
                 self._consecutive_slow += 1
                 if self._consecutive_slow >= self._max_consecutive_slow:
                     self.suspended_reason = (
@@ -260,6 +279,7 @@ class StimulationQueue:
             else:
                 self._consecutive_slow = 0
             self._last_dispatch_at = now
+            self._last_dispatch_end = time.perf_counter()
 
         if failed:
             self.failed += 1

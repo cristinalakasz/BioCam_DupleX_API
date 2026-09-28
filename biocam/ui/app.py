@@ -1241,7 +1241,10 @@ class BioCamWindow:
         return LiveFactory(
             output_path=output, duration_sec=duration,
             device=self._device, stimulator=self._stimulator,
-            log=self._stimulator.log if self._stimulator else None,
+            # No log passed: the factory makes a fresh one per recording and
+            # hands it to the stimulator in attach_clock. This read
+            # `self._stimulator.log`, which does not exist - every live Start
+            # failed whenever the stimulator had initialized.
             listener=self.controller.listener,
             warn=self._warn_from_any_thread,
             loop_plan=plan, loop_pattern=pattern,

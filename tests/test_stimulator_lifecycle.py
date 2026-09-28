@@ -104,3 +104,76 @@ def test_an_already_initialized_stimulator_is_refused_untouched(stim):
     with pytest.raises(StimulatorError, match="already initialized"):
         Stimulator(device).__enter__()
     assert fake.calls == []
+
+
+def test_attach_log_replaces_the_log_for_the_next_session(stim):
+    from biocam.stim import StimulusLog
+
+    _, device = stim
+    s = Stimulator(device, log=StimulusLog())
+    fresh = StimulusLog()
+    s.attach_log(fresh)
+    assert s._log is fresh
+
+
+# --------------------------------------------------------------------------
+# endpoints: only valid, internal ones reach Send (Gate 2)
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def endpoint_modules(monkeypatch):
+    system = types.ModuleType("System")
+    system.Array = {object: list}
+    system.Array = type("A", (), {"__class_getitem__": classmethod(
+        lambda cls, t: list)})
+    common = types.ModuleType("_3Brain.Common")
+    common.ChCoord = lambda r, c: (r, c)
+    driver = sys.modules.get("_3Brain.BioCamDriver") or types.ModuleType(
+        "_3Brain.BioCamDriver")
+    driver.StimEndPoint = object
+    monkeypatch.setitem(sys.modules, "System", system)
+    monkeypatch.setitem(sys.modules, "_3Brain.Common", common)
+    monkeypatch.setitem(sys.modules, "_3Brain.BioCamDriver", driver)
+
+
+def _stimulator_returning(endpoints):
+    net = types.SimpleNamespace(
+        GetInternalEndPoint=lambda coord: endpoints[coord])
+    s = Stimulator(types.SimpleNamespace(biocam=types.SimpleNamespace()))
+    s._stimulator = net
+    return s
+
+
+def _endpoint(valid=True, internal=True):
+    return types.SimpleNamespace(IsValid=valid, IsInternal=internal)
+
+
+def test_valid_internal_endpoints_are_passed_through(stim, endpoint_modules):
+    from biocam.stim import Electrode
+
+    s = _stimulator_returning({(1, 2): _endpoint(), (3, 4): _endpoint()})
+    built = s._build_endpoints([Electrode(1, 2), Electrode(3, 4)])
+    assert len(built) == 2
+
+
+@pytest.mark.parametrize("flags", [dict(valid=False), dict(internal=False)])
+def test_an_invalid_or_external_endpoint_is_refused_before_send(
+        stim, endpoint_modules, flags):
+    # The XML documents no null return from GetInternalEndPoint - only
+    # StimEndPoint.IsValid and IsInternal. Checking for None alone let an
+    # endpoint the driver itself marks invalid go into Send.
+    from biocam.stim import Electrode
+
+    s = _stimulator_returning({(1, 2): _endpoint(**flags)})
+    with pytest.raises(StimulatorError, match="1,2|\\(1, 2\\)|1, 2"):
+        s._build_endpoints([Electrode(1, 2)])
+
+
+def test_ctrl_c_during_a_driver_read_is_not_turned_into_a_driver_error(stim):
+    # _read wraps driver failures as StimulatorError, which callers on the
+    # recording thread count and carry on from. Ctrl+C must stay Ctrl+C.
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        Stimulator._read("anything", interrupted)
