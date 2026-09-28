@@ -1211,3 +1211,47 @@ def test_text_wraps_to_the_column_width(root, tmp_path, demo):
     shown(root)
     column = window.scrollers["Stimulus"]
     assert abs(column.inner.winfo_width() - column.canvas.winfo_width()) <= 1
+
+
+# --------------------------------------------------------------------------
+# the array column reads cleanly at the instrument's size
+# --------------------------------------------------------------------------
+
+FULL = AcquisitionParameters(
+    frame_rate_hz=1000.0, total_channels=4096, ch_sample_byte_size=2,
+    bit_depth=12, adc_counts_to_value=1.0, offset=0.0,
+    min_digital_value=0, max_digital_value=4095,
+)
+
+
+def _right_edge(widget):
+    return widget.winfo_rootx() + widget.winfo_width()
+
+
+def test_trace_lanes_are_labelled_by_electrode_not_just_channel(root, tmp_path, demo):
+    # The operator clicked 3,3; "ch 66" alone does not say that is it.
+    window = a_window(root, tmp_path, demo, params=FULL)
+    label = window.traces.label_for(66)
+    assert label.startswith("2,3")
+    assert "66" in label
+
+
+def test_the_legend_and_its_clear_button_fit_the_column(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo, params=FULL)
+    shown(root)
+    column = window.array.canvas.master.master
+    assert _right_edge(window.btn_clear) <= _right_edge(column)
+
+
+def test_the_hover_and_scale_lines_wrap_instead_of_running_off(root, tmp_path, demo):
+    window = a_window(root, tmp_path, demo, params=FULL)
+    shown(root)
+    # The real format, whose last word is the one that used to be cut.
+    window.lbl_hover.configure(
+        text="electrode (64,64)   12345 uV peak-to-peak")
+    window.lbl_scale.configure(
+        text="peak-to-peak 10 - 671 uV   (498 samples, 1186 us slowest)")
+    root.update()
+    for label in (window.lbl_hover, window.lbl_scale):
+        assert int(label.cget("wraplength")) > 0
+        assert label.winfo_reqwidth() <= label.winfo_width() + 1

@@ -29,8 +29,12 @@ MIN_LANE_PX = 44
 class TraceStripView:
     """A stack of trace lanes on a Tk canvas."""
 
-    def __init__(self, parent, tk, *, width: int = 620, height: int = 260):
+    def __init__(self, parent, tk, *, width: int = 620, height: int = 260,
+                 label_for=None):
         self.tk = tk
+        # Names a lane. The window passes one that gives the electrode's
+        # row,col - what the operator clicked - rather than a bare channel.
+        self.label_for = label_for or (lambda channel: f"ch {channel}")
         self.width = width
         self.height = height
         self.canvas = tk.Canvas(parent, width=width, height=height,
@@ -110,11 +114,23 @@ class TraceStripView:
         for x0, y0, x1, y1 in coords:
             c.create_line(x0, y0, x1, y1, fill=colour)
 
-        c.create_text(4, plot_top - 2, anchor="nw", fill=LABEL,
-                      font=("Segoe UI", 8, "bold"), text=f"ch {channel}")
-        c.create_text(self.width - 4, plot_top - 2, anchor="ne", fill=QUIET,
-                      font=("Segoe UI", 8),
-                      text=f"{low:.0f} to {high:.0f} {snapshot.value_unit}")
+        self._label(4, plot_top - 2, "nw", LABEL, ("Segoe UI", 8, "bold"),
+                    self.label_for(channel))
+        self._label(self.width - 4, plot_top - 2, "ne", QUIET, ("Segoe UI", 8),
+                    f"{low:.0f} to {high:.0f} {snapshot.value_unit}")
+
+    def _label(self, x, y, anchor, colour, font, text):
+        """Text on a patch of background, drawn above the trace.
+
+        Without the patch, the trace's peaks run through the numbers.
+        """
+        c = self.canvas
+        item = c.create_text(x, y, anchor=anchor, fill=colour, font=font,
+                             text=text)
+        x0, y0, x1, y1 = c.bbox(item)
+        back = c.create_rectangle(x0 - 2, y0, x1 + 2, y1, fill=BACKGROUND,
+                                  outline="")
+        c.tag_raise(item, back)
 
     # -- geometry ---------------------------------------------------------
 

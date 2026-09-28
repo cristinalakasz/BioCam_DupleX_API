@@ -290,23 +290,30 @@ class BioCamWindow:
         # Directly under the array, because the electrodes it draws are the
         # ones just clicked on it. Two panels apart would make the connection
         # something the operator has to remember rather than see.
+        n_cols = self.n_cols
         self.traces = TraceStripView(
-            frame, tk, width=self.n_cols * self.array.cell, height=200)
+            frame, tk, width=self.n_cols * self.array.cell, height=200,
+            label_for=lambda ch: f"{ch // n_cols + 1},{ch % n_cols + 1}  (ch {ch})")
         self.traces.canvas.grid(row=4, column=0, columnspan=3,
                                 sticky="ew", pady=(8, 0))
         self.traces.canvas.bind("<Configure>",
                                 lambda e: self.traces.fit(e.width))
 
+        # Two short rows with Clear beneath, rather than one long row: at the
+        # column's usual width (about 260 px at the default window size) the
+        # single row ran off the edge and took the Clear button with it.
         legend = ttk.Frame(frame)
         legend.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        tk.Label(legend, text="  ", bg=POSITIVE_COLOUR,
-                 relief="solid", borderwidth=1).pack(side="left")
-        ttk.Label(legend, text=" left-click: positive   ").pack(side="left")
-        tk.Label(legend, text="  ", bg=NEGATIVE_COLOUR,
-                 relief="solid", borderwidth=1).pack(side="left")
-        ttk.Label(legend, text=" right-click: negative  ").pack(side="left")
-        ttk.Button(legend, text="Clear", width=7,
-                   command=self.array.clear).pack(side="left", padx=6)
+        for row, (colour, text) in enumerate((
+                (POSITIVE_COLOUR, " left-click: positive"),
+                (NEGATIVE_COLOUR, " right-click: negative"))):
+            tk.Label(legend, text="  ", bg=colour, relief="solid",
+                     borderwidth=1).grid(row=row, column=0, pady=1)
+            ttk.Label(legend, text=text).grid(row=row, column=1, sticky="w")
+        self.btn_clear = ttk.Button(legend, text="Clear", width=7,
+                                    command=self.array.clear)
+        self.btn_clear.grid(row=2, column=0, columnspan=2, sticky="w",
+                            pady=(4, 0))
 
         self.lbl_hover = tk.Label(
             frame, text="Hover an electrode to read it.", anchor="w",
@@ -317,6 +324,18 @@ class BioCamWindow:
             frame, text="No signal yet - start a recording.", anchor="w",
             font=("Segoe UI", 9), fg=COLOURS["idle"])
         self.lbl_scale.grid(row=3, column=0, columnspan=3, sticky="ew")
+
+        # Both lines wrap to the column instead of running off its edge,
+        # which cut the reading the protocol asks the operator to check.
+        def wrap(event):
+            # The label's own width, not the column's: the column has padding
+            # and a border, and wrapping to its outer width let the last word
+            # run past the edge ("peak-to-peal").
+            for label in (self.lbl_hover, self.lbl_scale):
+                label.configure(wraplength=max(80, label.winfo_width() - 4),
+                                justify="left")
+        frame.bind("<Configure>", wrap, add="+")
+        self.lbl_hover.bind("<Configure>", wrap, add="+")
 
     def _on_array_selection(self):
         """The picture is the source of truth; the text fields follow it."""
@@ -359,7 +378,7 @@ class BioCamWindow:
         reading = self.array.activity_at(row, col, self._activity)
         text = f"electrode ({row},{col})"
         if reading is not None:
-            text += f"   {reading:7.0f} uV peak-to-peak"
+            text += f"   {reading:.0f} uV peak-to-peak"
         self.lbl_hover.configure(text=text)
 
     def _sync_array_from_text(self):

@@ -276,3 +276,55 @@ def test_changes_are_counted_for_the_session_record():
     r.request_channels((3,))
     r.observe(packet_from(flat(4)))
     assert r.summary()["trace_channel_changes"] == 2
+
+
+
+# --------------------------------------------------------------------------
+# the strip itself
+# --------------------------------------------------------------------------
+
+def _strip():
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # pragma: no cover - headless only
+        pytest.skip(f"no Tk display: {exc}")
+    root.withdraw()
+    from biocam.ui.traceview import TraceStripView
+    return root, TraceStripView(root, tk, width=300, height=120,
+                                label_for=lambda ch: f"electrode for {ch}")
+
+
+def test_a_lane_label_comes_from_label_for():
+    root, strip = _strip()
+    try:
+        r = recorder(channels=(3,), columns=4, span_sec=0.004)
+        r.observe(packet_from(flat(4)))
+        strip.set_snapshot(r.snapshot())
+        texts = [strip.canvas.itemcget(i, "text")
+                 for i in strip.canvas.find_all()
+                 if strip.canvas.type(i) == "text"]
+        assert "electrode for 3" in texts
+    finally:
+        root.destroy()
+
+
+def test_lane_labels_sit_on_a_background_above_the_trace():
+    # Otherwise the peaks of the trace run through the numbers.
+    root, strip = _strip()
+    try:
+        r = recorder(channels=(3,), columns=4, span_sec=0.004)
+        r.observe(packet_from(flat(4)))
+        strip.set_snapshot(r.snapshot())
+        c = strip.canvas
+        items = c.find_all()                     # bottom to top
+        for text in (i for i in items if c.type(i) == "text"):
+            below = items[:items.index(text)]
+            backs = [i for i in below if c.type(i) == "rectangle"
+                     and c.coords(i)[0] <= c.bbox(text)[0]
+                     and c.coords(i)[2] >= c.bbox(text)[2]]
+            lines_after = [i for i in items[items.index(backs[-1]):]
+                           if c.type(i) == "line"]
+            assert backs and not lines_after
+    finally:
+        root.destroy()
